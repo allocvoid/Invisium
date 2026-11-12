@@ -1,0 +1,10 @@
+[package]
+name = "invis-chrome"
+description = "InvisBrowser chrome UI kit: tab strip, toolbar, address bar, privacy panel and internal pages, drawn through the Invisium display list"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# ── DEPENDENCY ALLOWLIST ── do not add, remove or re-feature entries (see docs/agents/RULES.md).
+[dependencies]
+invisium-draw = { path = "../invisium-draw" }

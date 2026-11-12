@@ -1,0 +1,8 @@
+[package]
+name = "invisium-draw"
+description = "Invisium display-list contract: the data types shared by the painter, the GPU renderer and the browser chrome"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

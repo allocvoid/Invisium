@@ -1,0 +1,17 @@
+/target
+*.png.tmp
+
+# machine-specific build configuration (points the build output at a local folder)
+/.cargo/config.toml
+
+# local working material: not part of the published source
+/dist/
+/handoff/
+/HANDOFF.md
+/docs/
+/tools/
+/InvisBrowser-handoff-*.zip
+
+# working screenshots stay local; only the ones the README shows are published
+/screenshots/*
+!/screenshots/readme-*.png

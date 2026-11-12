@@ -1,0 +1,10 @@
+[package]
+name = "invisium-regex"
+description = "Invisium regular-expression engine: a from-scratch ECMAScript regex parser and backtracking matcher over UTF-16"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# ── DEPENDENCY ALLOWLIST ── this crate has no dependencies: standard library only
+# (see docs/agents/RULES.md).
+[dependencies]

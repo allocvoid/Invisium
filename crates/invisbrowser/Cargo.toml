@@ -1,0 +1,27 @@
+[package]
+name = "invisbrowser"
+description = "InvisBrowser: a private, lightweight web browser built on the Invisium engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "invisbrowser"
+path = "src/main.rs"
+
+[features]
+default = ["images"]
+# Embedded Tor (arti). Adds several minutes to a clean build.
+tor = ["invisium-net/tor"]
+# Image decoding and inline SVG (needs invisium-gfx milestone 2).
+images = []
+
+[dependencies]
+invisium = { path = "../invisium" }
+invisium-net = { path = "../invisium-net" }
+invisium-gfx = { path = "../invisium-gfx" }
+invis-chrome = { path = "../invis-chrome" }
+winit = "0.30"
+pollster = "0.4"
+arboard = { version = "3", default-features = false }

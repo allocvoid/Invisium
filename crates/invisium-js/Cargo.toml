@@ -1,0 +1,11 @@
+[package]
+name = "invisium-js"
+description = "Invisium JavaScript engine: a from-scratch lexer, parser and interpreter with an embedding API"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# ── DEPENDENCY ALLOWLIST ── the workspace's own regular-expression engine and nothing else
+# (see docs/agents/RULES.md).
+[dependencies]
+invisium-regex = { path = "../invisium-regex" }

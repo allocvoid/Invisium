@@ -1,0 +1,73 @@
+# Invisium
+
+A web browser engine written from scratch in Rust, and **InvisBrowser**, a small privacy-first
+browser built on it.
+
+"From scratch" is the point of the project: the HTML parser, CSS parser and cascade, layout,
+painting, the JavaScript engine, the regular-expression engine, the HTTP stack, URL and cookie
+handling and the SVG rasteriser are all implemented in this repository. No code from Chromium,
+WebKit, Gecko or Servo is used, and no crate that does the engine's own job. Third-party crates
+are used only for platform plumbing: the GPU API (`wgpu`), TLS cryptography (`rustls`), image
+codecs (`image`), glyph outlines (`ab_glyph`), windowing (`winit`) and the Tor protocol (`arti`).
+
+This is work in progress. It is not a finished browser and should not be relied on for
+security-sensitive browsing yet.
+
+![Wikipedia rendered with scripts running](screenshots/readme-wikipedia.png)
+
+## Status
+
+| Area | State |
+|---|---|
+| Static sites (Wikipedia, Hacker News, documentation, blogs) | Render well |
+| JavaScript | Own engine: ES2022-level language, promises/async, generators, Proxy, RegExp, `Date`, typed arrays, `BigInt`, ES modules, a fixed-locale `Intl`. Off by default in the browser ("JavaScript (experimental)" setting). |
+| DOM | Events, selectors, forms, timers, `fetch`/XHR (CORS enforced in the network stack), custom elements, `URL`, storage (session only), `TextEncoder`, `crypto.getRandomValues` |
+| Script-heavy sites | Wikipedia and Hacker News run their scripts cleanly; DuckDuckGo's results page and YouTube's signed-out home page render; many others still fail |
+| Privacy | Tracker blocking, HTTPS-only mode, tracking-parameter stripping, partitioned in-memory cookies and cache, DNS-over-HTTPS, HTTP/SOCKS5 proxies, embedded Tor (optional feature), fixed generic user agent, `Intl`/`Date` always report `en-US`/UTC, public pages cannot reach local-network addresses |
+| Not there yet | Video and audio, canvas/WebGL, downloads, text selection, find-in-page, bookmarks/history, web fonts, HTTP/2, shadow DOM (pages that ship a polyfill work), incremental layout |
+
+| | |
+|---|---|
+| ![DuckDuckGo results](screenshots/readme-duckduckgo.png) | ![YouTube signed-out home](screenshots/readme-youtube.png) |
+| DuckDuckGo's results page (scripts on) | YouTube's signed-out home page (scripts on) |
+| ![New-tab page](screenshots/readme-newtab.png) | |
+| The browser's own new-tab page | |
+
+## Building
+
+Requires stable Rust (1.92 or newer). Developed on Windows 10/11 with the MSVC toolchain; other
+platforms are a goal, not yet a tested target.
+
+```sh
+cargo test --workspace                 # all tests
+cargo run -p invisbrowser              # the browser window
+cargo run -p invisbrowser -- https://en.wikipedia.org/wiki/Cat
+cargo run --release -p invisbrowser --features tor     # with the embedded Tor client
+```
+
+Render a page without a window:
+
+```sh
+cargo run -p invisbrowser -- --screenshot <address> out.png --width 1280 --height 900 --dump
+cargo run -p invisbrowser -- --screenshot <address> out.png --js --console
+```
+
+`--dump` prints page statistics (nodes, boxes, memory, network), `--js` runs the page's scripts,
+`--console` prints what they log, `--eval "<javascript>"` runs one more script after load.
+
+## Layout of the workspace
+
+| Crate | What it is |
+|---|---|
+| `crates/invisium` | Engine core: HTML parser, CSS parser and cascade, fonts, layout (block, inline, flex, grid, table), paint, the `Page` type, and the DOM bindings for scripts |
+| `crates/invisium-js` | JavaScript engine: lexer, parser, bytecode compiler, VM, garbage collector, built-ins, embedding API |
+| `crates/invisium-regex` | ECMAScript regular-expression engine (backtracking, UTF-16) |
+| `crates/invisium-net` | URL, HTTP/1.1, TLS, privacy policy pipeline, cookies, cache, DNS-over-HTTPS, proxies, Tor, CORS |
+| `crates/invisium-gfx` | GPU renderer (wgpu), glyph atlas, image decoding, SVG rasteriser |
+| `crates/invisium-draw` | Display-list types shared by the painter, the renderer and the browser UI |
+| `crates/invis-chrome` | Browser UI kit: tabs, toolbar, address bar, privacy panel, internal pages |
+| `crates/invisbrowser` | The application: window, tabs, navigation, settings, screenshot mode |
+
+## License
+
+MIT. See [LICENSE](LICENSE). The bundled Geist fonts are under the SIL Open Font License.

@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/invisium-draw",   # display-list contract (shared data types)
+    "crates/invisium",        # engine core: HTML, CSS, cascade, fonts, layout, paint
+    "crates/invisium-net",    # private network stack: HTTP, TLS, DoH, proxies, Tor
+    "crates/invisium-regex",  # regular-expression engine (used by the JavaScript engine)
+    "crates/invisium-js",     # JavaScript engine
+    "crates/invisium-gfx",    # GPU renderer, image decoding, SVG rasteriser
+    "crates/invis-chrome",    # browser chrome UI kit + internal pages
+    "crates/invisbrowser",    # the browser application
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[profile.dev]
+opt-level = 1
+debug = "line-tables-only"
+
+# Dependencies (codecs, crypto, GPU) are always optimised, even in dev builds.
+[profile.dev.package."*"]
+opt-level = 2
+debug = false
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 8
+strip = true
+debug = false

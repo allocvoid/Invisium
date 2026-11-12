@@ -1,0 +1,21 @@
+//! structuredClone: plain data, cycles and shared references, Date, RegExp, Map, Set, Error,
+//! buffers and their views, and what it refuses.
+
+pub const CASES: &[(&str, &str)] = &[
+    (r#"var o = { a: 1, b: 'x', c: [1, 2, { d: null }], e: undefined, f: true }; var c = structuredClone(o); c !== o && c.c !== o.c && c.c[2] !== o.c[2] && JSON.stringify(c) === JSON.stringify(o) && 'e' in c"#, "true"),
+    (r#"var o = { name: 'root' }; o.self = o; o.list = [o, o]; var c = structuredClone(o); (c.self === c) + '|' + (c.list[0] === c) + '|' + (c !== o)"#, "true|true|true"),
+    (r#"var shared = { n: 1 }; var c = structuredClone({ a: shared, b: shared }); (c.a === c.b) + '|' + (c.a !== shared)"#, "true|true"),
+    (r#"var d = new Date(86400000); var r = /a(b)/gi; r.lastIndex = 3; var c = structuredClone({ d: d, r: r }); [c.d instanceof Date, c.d !== d, c.d.getTime(), c.r instanceof RegExp, c.r !== r, c.r.source, c.r.flags, c.r.lastIndex, c.r.test('xAB')].join('|')"#, "true|true|86400000|true|true|a(b)|gi|0|true"),
+    (r#"var m = new Map([[1, { v: 1 }], ['k', new Set([1, 2])]]); var c = structuredClone(m); [c instanceof Map, c !== m, c.size, c.get(1).v, c.get(1) !== m.get(1), c.get('k') instanceof Set, [...c.get('k')].join()].join('|')"#, "true|true|2|1|true|true|1,2"),
+    (r#"var k = { id: 1 }; var m = new Map(); m.set(k, m); var c = structuredClone(m); var ck = [...c.keys()][0]; (ck !== k) + '|' + ck.id + '|' + (c.get(ck) === c)"#, "true|1|true"),
+    (r#"var a = new Uint8Array([1, 2, 3, 4]); var c = structuredClone(a); c[0] = 9; [c instanceof Uint8Array, c.join(), a.join(), c.buffer !== a.buffer, c.buffer.byteLength].join('|')"#, "true|9,2,3,4|1,2,3,4|true|4"),
+    (r#"var b = new ArrayBuffer(8); var o = { u8: new Uint8Array(b, 2, 4), f: new Float32Array(b), dv: new DataView(b, 1), b: b }; var c = structuredClone(o); c.u8[0] = 7; [c.u8.buffer === c.b, c.f.buffer === c.b, c.dv.buffer === c.b, c.b !== b, c.u8.byteOffset, c.u8.length, c.dv.getUint8(1), new Uint8Array(b)[2], c.dv.byteLength].join('|')"#, "true|true|true|true|2|4|7|0|7"),
+    (r#"var r = []; for (var v of [() => 1, Symbol('s'), { f() {} }, [1, function () {}], new Map([[1, () => 1]]), new WeakMap(), new Proxy({}, {}), Promise.resolve(1)]) { try { structuredClone(v); r.push('ok'); } catch (e) { r.push(e.name); } } r.join()"#, "DataCloneError,DataCloneError,DataCloneError,DataCloneError,DataCloneError,DataCloneError,DataCloneError,DataCloneError"),
+    (r#"[structuredClone(1), structuredClone('s'), structuredClone(null), structuredClone(undefined), structuredClone(NaN), typeof structuredClone(new Number(5)), structuredClone(new String('ab')).length, structuredClone(new Boolean(false)).valueOf(), Object.is(structuredClone(-0), -0)].join('|')"#, "1|s|||NaN|object|2|false|true"),
+    (r#"class P { constructor() { this.x = 1; } get y() { return 2; } } var o = Object.defineProperty({ p: new P(), get g() { return 'got'; }, [Symbol('s')]: 1 }, 'hidden', { value: 1, enumerable: false }); var c = structuredClone(o); var arr = structuredClone([1, , 3]); [c.p instanceof P, c.p.x, c.p.y, c.g, Object.getOwnPropertyDescriptor(c, 'g').value, 'hidden' in c, Object.getOwnPropertySymbols(c).length, arr.length, 1 in arr].join('|')"#, "false|1||got|got|false|0|3|false"),
+    (r#"var e = new RangeError('bad', { cause: { code: 7 } }); var c = structuredClone(e); [c instanceof RangeError, c !== e, c.message, c.name, c.cause.code, c.cause !== e.cause].join('|')"#, "true|true|bad|RangeError|7|true"),
+    (r#"try { structuredClone() } catch (e) { e.name }"#, "TypeError"),
+    (r#"var o = { list: [new Date(0), /x/g, new Map([['a', [1]]])] }; var c = structuredClone(o); JSON.stringify(c.list[0]) + '|' + c.list[1] + '|' + c.list[2].get('a')[0] + '|' + typeof structuredClone"#, "\"1970-01-01T00:00:00.000Z\"|/x/g|1|function"),
+    (r#"var a = [1, 2]; a.tag = 'T'; var c = structuredClone(a); Array.isArray(c) + '|' + c.tag + '|' + c.join() + '|' + structuredClone(new Date(NaN)).getTime()"#, "true|T|1,2|NaN"),
+    (r#"var src = { list: [] }; for (var i = 0; i < 2000; i++) src.list.push({ i: i, s: 'v' + i }); var c = structuredClone(src); c.list.length + '|' + c.list[1999].s + '|' + (c.list[5] !== src.list[5])"#, "2000|v1999|true"),
+];
