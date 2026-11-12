@@ -11,9 +11,13 @@ mod charset;
 mod compile;
 mod escape;
 mod exec;
+#[cfg(test)]
+mod gc_check;
+mod gc_table;
 mod parser;
 mod program;
 mod props;
+mod script;
 mod unicode;
 mod vm;
 

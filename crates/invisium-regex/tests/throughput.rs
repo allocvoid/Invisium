@@ -93,6 +93,40 @@ fn literal_scan_over_one_million_characters() {
     assert!(steps > 999_000, "the prefilter should skip without spending steps");
 }
 
+/// Milestone 2, B5: table-backed property names are cheap to compile.
+#[test]
+fn compiling_a_property_class_a_thousand_times() {
+    let started = Instant::now();
+    for _ in 0..1000 {
+        let re = regex(r"\p{L}", "u");
+        assert_eq!(re.group_count(), 0);
+    }
+    let elapsed = started.elapsed();
+    assert!(elapsed < Duration::from_secs(1), "1000 compiles took {elapsed:?}");
+}
+
+/// Milestone 2, B5: a property class scan over 100 000 characters of mixed scripts.
+#[test]
+fn property_class_scan_over_mixed_scripts() {
+    let words = ["hello", "na\u{EF}ve", "\u{65E5}\u{672C}\u{8A9E}", "\u{43F}\u{440}\u{438}\u{432}\u{435}\u{442}", "e\u{301}t\u{E9}_1", "\u{639}\u{631}\u{628}\u{64A}", "\u{939}\u{93F}\u{928}\u{94D}\u{926}\u{940}", "x\u{1D7CE}\u{20000}"];
+    let separators = [" ", ", ", "! ", " \u{2014} ", "\u{3000}"];
+    let mut subject = String::new();
+    let (mut expected, mut i) = (0, 0usize);
+    while subject.chars().count() < 100_000 {
+        subject.push_str(words[i % words.len()]);
+        subject.push_str(separators[i % separators.len()]);
+        expected += 1;
+        i += 1;
+    }
+    let text = u16s(&subject);
+    let re = regex(r"[\p{L}\p{M}\p{N}_]+", "u");
+    let started = Instant::now();
+    let found = count_matches(&re, &text, |m| assert!(!m.is_empty()));
+    let elapsed = started.elapsed();
+    assert_eq!(found, expected);
+    assert!(elapsed < Duration::from_secs(1), "property scan took {elapsed:?}");
+}
+
 #[test]
 fn case_insensitive_and_class_led_scans_stay_fast() {
     let mut subject = "lorem ipsum dolor sit amet, consectetur adipiscing elit ".repeat(4000);

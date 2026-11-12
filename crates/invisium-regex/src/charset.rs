@@ -76,6 +76,29 @@ impl CharSet {
         CharSet { ranges: out }
     }
 
+    /// Members of both sets; both must be normalized.
+    pub(crate) fn intersection(&self, other: &CharSet) -> CharSet {
+        let mut out = Vec::new();
+        let (mut a, mut b) = (self.ranges.iter().peekable(), other.ranges.iter().peekable());
+        while let (Some(&&(alo, ahi)), Some(&&(blo, bhi))) = (a.peek(), b.peek()) {
+            let (lo, hi) = (alo.max(blo), ahi.min(bhi));
+            if lo <= hi {
+                out.push((lo, hi));
+            }
+            if ahi < bhi {
+                a.next();
+            } else {
+                b.next();
+            }
+        }
+        CharSet { ranges: out }
+    }
+
+    /// Members of `self` that are not in `other`; both must be normalized.
+    pub(crate) fn difference(&self, other: &CharSet) -> CharSet {
+        self.intersection(&other.negated())
+    }
+
     pub(crate) fn contains(&self, c: u32) -> bool {
         search(&self.ranges, c)
     }
