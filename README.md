@@ -10,8 +10,22 @@ WebKit, Gecko or Servo is used, and no crate that does the engine's own job. Thi
 are used only for platform plumbing: the GPU API (`wgpu`), TLS cryptography (`rustls`), image
 codecs (`image`), glyph outlines (`ab_glyph`), windowing (`winit`) and the Tor protocol (`arti`).
 
-This is work in progress. It is not a finished browser and should not be relied on for
-security-sensitive browsing yet.
+This is work in progress. It is not a finished browser.
+
+## Fair warning
+
+- **No security assessment has been done.** Every part that reads untrusted input (the HTML,
+  CSS and JavaScript engines, the image and font paths, the network stack) is new code that
+  nobody has audited or fuzzed, and pages are not sandboxed: the browser is one ordinary
+  process with your user account's rights. Do not use it for banking, accounts you care about
+  or anything else where a malicious page could hurt you.
+- **It is still fingerprintable, because it is custom.** The privacy features cut down on
+  tracking by cookies, trackers and tracking parameters, and can hide your network address
+  behind a proxy or Tor. They do not make you blend in. A from-scratch engine behaves unlike
+  every mainstream browser (which script and CSS features exist, how pages are laid out, how
+  it speaks TLS and HTTP), so a site that looks can tell this browser apart from all others,
+  and very few people run it. With Tor turned on, your traffic goes through Tor, but you do
+  not look like Tor Browser's other users: do not rely on it for anonymity.
 
 ![Wikipedia rendered with scripts running](screenshots/readme-wikipedia.png)
 
