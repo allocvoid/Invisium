@@ -208,6 +208,17 @@ mod imp {
         }
         parse_result(&file_buf, multiple)
     }
+
+    #[cfg(test)]
+    mod tests {
+        /// The hand-written struct must have the size the system expects (it checks the
+        /// struct's size field): 152 bytes on 64-bit Windows, 88 on 32-bit.
+        #[test]
+        fn open_file_name_struct_has_the_sdk_size() {
+            let want = if cfg!(target_pointer_width = "64") { 152 } else { 88 };
+            assert_eq!(std::mem::size_of::<super::OPENFILENAMEW>(), want);
+        }
+    }
 }
 
 #[cfg(not(windows))]
