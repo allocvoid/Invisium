@@ -710,6 +710,7 @@ fn dom_objects_name_their_interface_and_storage_fails_politely() {
         </script>",
     );
     t.step(1.0);
+    t.p.frame(5.0);
     t.step(10.0);
     assert_eq!(t.errors(), Vec::<&String>::new(), "console: {:?}", t.log);
     assert_eq!(
@@ -719,8 +720,9 @@ fn dom_objects_name_their_interface_and_storage_fails_politely() {
             "false [object HTMLBodyElement] [object HTMLElement]",
             "true,true",
             "function function true true",
-            "resize true true",
             "idb true InvalidStateError done",
+            // size observers report with the next frame, after the timers
+            "resize true true",
         ]
     );
 }
@@ -866,4 +868,182 @@ fn module_scripts_load_their_graph_and_run_in_order() {
     unique.dedup();
     assert_eq!(served, unique);
     assert_eq!(p.pending_scripts(), 0);
+}
+
+impl T {
+    /// One displayed frame at `now`: timers, frame callbacks, animations, then layout.
+    fn frame(&mut self, now: f64) {
+        self.step(now);
+        self.p.frame(now);
+        self.step(now);
+    }
+
+    fn opacity(&self, id: &str) -> f32 {
+        self.p.styles().get(self.id(id)).map_or(f32::NAN, |s| s.opacity)
+    }
+}
+
+#[test]
+fn animation_frames_run_once_per_frame_in_order() {
+    let mut t = T::new(
+        "<script>
+           var seen = [];
+           requestAnimationFrame(function (ts) { seen.push('a' + (typeof ts)); requestAnimationFrame(function () { seen.push('c'); }); });
+           var dropped = requestAnimationFrame(function () { seen.push('never'); });
+           requestAnimationFrame(function () { seen.push('b'); });
+           cancelAnimationFrame(dropped);
+         </script>",
+    );
+    assert!(t.p.wants_frame());
+    // timers alone do not run frame callbacks
+    t.step(500.0);
+    t.p.eval("console.log(seen.join(','))");
+    t.frame(516.0);
+    t.p.eval("console.log(seen.join(','))");
+    // a callback queued during a frame waits for the next one
+    assert!(t.p.wants_frame());
+    t.frame(532.0);
+    t.p.eval("console.log(seen.join(','))");
+    t.step(532.0);
+    assert!(!t.p.wants_frame());
+    assert_eq!(t.logs(), ["", "anumber,b", "anumber,b,c"]);
+    assert!(t.errors().is_empty(), "{:?}", t.log);
+}
+
+#[test]
+fn element_animate_moves_values_and_finishes() {
+    let mut t = T::new(
+        "<div id=box style='width:50px;height:50px'></div>
+         <script>
+           var box = document.getElementById('box');
+           var a = box.animate({ opacity: [0, 1], transform: ['translateX(0px)', 'translateX(100px)'] }, { duration: 200, easing: 'linear', fill: 'both' });
+           a.finished.then(function () { console.log('finished ' + a.playState + ' ' + a.currentTime); });
+           a.onfinish = function () { console.log('onfinish'); };
+           console.log(a.playState, box.getAnimations().length, document.getAnimations().length);
+           var gone = box.animate([{ opacity: 0.3 }, { opacity: 0.6 }], 100);
+           gone.finished.catch(function (e) { console.log('cancelled ' + e.name); });
+           gone.cancel();
+           console.log(gone.playState, box.getAnimations().length);
+         </script>",
+    );
+    t.frame(0.0);
+    assert!(t.p.wants_frame());
+    t.frame(100.0);
+    assert!((t.opacity("box") - 0.5).abs() < 0.01, "{}", t.opacity("box"));
+    let st = t.p.styles().get(t.id("box")).unwrap();
+    let m = st.transform_matrix(50.0, 50.0).unwrap();
+    assert!((m[4] - 50.0).abs() < 0.5, "{m:?}");
+    t.p.eval("console.log(getComputedStyle(box).opacity, a.currentTime, a.playState)");
+    t.frame(250.0);
+    // `fill: both` keeps the last values after the end
+    assert!((t.opacity("box") - 1.0).abs() < 0.001);
+    t.frame(266.0);
+    assert!(!t.p.wants_frame());
+    // committing the values and cancelling leaves them as inline style
+    t.p.eval("a.commitStyles(); a.cancel(); console.log(box.style.opacity, a.playState, box.getAnimations().length)");
+    t.frame(280.0);
+    assert!((t.opacity("box") - 1.0).abs() < 0.001);
+    assert_eq!(
+        t.logs(),
+        ["running 1 1", "idle 1", "cancelled AbortError", "0.5 100 running", "onfinish", "finished finished 200", "1 idle 0"]
+    );
+    assert!(t.errors().is_empty(), "{:?}", t.log);
+}
+
+#[test]
+fn css_transitions_and_keyframes_run_on_the_page_clock() {
+    let mut t = T::new(
+        "<style>
+           #b { width: 100px; height: 20px; opacity: 1; background-color: rgb(0, 0, 0); transition: opacity 100ms linear, background-color 100ms linear 50ms }
+           #b.on { opacity: 0.5; background-color: rgb(200, 0, 0) }
+           @keyframes turn { from { rotate: 0deg } to { rotate: 360deg } }
+           #s { width: 10px; height: 10px; animation: turn 1s linear infinite }
+           @keyframes fade { from { opacity: var(--from, 0.2) } }
+           #f { --from: 0.4; animation: fade 100ms linear both }
+         </style>
+         <div id=b></div><div id=s></div><div id=f></div>
+         <script>
+           var b = document.getElementById('b'), log = [];
+           ['transitionstart', 'transitionend', 'animationstart', 'animationend'].forEach(function (k) {
+             document.addEventListener(k, function (e) { log.push(k + ':' + (e.propertyName || e.animationName) + ':' + e.target.id); });
+           });
+         </script>",
+    );
+    t.frame(0.0);
+    // keyframes start with the first style pass; var() in a keyframe reads the element's value
+    assert!((t.opacity("f") - 0.4).abs() < 0.001, "{}", t.opacity("f"));
+    t.frame(50.0);
+    assert!((t.opacity("f") - 0.7).abs() < 0.01, "{}", t.opacity("f"));
+    let rot = |t: &T| t.p.styles().get(t.id("s")).unwrap().rotate;
+    assert!((rot(&t) - 18.0).abs() < 0.5, "{}", rot(&t));
+    // a class change starts the transitions from the old values
+    t.p.eval("b.className = 'on'");
+    t.step(50.0);
+    assert!((t.opacity("b") - 1.0).abs() < 0.001, "{}", t.opacity("b"));
+    t.frame(100.0);
+    assert!((t.opacity("b") - 0.75).abs() < 0.01, "{}", t.opacity("b"));
+    let bg = |t: &T| t.p.styles().get(t.id("b")).unwrap().background_color;
+    assert_eq!(bg(&t).r, 0); // still inside its delay
+    t.frame(150.0);
+    assert!((t.opacity("b") - 0.5).abs() < 0.001);
+    assert_eq!(bg(&t).r, 100);
+    // turning back half-way goes from where it is
+    t.p.eval("b.className = ''");
+    t.step(150.0);
+    assert_eq!(bg(&t).r, 100);
+    t.frame(175.0);
+    assert!((t.opacity("b") - 0.625).abs() < 0.01, "{}", t.opacity("b"));
+    t.frame(1000.0);
+    assert!((t.opacity("b") - 1.0).abs() < 0.001);
+    assert_eq!(bg(&t).r, 0);
+    // the endless spinner keeps the page asking for frames
+    assert!(t.p.wants_frame());
+    t.p.eval("document.getElementById('s').style.animation = 'none'");
+    t.frame(1016.0);
+    assert!(!t.p.wants_frame());
+    assert_eq!(rot(&t), 0.0);
+    t.p.eval("console.log(log.join(' '))");
+    t.step(1016.0);
+    let log = t.logs().join(" ");
+    for want in ["animationstart:turn:s", "animationstart:fade:f", "animationend:fade:f", "transitionstart:opacity:b", "transitionend:opacity:b", "transitionend:background-color:b"] {
+        assert!(log.contains(want), "missing {want} in {log}");
+    }
+    assert!(t.errors().is_empty(), "{:?}", t.log);
+}
+
+#[test]
+fn observers_follow_layout_and_scrolling() {
+    let mut t = T::new(
+        "<div id=top style='height:300px'></div><div id=far style='height:100px;margin-top:2000px'></div><div style='height:3000px'></div>
+         <script>
+           var out = [];
+           var io = new IntersectionObserver(function (entries) {
+             entries.forEach(function (e) { out.push(e.target.id + ':' + e.isIntersecting + ':' + Math.round(e.intersectionRatio * 100)); });
+           }, { threshold: [0, 0.5] });
+           io.observe(document.getElementById('top'));
+           io.observe(document.getElementById('far'));
+           var ro = new ResizeObserver(function (entries) { entries.forEach(function (e) { out.push('size:' + e.contentRect.height); }); });
+           ro.observe(document.getElementById('top'));
+           console.log(IntersectionObserverEntry.prototype.hasOwnProperty('intersectionRatio'));
+         </script>",
+    );
+    t.frame(16.0);
+    t.p.eval("console.log(out.join(' ')); out.length = 0");
+    // nothing changed: the observers stay quiet and ask for no frames
+    t.frame(32.0);
+    t.frame(48.0);
+    assert!(!t.p.wants_frame());
+    // scrolling brings the far box in and takes the top one out
+    t.p.scroll_to(0.0, 2000.0);
+    assert!(t.p.wants_frame());
+    t.frame(64.0);
+    t.p.eval("console.log(out.join(' ')); out.length = 0");
+    // a size change is reported once
+    t.p.eval("document.getElementById('top').style.height = '120px'");
+    t.frame(80.0);
+    t.frame(96.0);
+    t.p.eval("console.log(out.join(' '))");
+    t.step(96.0);
+    assert_eq!(t.logs(), ["true", "size:300 top:true:100 far:false:0", "top:false:0 far:true:100", "size:120"]);
+    assert!(t.errors().is_empty(), "{:?}", t.log);
 }

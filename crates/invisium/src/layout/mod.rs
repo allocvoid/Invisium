@@ -146,11 +146,21 @@ pub struct LayoutTree {
     /// Extent of the laid-out document (scrollable area).
     pub width: f32,
     pub height: f32,
+    /// `position: sticky` boxes with the position layout gave them, parents before children.
+    pub sticky: Vec<StickyBox>,
+}
+
+/// A `position: sticky` box and where it sits when nothing makes it stick.
+#[derive(Clone, Copy, Debug)]
+pub struct StickyBox {
+    pub id: BoxId,
+    pub base_x: f32,
+    pub base_y: f32,
 }
 
 impl LayoutTree {
     pub fn empty() -> LayoutTree {
-        LayoutTree { boxes: Vec::new(), fragments: Vec::new(), glyphs: Vec::new(), glyph_base: 0, gen_text: Vec::new(), root: NO_BOX, width: 0.0, height: 0.0 }
+        LayoutTree { boxes: Vec::new(), fragments: Vec::new(), glyphs: Vec::new(), glyph_base: 0, gen_text: Vec::new(), root: NO_BOX, width: 0.0, height: 0.0, sticky: Vec::new() }
     }
 
     pub fn children(&self, id: BoxId) -> BoxChildren<'_> {
@@ -174,6 +184,67 @@ impl LayoutTree {
             b = bx.parent;
         }
         (x, y)
+    }
+
+    /// Move every `position: sticky` box to where it belongs for this scroll position (document
+    /// scrolling only: a box inside a clipping ancestor sticks to that ancestor, which never
+    /// scrolls here, so it stays put). Returns true if any box moved.
+    pub fn place_sticky(&mut self, styles: &StyleStore, scroll: (f32, f32), viewport: (f32, f32)) -> bool {
+        let mut moved = false;
+        for i in 0..self.sticky.len() {
+            let s = self.sticky[i];
+            let Some(b) = self.boxes.get(s.id as usize) else { continue };
+            let (w, h, margin, parent) = (b.w, b.h, b.margin, b.parent);
+            let st = styles.style(b.style);
+            let (mut dx, mut dy) = (0.0f32, 0.0f32);
+            // the scroller is the document unless an ancestor clips or is viewport-fixed
+            let mut free = parent != NO_BOX;
+            let mut a = parent;
+            while a != NO_BOX && free {
+                let ab = &self.boxes[a as usize];
+                // `overflow: clip` cuts content off without making a scroller, and what the root
+                // and the body ask for applies to the viewport itself
+                let scroller = |o: Overflow| matches!(o, Overflow::Hidden | Overflow::Scroll | Overflow::Auto);
+                let ast = styles.style(ab.style);
+                let own_scroller = ab.flags & F_CLIP != 0 && (scroller(ast.overflow_x) || scroller(ast.overflow_y));
+                if ab.flags & F_FIXED != 0 || (own_scroller && a != self.root && ab.parent != self.root) {
+                    free = false;
+                }
+                a = ab.parent;
+            }
+            if free {
+                let pb = &self.boxes[parent as usize];
+                let pst = styles.style(pb.style);
+                let (px, py) = self.abs_pos(parent);
+                let bw = pst.border_width;
+                // content box of the containing block, in document coordinates
+                let (c_top, c_bottom) = (py + bw[0] + pb.pad[0], py + pb.h - bw[2] - pb.pad[2]);
+                let (c_left, c_right) = (px + bw[3] + pb.pad[3], px + pb.w - bw[1] - pb.pad[1]);
+                let (nx, ny) = (px + s.base_x, py + s.base_y);
+                if let Some(t) = st.inset[0].resolve(viewport.1) {
+                    let room = (c_bottom - h - margin[2]) - ny;
+                    dy = (scroll.1 + t - ny).clamp(0.0, room.max(0.0));
+                } else if let Some(bo) = st.inset[2].resolve(viewport.1) {
+                    let room = ny - margin[0] - c_top;
+                    dy = -((ny + h) - (scroll.1 + viewport.1 - bo)).clamp(0.0, room.max(0.0));
+                }
+                if let Some(l) = st.inset[3].resolve(viewport.0) {
+                    let room = (c_right - w - margin[1]) - nx;
+                    dx = (scroll.0 + l - nx).clamp(0.0, room.max(0.0));
+                } else if let Some(r) = st.inset[1].resolve(viewport.0) {
+                    let room = nx - margin[3] - c_left;
+                    dx = -((nx + w) - (scroll.0 + viewport.0 - r)).clamp(0.0, room.max(0.0));
+                }
+            }
+            let b = &mut self.boxes[s.id as usize];
+            let (x, y) = (s.base_x + dx, s.base_y + dy);
+            if b.x != x || b.y != y {
+                b.x = x;
+                b.y = y;
+                moved = true;
+            }
+        }
+        moved
     }
 
     /// First box generated for a DOM node.
@@ -1327,6 +1398,14 @@ pub fn layout_document(input: LayoutInput) -> LayoutTree {
     l.tree.height = max.1;
     l.tree.boxes.shrink_to_fit();
     l.tree.glyph_base = l.tree.glyphs.len() as u32;
+    for (i, b) in l.tree.boxes.iter().enumerate() {
+        if b.flags & F_POSITIONED != 0
+            && !matches!(b.kind, BoxKind::Inline | BoxKind::Text | BoxKind::Break)
+            && l.styles.style(b.style).position == Position::Sticky
+        {
+            l.tree.sticky.push(StickyBox { id: i as BoxId, base_x: b.x, base_y: b.y });
+        }
+    }
     l.tree
 }
 
@@ -1400,11 +1479,22 @@ impl LayoutTree {
             x += sx;
             y += sy;
         }
-        if let Some((tx, ty)) = &st.translate {
-            x += tx.px(b.w);
-            y += ty.px(b.h);
-        }
         let has_geom = !matches!(b.kind, BoxKind::Inline | BoxKind::Text | BoxKind::Break);
+        let (mut px, mut py) = (px, py);
+        if let Some(m) = st.transform_matrix(b.w, b.h) {
+            if crate::style::is_translation(&m) {
+                x += m[4];
+                y += m[5];
+            } else if has_geom {
+                // look at the point in the box's own, untransformed space
+                use crate::draw::{affine_inverse, affine_mul, affine_point};
+                let world = affine_mul(&affine_mul(&[1.0, 0.0, 0.0, 1.0, x, y], &m), &[1.0, 0.0, 0.0, 1.0, -x, -y]);
+                match affine_inverse(&world) {
+                    Some(inv) => (px, py) = affine_point(&inv, px, py),
+                    None => return,
+                }
+            }
+        }
         let inside = has_geom && px >= x && px < x + b.w && py >= y && py < y + b.h;
         if has_geom && b.flags & F_CLIP != 0 && !inside {
             return;

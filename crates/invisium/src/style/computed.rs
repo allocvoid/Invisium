@@ -2,6 +2,9 @@
 
 use crate::atom::Atom;
 use crate::css::values::{BgSize, Color, ContentItem, GridAreas, GridLine, Image, Len, Size, TrackItem};
+use crate::anim::{Direction, Easing, Fill};
+use crate::css::properties::TransProp;
+use crate::draw::{affine_mul, Affine, IDENTITY};
 use std::rc::Rc;
 
 macro_rules! simple_enum {
@@ -18,6 +21,68 @@ simple_enum!(Display {
     TableCaption, ListItem, Contents,
 });
 simple_enum!(Position { Static, Relative, Absolute, Fixed, Sticky });
+
+/// The `transition-*` properties. The lists are as written; a shorter list repeats.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct TransStyle {
+    pub props: Vec<TransProp>,
+    /// Milliseconds.
+    pub durations: Vec<f32>,
+    pub delays: Vec<f32>,
+    pub easings: Vec<Easing>,
+}
+
+impl TransStyle {
+    /// True if any listed transition takes time.
+    pub fn any(&self) -> bool {
+        self.durations.iter().any(|d| *d > 0.0) || self.delays.iter().any(|d| *d > 0.0)
+    }
+}
+
+/// The `animation-*` properties. `names` decides how many animations there are; the other
+/// lists repeat as needed.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct AnimStyle {
+    pub names: Vec<Atom>,
+    pub durations: Vec<f32>,
+    pub delays: Vec<f32>,
+    pub easings: Vec<Easing>,
+    pub iterations: Vec<f32>,
+    pub directions: Vec<Direction>,
+    pub fills: Vec<Fill>,
+    pub paused: Vec<bool>,
+}
+
+/// Item `i` of a list that repeats when it is shorter than the list that drives it.
+pub fn cyc<T: Clone>(list: &[T], i: usize, default: T) -> T {
+    if list.is_empty() {
+        default
+    } else {
+        list[i % list.len()].clone()
+    }
+}
+
+/// One function of a computed `transform` list.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TransformOp {
+    Translate(Size, Size),
+    Scale(f32, f32),
+    /// Clockwise, in degrees.
+    Rotate(f32),
+    Skew(f32, f32),
+    Matrix([f32; 6]),
+}
+
+/// Clockwise rotation by `deg` degrees (y grows downward).
+pub fn rotation(deg: f32) -> Affine {
+    let (s, c) = deg.to_radians().sin_cos();
+    [c, s, -s, c, 0.0, 0.0]
+}
+
+/// True if `m` only moves things (no scale, rotation or skew).
+pub fn is_translation(m: &Affine) -> bool {
+    m[0] == 1.0 && m[1] == 0.0 && m[2] == 0.0 && m[3] == 1.0
+}
 simple_enum!(Float { None, Left, Right });
 simple_enum!(Clear { None, Left, Right, Both });
 simple_enum!(Overflow { Visible, Hidden, Scroll, Auto, Clip });
@@ -222,7 +287,16 @@ pub struct ComputedStyle {
     pub content: Option<Rc<[ContentItem]>>,
     pub object_fit: ObjectFit,
     pub aspect_ratio: Option<f32>,
+    /// The `transform` function list, lengths resolved.
+    pub transform: Option<Rc<[TransformOp]>>,
+    /// The standalone `translate`, `rotate` (degrees) and `scale` properties.
     pub translate: Option<(Size, Size)>,
+    pub rotate: f32,
+    pub scale: (f32, f32),
+    /// `transform-origin`, relative to the border box.
+    pub transform_origin: (Size, Size),
+    pub transitions: Option<Rc<TransStyle>>,
+    pub animations: Option<Rc<AnimStyle>>,
     pub outline_width: f32,
     pub outline_style: BorderStyle,
     pub outline_color: Color,
@@ -321,7 +395,13 @@ impl ComputedStyle {
             content: None,
             object_fit: ObjectFit::Fill,
             aspect_ratio: None,
+            transform: None,
             translate: None,
+            rotate: 0.0,
+            scale: (1.0, 1.0),
+            transform_origin: (Size::Pct(50.0), Size::Pct(50.0)),
+            transitions: None,
+            animations: None,
             outline_width: 0.0,
             outline_style: BorderStyle::None,
             outline_color: Color::BLACK,
@@ -379,6 +459,47 @@ impl ComputedStyle {
 
     pub fn is_positioned(&self) -> bool {
         self.position != Position::Static
+    }
+
+    /// Any of `transform`, `translate`, `rotate` or `scale` is set to something.
+    pub fn has_transform(&self) -> bool {
+        self.transform.is_some() || self.translate.is_some() || self.rotate != 0.0 || self.scale != (1.0, 1.0)
+    }
+
+    /// The transform of a `w` x `h` border box as a matrix in the box's own coordinates (origin
+    /// at its top-left corner). `None` when nothing is set.
+    pub fn transform_matrix(&self, w: f32, h: f32) -> Option<Affine> {
+        if !self.has_transform() {
+            return None;
+        }
+        let (ox, oy) = (self.transform_origin.0.px(w), self.transform_origin.1.px(h));
+        let mut m: Affine = [1.0, 0.0, 0.0, 1.0, ox, oy];
+        if let Some((tx, ty)) = &self.translate {
+            m = affine_mul(&m, &[1.0, 0.0, 0.0, 1.0, tx.px(w), ty.px(h)]);
+        }
+        if self.rotate != 0.0 {
+            m = affine_mul(&m, &rotation(self.rotate));
+        }
+        if self.scale != (1.0, 1.0) {
+            m = affine_mul(&m, &[self.scale.0, 0.0, 0.0, self.scale.1, 0.0, 0.0]);
+        }
+        if let Some(ops) = &self.transform {
+            for op in ops.iter() {
+                let f: Affine = match op {
+                    TransformOp::Translate(x, y) => [1.0, 0.0, 0.0, 1.0, x.px(w), y.px(h)],
+                    TransformOp::Scale(x, y) => [*x, 0.0, 0.0, *y, 0.0, 0.0],
+                    TransformOp::Rotate(deg) => rotation(*deg),
+                    TransformOp::Skew(ax, ay) => [1.0, ay.to_radians().tan(), ax.to_radians().tan(), 1.0, 0.0, 0.0],
+                    TransformOp::Matrix(m) => *m,
+                };
+                m = affine_mul(&m, &f);
+            }
+        }
+        m = affine_mul(&m, &[1.0, 0.0, 0.0, 1.0, -ox, -oy]);
+        if m.iter().any(|v| !v.is_finite()) {
+            return Some(IDENTITY);
+        }
+        Some(m)
     }
 
     pub fn is_out_of_flow(&self) -> bool {

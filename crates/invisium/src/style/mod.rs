@@ -10,11 +10,11 @@ mod ua;
 pub use computed::*;
 
 use crate::atom::{a, Atom};
-use crate::css::parser::{parse_stylesheet, MediaEnv, MediaQueryList, Origin, Rule, Stylesheet};
+use crate::css::parser::{parse_stylesheet, KeyframeRule, MediaEnv, MediaQueryList, Origin, Rule, Stylesheet};
 use crate::css::properties::{self, longhands, Declaration, Kw, PropId, UrlResolver, Value};
 use crate::css::selector::{matches, MatchCtx, PseudoElement, Selector};
 use crate::css::tokenizer::tokenize_value;
-use crate::css::values::{named_color, parse_hex_color, Color, CssColor, Len, LenCtx, Size};
+use crate::css::values::{named_color, parse_hex_color, Color, CssColor, Len, LenCtx, Size, TransformFn};
 use crate::dom::{Document, Element, NodeId, NO_NODE};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -31,10 +31,15 @@ pub struct StyleStore {
     pub of_node: Vec<StyleId>,
     pub before: HashMap<NodeId, StyleId>,
     pub after: HashMap<NodeId, StyleId>,
+    /// For elements with animated values laid over their style: the style without them.
+    pub base: HashMap<NodeId, StyleId>,
     pub root_font_size: f32,
     pub vw: f32,
     pub vh: f32,
 }
+
+/// Values an animation lays over an element's style.
+pub type Overrides = HashMap<NodeId, Vec<(PropId, Value)>>;
 
 impl StyleStore {
     pub fn empty() -> StyleStore {
@@ -43,10 +48,46 @@ impl StyleStore {
             of_node: Vec::new(),
             before: HashMap::new(),
             after: HashMap::new(),
+            base: HashMap::new(),
             root_font_size: 16.0,
             vw: 0.0,
             vh: 0.0,
         }
+    }
+
+    /// The style of `node` without animated values.
+    pub fn base_style(&self, node: NodeId) -> Option<&ComputedStyle> {
+        match self.base.get(&node) {
+            Some(&id) => self.styles.get(id as usize).map(|s| &**s),
+            None => self.get(node),
+        }
+    }
+
+    /// Lay `over` on top of `node`'s style without redoing the cascade. Only correct when no
+    /// value in `over` (or in what was there before) is inherited by children. Returns false if
+    /// the element has no style.
+    pub fn reanimate(&mut self, doc: &Document, node: NodeId, over: &[(PropId, Value)]) -> bool {
+        let current = self.id_of(node);
+        if current == NO_STYLE {
+            return false;
+        }
+        let base = *self.base.entry(node).or_insert(current);
+        // the element needs a style of its own: the one it has may be shared with others
+        let slot = if current == base {
+            let copy = (*self.styles[base as usize]).clone();
+            let id = self.push(copy);
+            self.of_node[node as usize] = id;
+            id
+        } else {
+            current
+        };
+        let psid = self.id_of(doc.parent(node));
+        let parent: Rc<ComputedStyle> = if psid == NO_STYLE { ComputedStyle::initial() } else { self.styles[psid as usize].clone() };
+        let mut st = (*self.styles[base as usize]).clone();
+        let cx = Cx { root_fs: self.root_font_size, vw: self.vw, vh: self.vh };
+        apply_overrides(&mut st, &parent, over, &cx);
+        self.styles[slot as usize] = Rc::new(st);
+        true
     }
 
     #[inline]
@@ -142,6 +183,8 @@ struct RuleIndex {
     dynamic: bool,
     /// `@property` registrations; a later rule for the same name replaces an earlier one
     registered: HashMap<Atom, Registered>,
+    /// `@keyframes` by name; a later rule replaces an earlier one
+    keyframes: HashMap<Atom, Rc<Vec<KeyframeRule>>>,
 }
 
 /// A custom property registered with `@property`.
@@ -190,8 +233,36 @@ impl RuleIndex {
                 Rule::Property { name, inherits, initial } => {
                     self.registered.insert(*name, Registered { inherits: *inherits, initial: initial.clone() });
                 }
+                Rule::Keyframes { name, frames } => {
+                    self.keyframes.insert(*name, frames.clone());
+                }
                 Rule::Import { .. } | Rule::FontFace(_) => {}
             }
+        }
+    }
+}
+
+/// Lay animated values over a cascaded style.
+fn apply_overrides(st: &mut ComputedStyle, parent: &ComputedStyle, over: &[(PropId, Value)], cx: &Cx) {
+    // what other values depend on first, as in the cascade
+    for (p, v) in over {
+        if matches!(p, PropId::FontSize | PropId::Color) {
+            apply(st, parent, *p, v, cx);
+        }
+    }
+    for (p, v) in over {
+        if !matches!(p, PropId::FontSize | PropId::Color) {
+            apply(st, parent, *p, v, cx);
+        }
+    }
+    if over.iter().any(|(p, _)| *p == PropId::Color) {
+        for i in 0..4 {
+            if st.border_color_set & (1 << i) == 0 {
+                st.border_color[i] = st.color;
+            }
+        }
+        if !st.outline_color_set {
+            st.outline_color = st.color;
         }
     }
 }
@@ -252,6 +323,8 @@ pub struct StyleInput<'a> {
     pub target: NodeId,
     pub resolve: UrlResolver<'a>,
     pub scripting: bool,
+    /// Animated values to lay over the cascaded styles.
+    pub animated: Option<&'a Overrides>,
 }
 
 #[derive(Default)]
@@ -294,6 +367,70 @@ impl Stylist {
         self.index.as_ref().map_or(0, |i| i.2.rules.len())
     }
 
+    /// The keyframes of the `@keyframes` rule called `name`, for an element whose style is `st`
+    /// (its custom properties resolve any `var()` in the keyframes). `timing` is the element's
+    /// `animation-timing-function`, which applies between keyframes that do not set their own.
+    pub fn css_keyframes(&self, name: Atom, st: &ComputedStyle, timing: &crate::anim::Easing, resolve: UrlResolver) -> Option<Vec<crate::anim::Keyframe>> {
+        use crate::anim::Keyframe;
+        let index = &self.index.as_ref()?.2;
+        let rules = index.keyframes.get(&name)?;
+        let mut frames: Vec<Keyframe> = Vec::new();
+        // keyframes by offset (a hostile sheet can list a great many)
+        let mut at: HashMap<u32, usize> = HashMap::new();
+        const MAX_FRAMES: usize = 1024;
+        let mut tmp: Vec<Declaration> = Vec::new();
+        for rule in rules.iter() {
+            let mut values: Vec<(PropId, Value)> = Vec::new();
+            let mut easing = None;
+            for d in &rule.decls {
+                let mut take = |prop: PropId, v: &Value, values: &mut Vec<(PropId, Value)>| match (prop, v) {
+                    (PropId::AnimationTimingFunction, Value::Easings(l)) => easing = l.first().cloned(),
+                    (PropId::Custom, _) => {}
+                    _ => values.push((prop, v.clone())),
+                };
+                match &d.value {
+                    Value::Custom(..) => {}
+                    Value::Pending(text) => {
+                        let scope = VarScope { chain: st.vars.as_deref(), local: &[], registered: Some(&index.registered) };
+                        if let Some(s) = substitute_vars(text, &scope, 0) {
+                            let toks = tokenize_value(&s);
+                            tmp.clear();
+                            properties::parse_value(d.prop, &toks, false, resolve, &mut tmp);
+                            for t in tmp.drain(..) {
+                                take(t.prop, &t.value, &mut values);
+                            }
+                        }
+                    }
+                    v => take(d.prop, v, &mut values),
+                }
+            }
+            for &offset in &rule.offsets {
+                match at.get(&offset.to_bits()) {
+                    Some(&i) => {
+                        let f = &mut frames[i];
+                        if f.values.len() < 4096 {
+                            f.values.extend(values.iter().cloned());
+                        }
+                        if easing.is_some() {
+                            f.easing.clone_from(&easing);
+                        }
+                    }
+                    None if frames.len() < MAX_FRAMES => {
+                        at.insert(offset.to_bits(), frames.len());
+                        frames.push(Keyframe { offset, easing: easing.clone(), values: values.clone() });
+                    }
+                    None => {}
+                }
+            }
+        }
+        for f in &mut frames {
+            if f.easing.is_none() {
+                f.easing = Some(timing.clone());
+            }
+        }
+        Some(frames)
+    }
+
     fn ensure_index(&mut self, env: MediaEnv, scripting: bool) {
         if let Some((e, s, _)) = &self.index {
             if *e == env && *s == scripting {
@@ -333,6 +470,7 @@ impl Stylist {
             of_node: vec![NO_STYLE; doc.nodes.len()],
             before: HashMap::new(),
             after: HashMap::new(),
+            base: HashMap::new(),
             root_font_size: 16.0,
             vw: input.env.width,
             vh: input.env.height,
@@ -383,6 +521,19 @@ impl Stylist {
                     sid
                 }
             };
+            // animated values go on top of the cascaded style; children inherit from the result
+            let sid = match input.animated.and_then(|m| m.get(&node)) {
+                Some(over) if !over.is_empty() => {
+                    let cx = Cx { root_fs: store.root_font_size, vw: input.env.width, vh: input.env.height };
+                    let parent: &ComputedStyle =
+                        if parent_sid == NO_STYLE { &initial } else { &store.styles[parent_sid as usize] };
+                    let mut st = (*store.styles[sid as usize]).clone();
+                    apply_overrides(&mut st, parent, over, &cx);
+                    store.base.insert(node, sid);
+                    store.push(st)
+                }
+                _ => sid,
+            };
             store.of_node[node as usize] = sid;
             if is_root {
                 store.root_font_size = store.styles[sid as usize].font_size;
@@ -431,9 +582,12 @@ impl Stylist {
             }
         }
         // Custom-property maps are only needed while cascading.
+        // (kept where an animation may still need them for `var()` in its keyframes)
         for s in &mut store.styles {
             if let Some(m) = Rc::get_mut(s) {
-                m.vars = None;
+                if m.animations.is_none() {
+                    m.vars = None;
+                }
             }
         }
         store.styles.shrink_to_fit();
@@ -861,7 +1015,7 @@ fn presentational_hints(doc: &Document, node: NodeId, el: &Element) -> String {
 
 // ───────────────────────────── cascade ─────────────────────────────
 
-fn is_inherited(p: PropId) -> bool {
+pub(crate) fn is_inherited(p: PropId) -> bool {
     use PropId::*;
     matches!(
         p,
@@ -928,6 +1082,34 @@ fn copy_prop(d: &mut ComputedStyle, s: &ComputedStyle, p: PropId) {
         TextFillColor => d.text_fill = s.text_fill,
         BackgroundClip => d.bg_clip_text = s.bg_clip_text,
         Translate => d.translate = s.translate.clone(),
+        Rotate => d.rotate = s.rotate,
+        Scale => d.scale = s.scale,
+        TransformOrigin => d.transform_origin = s.transform_origin.clone(),
+        TransitionProperty | TransitionDuration | TransitionTimingFunction | TransitionDelay => {
+            let from = s.transitions.as_deref().cloned().unwrap_or_default();
+            let t = Rc::make_mut(d.transitions.get_or_insert_with(Default::default));
+            match p {
+                TransitionProperty => t.props = from.props,
+                TransitionDuration => t.durations = from.durations,
+                TransitionTimingFunction => t.easings = from.easings,
+                _ => t.delays = from.delays,
+            }
+        }
+        AnimationName | AnimationDuration | AnimationTimingFunction | AnimationDelay | AnimationIterationCount
+        | AnimationDirection | AnimationFillMode | AnimationPlayState => {
+            let from = s.animations.as_deref().cloned().unwrap_or_default();
+            let t = Rc::make_mut(d.animations.get_or_insert_with(Default::default));
+            match p {
+                AnimationName => t.names = from.names,
+                AnimationDuration => t.durations = from.durations,
+                AnimationTimingFunction => t.easings = from.easings,
+                AnimationDelay => t.delays = from.delays,
+                AnimationIterationCount => t.iterations = from.iterations,
+                AnimationDirection => t.directions = from.directions,
+                AnimationFillMode => t.fills = from.fills,
+                _ => t.paused = from.paused,
+            }
+        }
         BackgroundColor => d.background_color = s.background_color,
         BackgroundImage | BackgroundSize | BackgroundPosition | BackgroundRepeat => d.background = s.background.clone(),
         FontFamily => d.font_family = s.font_family.clone(),
@@ -983,7 +1165,7 @@ fn copy_prop(d: &mut ComputedStyle, s: &ComputedStyle, p: PropId) {
         Content => d.content = s.content.clone(),
         ObjectFit => d.object_fit = s.object_fit,
         AspectRatio => d.aspect_ratio = s.aspect_ratio,
-        Transform => d.translate = s.translate.clone(),
+        Transform => d.transform = s.transform.clone(),
         OutlineWidth => d.outline_width = s.outline_width,
         OutlineStyle => d.outline_style = s.outline_style,
         OutlineColor => {
@@ -1554,10 +1736,91 @@ fn apply(st: &mut ComputedStyle, parent: &ComputedStyle, prop: PropId, v: &Value
                 _ => None,
             }
         }
-        Transform | Translate => {
+        Transform => {
+            st.transform = match v {
+                Value::Transform(list) => Some(
+                    list.iter()
+                        .map(|f| match f {
+                            TransformFn::Translate(x, y) => TransformOp::Translate(x.to_size(&lc), y.to_size(&lc)),
+                            TransformFn::Scale(x, y) => TransformOp::Scale(*x, *y),
+                            TransformFn::Rotate(d) => TransformOp::Rotate(*d),
+                            TransformFn::Skew(x, y) => TransformOp::Skew(*x, *y),
+                            TransformFn::Matrix(m) => TransformOp::Matrix(*m),
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            }
+        }
+        Translate => {
             st.translate = match v {
+                Value::Translate(Len::Px(x), Len::Px(y)) if *x == 0.0 && *y == 0.0 => None,
                 Value::Translate(x, y) => Some((x.to_size(&lc), y.to_size(&lc))),
                 _ => None,
+            }
+        }
+        Rotate => {
+            st.rotate = match v {
+                Value::Num(d) if d.is_finite() => *d,
+                _ => 0.0,
+            }
+        }
+        Scale => {
+            st.scale = match v {
+                Value::Scale(x, y) => (*x, *y),
+                _ => (1.0, 1.0),
+            }
+        }
+        TransformOrigin => {
+            st.transform_origin = match v {
+                Value::Pair(x, y) => (x.to_size(&lc), y.to_size(&lc)),
+                _ => (Size::Pct(50.0), Size::Pct(50.0)),
+            }
+        }
+        TransitionProperty | TransitionDuration | TransitionTimingFunction | TransitionDelay => {
+            let t = Rc::make_mut(st.transitions.get_or_insert_with(Default::default));
+            match (prop, v) {
+                (TransitionProperty, Value::TransProps(l)) => t.props = l.to_vec(),
+                (TransitionDuration, Value::Times(l)) => t.durations = l.to_vec(),
+                (TransitionTimingFunction, Value::Easings(l)) => t.easings = l.to_vec(),
+                (TransitionDelay, Value::Times(l)) => t.delays = l.to_vec(),
+                _ => {}
+            }
+        }
+        AnimationName | AnimationDuration | AnimationTimingFunction | AnimationDelay | AnimationIterationCount
+        | AnimationDirection | AnimationFillMode | AnimationPlayState => {
+            use crate::anim::{Direction, Fill};
+            let t = Rc::make_mut(st.animations.get_or_insert_with(Default::default));
+            match (prop, v) {
+                (AnimationName, Value::Names(l)) => t.names = l.to_vec(),
+                (AnimationDuration, Value::Times(l)) => t.durations = l.to_vec(),
+                (AnimationTimingFunction, Value::Easings(l)) => t.easings = l.to_vec(),
+                (AnimationDelay, Value::Times(l)) => t.delays = l.to_vec(),
+                (AnimationIterationCount, Value::Nums(l)) => t.iterations = l.to_vec(),
+                (AnimationDirection, Value::Nums(l)) => {
+                    t.directions = l
+                        .iter()
+                        .map(|c| match *c as u8 {
+                            1 => Direction::Reverse,
+                            2 => Direction::Alternate,
+                            3 => Direction::AlternateReverse,
+                            _ => Direction::Normal,
+                        })
+                        .collect()
+                }
+                (AnimationFillMode, Value::Nums(l)) => {
+                    t.fills = l
+                        .iter()
+                        .map(|c| match *c as u8 {
+                            1 => Fill::Forwards,
+                            2 => Fill::Backwards,
+                            3 => Fill::Both,
+                            _ => Fill::None,
+                        })
+                        .collect()
+                }
+                (AnimationPlayState, Value::Nums(l)) => t.paused = l.iter().map(|c| *c != 0.0).collect(),
+                _ => {}
             }
         }
         OutlineWidth => st.outline_width = px(v).max(0.0),
@@ -1813,6 +2076,7 @@ mod tests {
             target: NO_NODE,
             resolve: &resolve,
             scripting: false,
+            animated: None,
         };
         let store = stylist.compute(&input);
         (doc, store)

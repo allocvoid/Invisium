@@ -6,6 +6,7 @@
 
 mod host;
 mod natives;
+mod natives_anim;
 mod natives_env;
 mod serialize;
 #[cfg(test)]
@@ -35,6 +36,7 @@ const BOOTSTRAP: &str = concat!(
     include_str!("js/45_fetch.js"),
     include_str!("js/46_streams.js"),
     include_str!("js/47_misc.js"),
+    include_str!("js/48_animation.js"),
     include_str!("js/50_window.js"),
 );
 
@@ -66,6 +68,9 @@ struct Exports {
     loaded: Value,
     uncaught: Value,
     files: Value,
+    frame: Value,
+    anim: Value,
+    anim_done: Value,
 }
 
 pub(crate) struct ScriptEngine {
@@ -113,6 +118,7 @@ impl ScriptEngine {
         rt.root(n);
         natives::install(&mut rt, n, &cx);
         natives_env::install(&mut rt, n, &cx);
+        natives_anim::install(&mut rt, n, &cx);
         ScriptEngine { rt, cx, natives: n, exports: None, broken: false, tmp: Vec::new() }
     }
 
@@ -182,6 +188,9 @@ impl ScriptEngine {
                     loaded: grab("loaded"),
                     uncaught: grab("uncaught"),
                     files: grab("files"),
+                    frame: grab("frame"),
+                    anim: grab("anim"),
+                    anim_done: grab("animDone"),
                 });
             }
             Err(e) => {
@@ -354,6 +363,56 @@ impl ScriptEngine {
         self.call_export(ex.loaded, &[n, Value::Bool(ok)], "load listener");
     }
 
+    /// True if a script has work for the next frame.
+    pub fn frame_wanted(&self) -> bool {
+        let st = self.cx.st.borrow();
+        st.frame_wanted || st.observers_due
+    }
+
+    /// True if scripts watch element sizes or visibility (they are told after layout changes).
+    pub fn observing(&self) -> bool {
+        self.cx.st.borrow().observing
+    }
+
+    /// A frame is about to be drawn: run what scripts queued for it (animation-frame
+    /// callbacks, then the size and visibility observers).
+    pub fn run_frame(&mut self, now: f64) {
+        let Some(ex) = self.exports else { return };
+        {
+            let mut st = self.cx.st.borrow_mut();
+            st.set_now(now);
+            st.frame_wanted = false;
+            st.observers_due = false;
+        }
+        self.call_export(ex.frame, &[Value::Number(now.floor())], "animation frame");
+    }
+
+    /// A CSS transition or animation started or ended on `node`. `name` is the property or
+    /// the `@keyframes` name; `elapsed` is in seconds.
+    pub fn animation_event(&mut self, node: NodeId, kind: &str, name: &str, elapsed: f64) {
+        let Some(ex) = self.exports else { return };
+        if !self.cx.st.borrow().page.document().is_valid(node) {
+            return;
+        }
+        let t = wrap(&mut self.rt, &self.cx, node);
+        let k = self.rt.string(kind);
+        self.keep(k);
+        let n = self.rt.string(name);
+        self.keep(n);
+        self.call_export(ex.anim, &[t, k, n, Value::Number(elapsed)], "animation event");
+        self.release();
+    }
+
+    /// Script animations (`Element.animate`) that reached their end.
+    pub fn animations_finished(&mut self, ids: &[u32]) {
+        let Some(ex) = self.exports else { return };
+        let vals: Vec<Value> = ids.iter().map(|&i| Value::Number(i as f64)).collect();
+        let list = self.rt.array(&vals);
+        self.keep(list);
+        self.call_export(ex.anim_done, &[list], "animation finish");
+        self.release();
+    }
+
     /// A request made by script finished. `None` = it failed; script is never told why.
     pub fn fetch_done(&mut self, id: u32, result: Option<&crate::page::FetchResult>) {
         let Some(ex) = self.exports else { return };
@@ -405,7 +464,7 @@ impl ScriptEngine {
         let Some(ex) = self.exports else { return 0 };
         let mut due: Vec<(f64, u32)> = {
             let mut st = self.cx.st.borrow_mut();
-            st.now_ms = now;
+            st.set_now(now);
             st.timers.iter().filter(|t| t.due <= now).map(|t| (t.due, t.id)).collect()
         };
         due.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1)));

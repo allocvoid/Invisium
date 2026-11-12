@@ -231,48 +231,8 @@ class Element extends Node {
   get classList() { return this[CLASSES] || (hide(this, CLASSES, new DOMTokenList(this, 'class')), this[CLASSES]); }
   set classList(v) { n.setAttr(this, 'class', String(v)); }
   get slot() { return n.getAttr(this, 'slot') || ''; }
-  // Web Animations without an animation engine: the animation counts as finished on the next
-  // timer turn, and a `fill` of forwards/both leaves the last keyframe's values on the element.
-  animate(keyframes, options) {
-    var self = this, fill = options && typeof options === 'object' ? options.fill : undefined;
-    var last = null;
-    if (Array.isArray(keyframes)) last = keyframes[keyframes.length - 1] || null;
-    else if (keyframes && typeof keyframes === 'object') {
-      last = {};
-      for (var k in keyframes) { var v = keyframes[k]; last[k] = Array.isArray(v) ? v[v.length - 1] : v; }
-    }
-    var done, failed;
-    var anim = new EventTarget();
-    anim.playState = 'running'; anim.currentTime = 0; anim.playbackRate = 1; anim.effect = null; anim.id = '';
-    anim.onfinish = null; anim.oncancel = null;
-    anim.finished = new Promise(function (res, rej) { done = res; failed = rej; });
-    anim.finished.catch(function () {});
-    anim.ready = Promise.resolve(anim);
-    var finish = function () {
-      if (anim.playState !== 'running') return;
-      anim.playState = 'finished';
-      if (last && (fill === 'forwards' || fill === 'both')) {
-        for (var p in last) {
-          if (p === 'offset' || p === 'easing' || p === 'composite') continue;
-          try { self.style[p === 'cssFloat' ? 'float' : p] = last[p]; } catch (e) {}
-        }
-      }
-      done(anim);
-      dispatch(anim, new Event('finish'));
-    };
-    anim.finish = finish;
-    anim.play = function () {}; anim.pause = function () {}; anim.reverse = function () {};
-    anim.commitStyles = function () {}; anim.persist = function () {}; anim.updatePlaybackRate = function () {};
-    anim.cancel = function () {
-      if (anim.playState !== 'running') return;
-      anim.playState = 'idle';
-      failed(new DOMException('The animation was cancelled', 'AbortError'));
-      dispatch(anim, new Event('cancel'));
-    };
-    g.setTimeout(finish, 0);
-    return anim;
-  }
-  getAnimations() { return []; }
+  animate(keyframes, options) { return elementAnimate(this, keyframes, options); }
+  getAnimations(options) { return animationsOf(this, !!(options && options.subtree)); }
   get shadowRoot() { var r = this._shadow; return r && r.mode === 'open' ? r : null; }
   attachShadow(init) {
     if (this._shadow) throw new DOMException('The element already has a shadow root', 'NotSupportedError');
@@ -382,7 +342,6 @@ class Element extends Node {
   scrollTo(x, y) { if (isRootScroller(this)) g.scrollTo(x, y); }
   scrollBy(x, y) { if (isRootScroller(this)) g.scrollBy(x, y); }
   scroll(x, y) { this.scrollTo(x, y); }
-  getAnimations() { return []; }
   setPointerCapture() {}
   releasePointerCapture() {}
   hasPointerCapture() { return false; }

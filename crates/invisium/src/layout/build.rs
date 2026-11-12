@@ -149,7 +149,8 @@ fn box_flags(st: &ComputedStyle) -> u16 {
     } else if st.float != Float::None {
         flags |= F_FLOAT | F_BFC;
     }
-    if st.position != Position::Static {
+    // a transformed box is a containing block and a stacking context, like a positioned one
+    if st.position != Position::Static || st.has_transform() {
         flags |= F_POSITIONED;
     }
     if st.clips() {

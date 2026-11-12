@@ -2,6 +2,7 @@
 
 use super::tokenizer::{split_commas, Cur, Tok};
 use super::values::*;
+use crate::anim::Easing;
 use crate::atom::Atom;
 use std::rc::Rc;
 
@@ -146,6 +147,13 @@ props! {
         BoxShadow = "box-shadow", BorderCollapse = "border-collapse", BorderSpacing = "border-spacing",
         TableLayout = "table-layout", Content = "content", ObjectFit = "object-fit",
         AspectRatio = "aspect-ratio", Transform = "transform", Translate = "translate",
+        Rotate = "rotate", Scale = "scale", TransformOrigin = "transform-origin",
+        TransitionProperty = "transition-property", TransitionDuration = "transition-duration",
+        TransitionTimingFunction = "transition-timing-function", TransitionDelay = "transition-delay",
+        AnimationName = "animation-name", AnimationDuration = "animation-duration",
+        AnimationTimingFunction = "animation-timing-function", AnimationDelay = "animation-delay",
+        AnimationIterationCount = "animation-iteration-count", AnimationDirection = "animation-direction",
+        AnimationFillMode = "animation-fill-mode", AnimationPlayState = "animation-play-state",
         BackgroundClip = "background-clip", TextFillColor = "-webkit-text-fill-color",
         OutlineWidth = "outline-width", OutlineStyle = "outline-style", OutlineColor = "outline-color",
         OutlineOffset = "outline-offset",
@@ -164,6 +172,7 @@ props! {
         PaddingInline = "padding-inline", PaddingBlock = "padding-block",
         InsetInline = "inset-inline", InsetBlock = "inset-block",
         BorderInline = "border-inline", BorderBlock = "border-block",
+        Transition = "transition", Animation = "animation",
     }
 }
 
@@ -235,7 +244,11 @@ pub fn prop_from_name(name: &str) -> Option<PropId> {
                 | "flex-wrap" | "flex-flow" | "flex-grow" | "flex-shrink" | "flex-basis" | "order"
                 | "justify-content" | "align-items" | "align-self" | "align-content"
                 | "border-top-left-radius" | "border-top-right-radius" | "border-bottom-left-radius"
-                | "border-bottom-right-radius" | "background-size" | "background-clip" => prop_lookup(stripped),
+                | "border-bottom-right-radius" | "background-size" | "background-clip" | "transform-origin"
+                | "transition" | "transition-property" | "transition-duration" | "transition-timing-function"
+                | "transition-delay" | "animation" | "animation-name" | "animation-duration"
+                | "animation-timing-function" | "animation-delay" | "animation-iteration-count"
+                | "animation-direction" | "animation-fill-mode" | "animation-play-state" => prop_lookup(stripped),
                 _ => None,
             };
         }
@@ -261,6 +274,20 @@ pub enum Value {
     Pair(Len, Len),
     Content(Rc<[ContentItem]>),
     Translate(Len, Len),
+    /// A `transform` function list.
+    Transform(Rc<[TransformFn]>),
+    /// The standalone `scale` property.
+    Scale(f32, f32),
+    /// A list of times in milliseconds (durations, delays).
+    Times(Rc<[f32]>),
+    Easings(Rc<[Easing]>),
+    /// `transition-property`.
+    TransProps(Rc<[TransProp]>),
+    /// `animation-name` (`Atom::NONE` for `none`).
+    Names(Rc<[Atom]>),
+    /// A list of numbers: iteration counts (infinity for `infinite`), or codes for the
+    /// direction, fill mode and play state keywords (see `anim_code`).
+    Nums(Rc<[f32]>),
     Areas(Rc<GridAreas>),
     /// A plain identifier (e.g. a grid area name).
     Name(Atom),
@@ -268,6 +295,17 @@ pub enum Value {
     Custom(Atom, Rc<str>),
     /// A value containing `var()`: resolved and parsed at cascade time.
     Pending(Rc<str>),
+}
+
+/// One entry of `transition-property`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TransProp {
+    All,
+    None,
+    /// A property (possibly a shorthand) this engine knows.
+    Prop(PropId),
+    /// Something else: keeps its place in the list, never transitions.
+    Other,
 }
 
 #[derive(Clone, Debug)]
@@ -328,6 +366,11 @@ pub fn longhands(sh: PropId) -> &'static [PropId] {
         PaddingBlock => &[PaddingTop, PaddingBottom],
         InsetInline => &[Left, Right],
         InsetBlock => &[Top, Bottom],
+        Transition => &[TransitionProperty, TransitionDuration, TransitionTimingFunction, TransitionDelay],
+        Animation => &[
+            AnimationName, AnimationDuration, AnimationTimingFunction, AnimationDelay, AnimationIterationCount,
+            AnimationDirection, AnimationFillMode, AnimationPlayState,
+        ],
         _ => &[],
     }
 }
@@ -673,6 +716,236 @@ fn parse_content(toks: &[Tok]) -> Option<Value> {
     Some(Value::Content(items.into()))
 }
 
+/// A time in milliseconds (`0.3s`, `150ms`).
+pub fn parse_time(c: &mut Cur) -> Option<f32> {
+    let save = c.i;
+    c.skip_ws();
+    let r = match c.next() {
+        Some(Tok::Dimension(v, u)) if u.eq_ignore_ascii_case("s") => Some(*v * 1000.0),
+        Some(Tok::Dimension(v, u)) if u.eq_ignore_ascii_case("ms") => Some(*v),
+        Some(Tok::Function(f)) if f.eq_ignore_ascii_case("calc") => {
+            // calc(0.2s * 2) and the like: one time, scaled by plain numbers
+            let mut inner = c.block();
+            let mut t = parse_time(&mut inner)?;
+            loop {
+                if inner.delim('*') {
+                    t *= parse_number(&mut inner)?;
+                } else if inner.delim('/') {
+                    let d = parse_number(&mut inner)?;
+                    if d == 0.0 {
+                        return None;
+                    }
+                    t /= d;
+                } else {
+                    break;
+                }
+            }
+            inner.at_end().then_some(t)
+        }
+        _ => None,
+    };
+    if r.is_none() {
+        c.i = save;
+    }
+    r.filter(|v| v.is_finite())
+}
+
+/// Codes for the animation keywords stored in `Value::Nums`.
+pub mod anim_code {
+    pub const NORMAL: f32 = 0.0;
+    pub const REVERSE: f32 = 1.0;
+    pub const ALTERNATE: f32 = 2.0;
+    pub const ALTERNATE_REVERSE: f32 = 3.0;
+    pub const FILL_NONE: f32 = 0.0;
+    pub const FORWARDS: f32 = 1.0;
+    pub const BACKWARDS: f32 = 2.0;
+    pub const BOTH: f32 = 3.0;
+    pub const RUNNING: f32 = 0.0;
+    pub const PAUSED: f32 = 1.0;
+}
+
+fn direction_code(i: &str) -> Option<f32> {
+    Some(match i {
+        "normal" => anim_code::NORMAL,
+        "reverse" => anim_code::REVERSE,
+        "alternate" => anim_code::ALTERNATE,
+        "alternate-reverse" => anim_code::ALTERNATE_REVERSE,
+        _ => return None,
+    })
+}
+
+fn fill_code(i: &str) -> Option<f32> {
+    Some(match i {
+        "none" => anim_code::FILL_NONE,
+        "forwards" => anim_code::FORWARDS,
+        "backwards" => anim_code::BACKWARDS,
+        "both" => anim_code::BOTH,
+        _ => return None,
+    })
+}
+
+fn play_code(i: &str) -> Option<f32> {
+    Some(match i {
+        "running" => anim_code::RUNNING,
+        "paused" => anim_code::PAUSED,
+        _ => return None,
+    })
+}
+
+fn trans_prop(name: &str) -> TransProp {
+    let l = name.to_ascii_lowercase();
+    match l.as_str() {
+        "all" => TransProp::All,
+        "none" => TransProp::None,
+        _ => match prop_from_name(&l) {
+            Some(p) => TransProp::Prop(p),
+            None => TransProp::Other,
+        },
+    }
+}
+
+/// A comma-separated list where every item is parsed by `one` and must use up its tokens.
+fn comma_list<T>(toks: &[Tok], one: impl Fn(&mut Cur) -> Option<T>) -> Option<Vec<T>> {
+    let mut out = Vec::new();
+    for part in split_commas(toks) {
+        let mut c = Cur::new(part);
+        let v = one(&mut c)?;
+        if !c.at_end() {
+            return None;
+        }
+        out.push(v);
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+fn ident_code_list(toks: &[Tok], code: fn(&str) -> Option<f32>) -> Option<Value> {
+    comma_list(toks, |c| code(&c.ident()?.to_ascii_lowercase())).map(|v| Value::Nums(v.into()))
+}
+
+/// `transition`: per item a property, a duration, a timing function and a delay, in any order.
+fn expand_transition(toks: &[Tok], out: &mut Vec<Declaration>) -> Option<()> {
+    let (mut props, mut durs, mut eases, mut delays) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for part in split_commas(toks) {
+        let mut c = Cur::new(part);
+        let (mut prop, mut times, mut ease): (Option<TransProp>, Vec<f32>, Option<Easing>) = (None, Vec::new(), None);
+        while !c.at_end() {
+            if let Some(t) = parse_time(&mut c) {
+                times.push(t);
+                continue;
+            }
+            let save = c.i;
+            if ease.is_none() {
+                if let Some(e) = Easing::parse(&mut c) {
+                    ease = Some(e);
+                    continue;
+                }
+                c.i = save;
+            }
+            let name = c.ident()?;
+            if prop.is_some() {
+                return None;
+            }
+            prop = Some(trans_prop(name));
+        }
+        if times.len() > 2 {
+            return None;
+        }
+        props.push(prop.unwrap_or(TransProp::All));
+        durs.push(times.first().copied().unwrap_or(0.0).max(0.0));
+        delays.push(times.get(1).copied().unwrap_or(0.0));
+        eases.push(ease.unwrap_or(Easing::EASE));
+    }
+    if props.is_empty() {
+        return None;
+    }
+    let mut push = |prop, value| out.push(Declaration { prop, value, important: false });
+    push(PropId::TransitionProperty, Value::TransProps(props.into()));
+    push(PropId::TransitionDuration, Value::Times(durs.into()));
+    push(PropId::TransitionTimingFunction, Value::Easings(eases.into()));
+    push(PropId::TransitionDelay, Value::Times(delays.into()));
+    Some(())
+}
+
+/// `animation`: per item a name plus timing words in any order.
+fn expand_animation(toks: &[Tok], out: &mut Vec<Declaration>) -> Option<()> {
+    let mut names = Vec::new();
+    let (mut durs, mut delays, mut eases) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut iters, mut dirs, mut fills, mut plays) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for part in split_commas(toks) {
+        let mut c = Cur::new(part);
+        let mut name: Option<Atom> = None;
+        let (mut times, mut ease): (Vec<f32>, Option<Easing>) = (Vec::new(), None);
+        let (mut iter, mut dir, mut fill, mut play): (Option<f32>, Option<f32>, Option<f32>, Option<f32>) = (None, None, None, None);
+        while !c.at_end() {
+            if let Some(t) = parse_time(&mut c) {
+                times.push(t);
+                continue;
+            }
+            c.skip_ws();
+            match c.peek() {
+                Some(Tok::Number(n)) if iter.is_none() => {
+                    iter = Some(n.max(0.0));
+                    c.next();
+                    continue;
+                }
+                Some(Tok::Str(s)) if name.is_none() => {
+                    name = Some(Atom::new(s));
+                    c.next();
+                    continue;
+                }
+                _ => {}
+            }
+            let save = c.i;
+            if ease.is_none() {
+                if let Some(e) = Easing::parse(&mut c) {
+                    ease = Some(e);
+                    continue;
+                }
+                c.i = save;
+            }
+            let word = c.ident()?;
+            let l = word.to_ascii_lowercase();
+            if iter.is_none() && l == "infinite" {
+                iter = Some(f32::INFINITY);
+            } else if dir.is_none() && direction_code(&l).is_some() {
+                dir = direction_code(&l);
+            } else if fill.is_none() && fill_code(&l).is_some() {
+                fill = fill_code(&l);
+            } else if play.is_none() && play_code(&l).is_some() {
+                play = play_code(&l);
+            } else if name.is_none() {
+                name = Some(if l == "none" { Atom::NONE } else { Atom::new(word) });
+            } else {
+                return None;
+            }
+        }
+        if times.len() > 2 {
+            return None;
+        }
+        names.push(name.unwrap_or(Atom::NONE));
+        durs.push(times.first().copied().unwrap_or(0.0).max(0.0));
+        delays.push(times.get(1).copied().unwrap_or(0.0));
+        eases.push(ease.unwrap_or(Easing::EASE));
+        iters.push(iter.unwrap_or(1.0));
+        dirs.push(dir.unwrap_or(anim_code::NORMAL));
+        fills.push(fill.unwrap_or(anim_code::FILL_NONE));
+        plays.push(play.unwrap_or(anim_code::RUNNING));
+    }
+    if names.is_empty() {
+        return None;
+    }
+    let mut push = |prop, value| out.push(Declaration { prop, value, important: false });
+    push(PropId::AnimationName, Value::Names(names.into()));
+    push(PropId::AnimationDuration, Value::Times(durs.into()));
+    push(PropId::AnimationTimingFunction, Value::Easings(eases.into()));
+    push(PropId::AnimationDelay, Value::Times(delays.into()));
+    push(PropId::AnimationIterationCount, Value::Nums(iters.into()));
+    push(PropId::AnimationDirection, Value::Nums(dirs.into()));
+    push(PropId::AnimationFillMode, Value::Nums(fills.into()));
+    push(PropId::AnimationPlayState, Value::Nums(plays.into()));
+    Some(())
+}
+
 /// The standalone `translate` property: `none`, or one to three lengths (the third, z, is ignored).
 fn parse_translate_prop(toks: &[Tok]) -> Option<Value> {
     if single_kw(toks) == Some(Kw::None) {
@@ -694,33 +967,119 @@ fn parse_transform(toks: &[Tok]) -> Option<Value> {
     if kw_in(toks, &[Kw::None]).is_some() {
         return Some(Value::Kw(Kw::None));
     }
+    let list = parse_transform_list(toks)?;
+    if list.is_empty() && !Cur::new(toks).at_end() {
+        // only functions that have no effect on the page (translateZ, perspective)
+        return Some(Value::Kw(Kw::None));
+    }
+    if list.is_empty() {
+        return None;
+    }
+    Some(Value::Transform(list.into()))
+}
+
+/// The standalone `rotate` property: `none`, an angle, or an axis and an angle (only rotation
+/// in the plane of the page is applied).
+fn parse_rotate_prop(toks: &[Tok]) -> Option<Value> {
+    if single_kw(toks) == Some(Kw::None) {
+        return Some(Value::Num(0.0));
+    }
     let mut c = Cur::new(toks);
-    let mut tx = Len::ZERO;
-    let mut ty = Len::ZERO;
-    let mut any = false;
-    loop {
-        c.skip_ws();
-        let Some(t) = c.next() else { break };
-        let Tok::Function(f) = t else { return None };
-        let mut inner = c.block();
-        any = true;
-        match f.to_ascii_lowercase().as_str() {
-            "translate" | "translate3d" => {
-                tx = parse_len(&mut inner, true)?;
-                if inner.comma() {
-                    ty = parse_len(&mut inner, true)?;
-                }
-            }
-            "translatex" => tx = parse_len(&mut inner, true)?,
-            "translatey" => ty = parse_len(&mut inner, true)?,
-            _ => {} // scale/rotate/skew/matrix: accepted, not applied
+    if let Some(a) = parse_angle(&mut c) {
+        if c.at_end() {
+            return Some(Value::Num(a));
         }
     }
-    if any {
-        Some(Value::Translate(tx, ty))
-    } else {
-        None
+    let mut c = Cur::new(toks);
+    let mut axis: Option<[f32; 3]> = None;
+    let mut angle: Option<f32> = None;
+    while !c.at_end() {
+        if let Some(a) = parse_angle(&mut c) {
+            angle = Some(a);
+        } else if let Some(i) = c.ident() {
+            axis = Some(match i.to_ascii_lowercase().as_str() {
+                "x" => [1.0, 0.0, 0.0],
+                "y" => [0.0, 1.0, 0.0],
+                "z" => [0.0, 0.0, 1.0],
+                _ => return None,
+            });
+        } else {
+            let x = parse_number(&mut c)?;
+            let y = parse_number(&mut c)?;
+            let z = parse_number(&mut c)?;
+            axis = Some([x, y, z]);
+        }
     }
+    let angle = angle?;
+    match axis {
+        None => Some(Value::Num(angle)),
+        Some([x, y, z]) if x == 0.0 && y == 0.0 && z != 0.0 => Some(Value::Num(if z < 0.0 { -angle } else { angle })),
+        Some(_) => Some(Value::Num(0.0)),
+    }
+}
+
+/// The standalone `scale` property: `none`, or one to three factors (the third, z, is ignored).
+fn parse_scale_prop(toks: &[Tok]) -> Option<Value> {
+    if single_kw(toks) == Some(Kw::None) {
+        return Some(Value::Scale(1.0, 1.0));
+    }
+    let mut c = Cur::new(toks);
+    let x = parse_factor(&mut c)?;
+    let y = if c.at_end() { x } else { parse_factor(&mut c)? };
+    if !c.at_end() {
+        parse_factor(&mut c)?;
+        if !c.at_end() {
+            return None;
+        }
+    }
+    (x.is_finite() && y.is_finite()).then_some(Value::Scale(x, y))
+}
+
+/// `transform-origin`: one or two of left/center/right/top/bottom or lengths (a third value,
+/// the z offset, is ignored).
+fn parse_transform_origin(toks: &[Tok]) -> Option<Value> {
+    let mut c = Cur::new(toks);
+    let (mut x, mut y): (Option<Len>, Option<Len>) = (None, None);
+    let mut n = 0;
+    while !c.at_end() && n < 3 {
+        n += 1;
+        if let Some(i) = c.ident() {
+            match i.to_ascii_lowercase().as_str() {
+                "left" => x = Some(Len::Pct(0.0)),
+                "right" => x = Some(Len::Pct(100.0)),
+                "top" => y = Some(Len::Pct(0.0)),
+                "bottom" => y = Some(Len::Pct(100.0)),
+                "center" => {
+                    if x.is_none() && n == 1 {
+                        x = Some(Len::Pct(50.0));
+                    } else if y.is_none() {
+                        y = Some(Len::Pct(50.0));
+                    } else {
+                        x.get_or_insert(Len::Pct(50.0));
+                    }
+                }
+                _ => return None,
+            }
+        } else {
+            let l = parse_len(&mut c, true)?;
+            if n == 3 {
+                break; // z offset
+            }
+            if x.is_none() && n == 1 {
+                x = Some(l);
+            } else if y.is_none() {
+                y = Some(l);
+            } else if x.is_none() {
+                x = Some(l);
+            } else {
+                return None;
+            }
+        }
+    }
+    if !c.at_end() || n == 0 {
+        return None;
+    }
+    Some(Value::Pair(x.unwrap_or(Len::Pct(50.0)), y.unwrap_or(Len::Pct(50.0))))
 }
 
 fn parse_bg_size_one(t: &[Tok]) -> Option<BgSize> {
@@ -1041,6 +1400,38 @@ pub fn parse_longhand(prop: PropId, toks: &[Tok], resolve: UrlResolver) -> Optio
         }
         Transform => parse_transform(toks),
         Translate => parse_translate_prop(toks),
+        Rotate => parse_rotate_prop(toks),
+        Scale => parse_scale_prop(toks),
+        TransformOrigin => parse_transform_origin(toks),
+        TransitionProperty => comma_list(toks, |c| c.ident().map(trans_prop)).map(|v| Value::TransProps(v.into())),
+        TransitionDuration | AnimationDuration => {
+            comma_list(toks, |c| parse_time(c).filter(|t| *t >= 0.0)).map(|v| Value::Times(v.into()))
+        }
+        TransitionDelay | AnimationDelay => comma_list(toks, parse_time).map(|v| Value::Times(v.into())),
+        TransitionTimingFunction | AnimationTimingFunction => comma_list(toks, Easing::parse).map(|v| Value::Easings(v.into())),
+        AnimationName => comma_list(toks, |c| {
+            c.skip_ws();
+            match c.next()? {
+                Tok::Ident(i) if i.eq_ignore_ascii_case("none") => Some(Atom::NONE),
+                Tok::Ident(i) | Tok::Str(i) => Some(Atom::new(i)),
+                _ => None,
+            }
+        })
+        .map(|v| Value::Names(v.into())),
+        AnimationIterationCount => comma_list(toks, |c| {
+            c.skip_ws();
+            match c.peek() {
+                Some(Tok::Ident(i)) if i.eq_ignore_ascii_case("infinite") => {
+                    c.next();
+                    Some(f32::INFINITY)
+                }
+                _ => parse_number(c).filter(|n| *n >= 0.0),
+            }
+        })
+        .map(|v| Value::Nums(v.into())),
+        AnimationDirection => ident_code_list(toks, direction_code),
+        AnimationFillMode => ident_code_list(toks, fill_code),
+        AnimationPlayState => ident_code_list(toks, play_code),
         Custom => None,
         _ => None,
     }
@@ -1380,6 +1771,8 @@ fn expand_flex(toks: &[Tok], out: &mut Vec<Declaration>) -> Option<()> {
 fn expand_shorthand(prop: PropId, toks: &[Tok], resolve: UrlResolver, out: &mut Vec<Declaration>) -> Option<()> {
     use PropId::*;
     match prop {
+        Transition => expand_transition(toks, out),
+        Animation => expand_animation(toks, out),
         Margin | Padding | Inset | BorderWidth | BorderStyle | BorderColor => {
             expand_four(toks, longhands(prop), resolve, out)
         }

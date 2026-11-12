@@ -627,12 +627,218 @@ pub fn parse_angle(c: &mut Cur) -> Option<f32> {
             _ => None,
         },
         Some(Tok::Number(v)) if *v == 0.0 => Some(0.0),
+        Some(Tok::Function(f)) if f.eq_ignore_ascii_case("calc") => {
+            let mut inner = c.block();
+            match angle_sum(&mut inner) {
+                Some((v, true)) if inner.at_end() => Some(v),
+                Some((v, false)) if v == 0.0 && inner.at_end() => Some(0.0),
+                _ => None,
+            }
+        }
         _ => None,
     };
     if r.is_none() {
         c.i = save;
     }
     r
+}
+
+fn angle_unit(v: f32, unit: &str) -> Option<f32> {
+    Some(match unit.to_ascii_lowercase().as_str() {
+        "deg" => v,
+        "rad" => v.to_degrees(),
+        "grad" => v * 0.9,
+        "turn" => v * 360.0,
+        _ => return None,
+    })
+}
+
+/// `calc()` over angles and plain numbers (`calc(90deg * -1)`): the value in degrees and
+/// whether it is an angle (as opposed to a bare number).
+fn angle_sum(c: &mut Cur) -> Option<(f32, bool)> {
+    let mut acc = angle_product(c)?;
+    loop {
+        c.skip_ws();
+        let sign = match c.peek() {
+            Some(Tok::Delim('+')) => 1.0,
+            Some(Tok::Delim('-')) => -1.0,
+            _ => break,
+        };
+        c.next();
+        let rhs = angle_product(c)?;
+        if rhs.1 != acc.1 {
+            return None;
+        }
+        acc.0 += sign * rhs.0;
+    }
+    Some(acc)
+}
+
+fn angle_product(c: &mut Cur) -> Option<(f32, bool)> {
+    let mut acc = angle_atom(c)?;
+    loop {
+        c.skip_ws();
+        match c.peek() {
+            Some(Tok::Delim('*')) => {
+                c.next();
+                let r = angle_atom(c)?;
+                if acc.1 && r.1 {
+                    return None;
+                }
+                acc = (acc.0 * r.0, acc.1 || r.1);
+            }
+            Some(Tok::Delim('/')) => {
+                c.next();
+                let r = angle_atom(c)?;
+                if r.1 || r.0 == 0.0 {
+                    return None;
+                }
+                acc.0 /= r.0;
+            }
+            _ => break,
+        }
+    }
+    Some(acc)
+}
+
+fn angle_atom(c: &mut Cur) -> Option<(f32, bool)> {
+    c.skip_ws();
+    match c.next()? {
+        Tok::Number(v) => Some((*v, false)),
+        Tok::Dimension(v, u) => angle_unit(*v, u).map(|d| (d, true)),
+        Tok::LParen => {
+            let mut inner = c.block();
+            angle_sum(&mut inner)
+        }
+        Tok::Function(f) if f.eq_ignore_ascii_case("calc") => {
+            let mut inner = c.block();
+            angle_sum(&mut inner)
+        }
+        _ => None,
+    }
+}
+
+/// One function of a `transform` list, as written (lengths not yet resolved).
+#[derive(Clone, Debug, PartialEq)]
+pub enum TransformFn {
+    Translate(Len, Len),
+    Scale(f32, f32),
+    /// Clockwise, in degrees.
+    Rotate(f32),
+    /// Degrees along x and y.
+    Skew(f32, f32),
+    Matrix([f32; 6]),
+}
+
+/// A number or a percentage as a factor (`scale(110%)`).
+pub fn parse_factor(c: &mut Cur) -> Option<f32> {
+    c.skip_ws();
+    if let Some(Tok::Percentage(v)) = c.peek() {
+        c.next();
+        return Some(*v / 100.0);
+    }
+    parse_number(c)
+}
+
+/// The functions of a `transform` value. Three-dimensional functions are flattened onto the
+/// page: z offsets are dropped, and a rotation about the x or y axis becomes the squash it
+/// would look like without perspective.
+pub fn parse_transform_list(toks: &[Tok]) -> Option<Vec<TransformFn>> {
+    let mut c = Cur::new(toks);
+    let mut out = Vec::new();
+    loop {
+        c.skip_ws();
+        let Some(t) = c.next() else { break };
+        let Tok::Function(f) = t else { return None };
+        let mut a = c.block();
+        let name = f.to_ascii_lowercase();
+        match name.as_str() {
+            "translate" => {
+                let x = parse_len(&mut a, true)?;
+                let y = if a.comma() { parse_len(&mut a, true)? } else { Len::Px(0.0) };
+                out.push(TransformFn::Translate(x, y));
+            }
+            "translate3d" => {
+                let x = parse_len(&mut a, true)?;
+                a.comma();
+                let y = parse_len(&mut a, true)?;
+                out.push(TransformFn::Translate(x, y));
+            }
+            "translatex" => out.push(TransformFn::Translate(parse_len(&mut a, true)?, Len::Px(0.0))),
+            "translatey" => out.push(TransformFn::Translate(Len::Px(0.0), parse_len(&mut a, true)?)),
+            "translatez" | "perspective" => {}
+            "scale" => {
+                let x = parse_factor(&mut a)?;
+                let y = if a.comma() { parse_factor(&mut a)? } else { x };
+                out.push(TransformFn::Scale(x, y));
+            }
+            "scale3d" => {
+                let x = parse_factor(&mut a)?;
+                a.comma();
+                let y = parse_factor(&mut a)?;
+                out.push(TransformFn::Scale(x, y));
+            }
+            "scalex" => out.push(TransformFn::Scale(parse_factor(&mut a)?, 1.0)),
+            "scaley" => out.push(TransformFn::Scale(1.0, parse_factor(&mut a)?)),
+            "scalez" => {}
+            "rotate" | "rotatez" => out.push(TransformFn::Rotate(parse_angle(&mut a)?)),
+            "rotatex" => out.push(TransformFn::Scale(1.0, parse_angle(&mut a)?.to_radians().cos())),
+            "rotatey" => out.push(TransformFn::Scale(parse_angle(&mut a)?.to_radians().cos(), 1.0)),
+            "rotate3d" => {
+                let x = parse_number(&mut a)?;
+                a.comma();
+                let y = parse_number(&mut a)?;
+                a.comma();
+                let z = parse_number(&mut a)?;
+                a.comma();
+                let deg = parse_angle(&mut a)?;
+                if z != 0.0 && x == 0.0 && y == 0.0 {
+                    out.push(TransformFn::Rotate(if z < 0.0 { -deg } else { deg }));
+                } else if x != 0.0 && y == 0.0 && z == 0.0 {
+                    out.push(TransformFn::Scale(1.0, deg.to_radians().cos()));
+                } else if y != 0.0 && x == 0.0 && z == 0.0 {
+                    out.push(TransformFn::Scale(deg.to_radians().cos(), 1.0));
+                }
+            }
+            "skew" => {
+                let x = parse_angle(&mut a)?;
+                let y = if a.comma() { parse_angle(&mut a)? } else { 0.0 };
+                out.push(TransformFn::Skew(x, y));
+            }
+            "skewx" => out.push(TransformFn::Skew(parse_angle(&mut a)?, 0.0)),
+            "skewy" => out.push(TransformFn::Skew(0.0, parse_angle(&mut a)?)),
+            "matrix" => {
+                let mut m = [0.0f32; 6];
+                for (i, v) in m.iter_mut().enumerate() {
+                    if i > 0 {
+                        a.comma();
+                    }
+                    *v = parse_number(&mut a)?;
+                }
+                out.push(TransformFn::Matrix(m));
+            }
+            "matrix3d" => {
+                let mut m = [0.0f32; 16];
+                for (i, v) in m.iter_mut().enumerate() {
+                    if i > 0 {
+                        a.comma();
+                    }
+                    *v = parse_number(&mut a)?;
+                }
+                out.push(TransformFn::Matrix([m[0], m[1], m[4], m[5], m[12], m[13]]));
+            }
+            _ => return None,
+        }
+    }
+    if out.iter().any(|f| match f {
+        TransformFn::Scale(x, y) | TransformFn::Skew(x, y) => !x.is_finite() || !y.is_finite(),
+        TransformFn::Rotate(d) => !d.is_finite(),
+        TransformFn::Matrix(m) => m.iter().any(|v| !v.is_finite()),
+        TransformFn::Translate(..) => false,
+    }) {
+        return None;
+    }
+    Some(out)
 }
 
 // ───────────────────── computed sizes (px / percentage / calc) ─────────────────────

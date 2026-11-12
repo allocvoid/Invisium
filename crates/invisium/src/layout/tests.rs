@@ -29,6 +29,7 @@ fn lay(body: &str, css: &str, vw: f32) -> Doc {
         target: NO_NODE,
         resolve: &resolve,
         scripting: false,
+        animated: None,
     };
     let mut styles = stylist.compute(&input);
     let mut fonts = FontSystem::new();
@@ -310,4 +311,66 @@ fn paints_a_display_list() {
             assert!(glyphs.1 as usize <= d.tree.glyphs.len());
         }
     }
+}
+
+#[test]
+fn sticky_boxes_follow_the_scroll_inside_their_container() {
+    let mut d = lay(
+        "<div id=before></div><section id=scene><div id=pin></div></section><div id=after></div>\
+         <div id=clipper><div id=inner></div></div>",
+        "#before{height:300px} #scene{height:2000px} #pin{position:sticky;top:10px;height:100px}
+         #after{height:3000px} #clipper{overflow:hidden;height:500px} #inner{position:sticky;top:0;height:50px}",
+        800.0,
+    );
+    let view = (800.0, 600.0);
+    // not reached yet: stays where the flow put it
+    assert!(!d.tree.place_sticky(&d.styles, (0.0, 200.0), view));
+    assert_rect!(d, "pin", 0, 300, 800, 100);
+    // scrolled past: pinned 10px below the top edge of the view
+    assert!(d.tree.place_sticky(&d.styles, (0.0, 1000.0), view));
+    assert_rect!(d, "pin", 0, 1010, 800, 100);
+    // near the end of its container it stops at the container's bottom edge
+    d.tree.place_sticky(&d.styles, (0.0, 2290.0), view);
+    assert_rect!(d, "pin", 0, 2200, 800, 100);
+    // scrolling back releases it
+    assert!(d.tree.place_sticky(&d.styles, (0.0, 0.0), view));
+    assert_rect!(d, "pin", 0, 300, 800, 100);
+    // inside a clipping ancestor the document's scroll does not move it
+    d.tree.place_sticky(&d.styles, (0.0, 5400.0), view);
+    assert_rect!(d, "inner", 0, 5300, 800, 50);
+}
+
+#[test]
+fn transforms_resolve_to_a_matrix_about_the_origin() {
+    let d = lay(
+        "<div id=a></div><div id=b></div><div id=c></div><div id=e></div><div id=f></div>",
+        "div{width:100px;height:40px} #a{transform:translate3d(10px, 50%, 0) scale(2)}
+         #b{rotate:calc(90deg * -1)} #c{transform:scaleX(0)} #e{scale:50%;transform-origin:top left;translate:10px 0}
+         #f{transform:translateY(8px)}",
+        800.0,
+    );
+    let m = |id: &str| {
+        let st = d.styles.get(d.doc.element_by_id(id)).unwrap();
+        st.transform_matrix(100.0, 40.0).unwrap()
+    };
+    let at = |m: &crate::draw::Affine, x: f32, y: f32| crate::draw::affine_point(m, x, y);
+    let near = |p: (f32, f32), x: f32, y: f32| (p.0 - x).abs() < 0.01 && (p.1 - y).abs() < 0.01;
+    // scale 2 about the centre (50, 20), then moved by (10, 20)
+    let a = m("a");
+    assert!(near(at(&a, 50.0, 20.0), 60.0, 40.0), "{a:?}");
+    assert!(near(at(&a, 0.0, 0.0), -40.0, 0.0), "{a:?}");
+    // a quarter turn anticlockwise about the centre: the top-left corner goes to the bottom-left side
+    let b = m("b");
+    assert!(near(at(&b, 0.0, 0.0), 30.0, 70.0), "{b:?}");
+    // collapsed along x
+    let c = m("c");
+    assert_eq!(c[0] * c[3] - c[1] * c[2], 0.0);
+    // individual properties: translate applies outside scale
+    let e = m("e");
+    assert!(near(at(&e, 100.0, 40.0), 60.0, 20.0), "{e:?}");
+    // only moved: still a plain translation
+    assert!(crate::style::is_translation(&m("f")));
+    // a transformed box is a stacking context and a containing block
+    let bx = &d.tree.boxes[d.tree.box_for_node(d.doc.element_by_id("a")) as usize];
+    assert!(bx.flags & F_POSITIONED != 0);
 }

@@ -200,7 +200,7 @@ impl Page {
         };
         {
             let mut st = eng.state().borrow_mut();
-            st.now_ms = self.clock_ms;
+            st.set_now(self.clock_ms);
             st.live_fetches = self.live_fetches.len();
             st.box_index = None;
             if st.cookie_access.is_none() {
@@ -258,6 +258,9 @@ impl Page {
             if !self.doc.is_connected(root) {
                 continue;
             }
+            if !self.images.is_empty() {
+                self.svg_changed(root);
+            }
             let nodes: Vec<NodeId> = std::iter::once(root).chain(self.doc.descendants(root)).collect();
             for n in nodes {
                 match self.doc.tag(n) {
@@ -269,6 +272,9 @@ impl Page {
             }
         }
         for (n, name) in fx.attr_changed {
+            if !self.images.is_empty() {
+                self.svg_changed(n);
+            }
             match (self.doc.tag(n), name) {
                 (a::IMG, a::SRC | a::SRCSET) | (a::INPUT, a::SRC) => {
                     self.images.remove(&n);
@@ -286,6 +292,9 @@ impl Page {
             }
         }
         for n in fx.text_changed {
+            if !self.images.is_empty() {
+                self.svg_changed(n);
+            }
             match self.doc.tag(n) {
                 a::STYLE => sheets = true,
                 a::TITLE => title = true,
@@ -307,8 +316,12 @@ impl Page {
         }
         if let Some(pos) = fx.scroll_to {
             if self.scroll != pos {
+                let before = self.scroll;
                 self.scroll = pos;
                 self.clamp_scroll();
+                if self.scroll != before {
+                    self.after_scroll();
+                }
                 self.script_redraw = true;
             }
         }

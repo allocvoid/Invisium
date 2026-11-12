@@ -87,11 +87,20 @@ pub(crate) struct HostState {
     // ── script-side state ──
     pub fx: Effects,
     pub timers: Vec<Timer>,
+    /// The page clock when script was entered, and when that was: script sees time move on
+    /// while it runs (code that waits for a few milliseconds to pass must not spin forever).
     pub now_ms: f64,
+    pub clock_at: std::time::Instant,
     pub console: Vec<ConsoleMessage>,
     pub current_script: NodeId,
     /// A user-input event (click, key press) is being dispatched right now.
     pub user_gesture: bool,
+    /// A script has work for the next frame (animation-frame callbacks).
+    pub frame_wanted: bool,
+    /// Size or visibility observers exist; `observers_due`: they have a target that has not
+    /// been looked at yet.
+    pub observing: bool,
+    pub observers_due: bool,
     /// `wrapped[node]`: a JS wrapper exists (and is rooted) for this node.
     pub wrapped: Vec<bool>,
     /// Prototype objects registered by the bootstrap script, by tag or by `#kind`.
@@ -118,6 +127,17 @@ pub(crate) struct HostState {
 }
 
 impl HostState {
+    /// Script is entered at page time `ms`.
+    pub fn set_now(&mut self, ms: f64) {
+        self.now_ms = ms;
+        self.clock_at = std::time::Instant::now();
+    }
+
+    /// The page clock as script sees it right now, in milliseconds.
+    pub fn live_now(&self) -> f64 {
+        self.now_ms + self.clock_at.elapsed().as_secs_f64() * 1000.0
+    }
+
     pub fn new(join: UrlJoin, scripting: bool) -> HostState {
         HostState {
             page: crate::page::Page::hollow(join),
@@ -126,9 +146,13 @@ impl HostState {
             fx: Effects::default(),
             timers: Vec::new(),
             now_ms: 0.0,
+            clock_at: std::time::Instant::now(),
             console: Vec::new(),
             current_script: NO_NODE,
             user_gesture: false,
+            frame_wanted: false,
+            observing: false,
+            observers_due: false,
             wrapped: Vec::new(),
             protos: HashMap::new(),
             cookies: Vec::new(),

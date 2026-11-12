@@ -34,6 +34,14 @@ impl invis_chrome::Clipboard for Clip {
 
 const BACKDROP: Rgba = Rgba::hex(0x0a0f1a);
 
+/// Shortest time between two frames while something animates. Presenting waits for the display
+/// anyway; this only keeps the loop from spinning when it does not (hidden window, no vsync).
+const FRAME_GAP: Duration = Duration::from_millis(8);
+/// The gap after a frame that drew nothing (nothing waited for the display): about 60 a second.
+const IDLE_FRAME_GAP: Duration = Duration::from_millis(16);
+/// How quickly a wheel or key scroll closes in on its target (time constant).
+const SCROLL_EASE_MS: f32 = 55.0;
+
 struct App {
     browser: Browser,
     chrome: Chrome,
@@ -51,6 +59,23 @@ struct App {
     page_rect: Rect,
     last_click: (Instant, f32, f32, u8),
     last_tick: Instant,
+    /// When the last frame was started (frames are never started less than `FRAME_GAP` apart).
+    last_frame: Instant,
+    /// Something asked for a redraw since the last frame (as opposed to a frame that only
+    /// exists because the page is animating, which is skipped if nothing changed).
+    redraw_wanted: std::cell::Cell<bool>,
+    /// The last frame drew something (presenting paces the loop; without it we pace ourselves).
+    presented: bool,
+    /// When the animation loop last asked for a frame (it asks at most once per gap, also
+    /// when the system delivers no frame, as for a minimised window).
+    last_request: Instant,
+    /// The window is minimised or fully covered: pages get no frames (timers still run).
+    hidden: bool,
+    /// The pending redraw was asked for by the animation loop only (a redraw the system asks
+    /// for, after the window was covered or restored, always draws).
+    auto_frame: std::cell::Cell<bool>,
+    /// Where a wheel or key scroll is heading: (tab, navigation, target y in page pixels).
+    scroll_goal: Option<(u64, u64, f32)>,
     caret_elapsed: u32,
     caret_on: bool,
     shown_address: String,
@@ -61,6 +86,15 @@ struct App {
 
 impl App {
     fn redraw_soon(&self) {
+        self.redraw_wanted.set(true);
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    /// Ask for a frame only because the page is animating.
+    fn next_animation_frame(&self) {
+        self.auto_frame.set(true);
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -297,10 +331,51 @@ impl App {
             return;
         }
         let z = self.zoom();
-        if let Some(page) = self.browser.active_page() {
-            if page.scroll_by(0.0, dy_px / z) {
-                self.redraw_soon();
-            }
+        self.scroll_smoothly(dy_px / z);
+    }
+
+    /// Scroll the page by `dy` page pixels, gliding there over the next few frames. Returns
+    /// false if the page cannot scroll that way.
+    fn scroll_smoothly(&mut self, dy: f32) -> bool {
+        let Some(tab) = self.browser.tabs.get(self.browser.active) else { return false };
+        let key = (tab.id, tab.nav);
+        let Some(page) = self.browser.active_page() else { return false };
+        let (_, sy) = page.scroll();
+        let max = (page.content_size().1 - page.viewport().1).max(0.0);
+        // further input adds to where the page is already heading
+        let from = match self.scroll_goal {
+            Some((t, n, goal)) if (t, n) == key => goal,
+            _ => sy,
+        };
+        let goal = (from + dy).clamp(0.0, max);
+        if (goal - sy).abs() < 0.5 {
+            self.scroll_goal = None;
+            return false;
+        }
+        self.scroll_goal = Some((key.0, key.1, goal));
+        self.redraw_soon();
+        true
+    }
+
+    /// Move a gliding scroll one frame along. `dt_ms` is the time since the previous frame.
+    fn step_scroll(&mut self, dt_ms: f32) {
+        let Some((t, n, goal)) = self.scroll_goal else { return };
+        let same = self.browser.tabs.get(self.browser.active).map_or(false, |tab| (tab.id, tab.nav) == (t, n));
+        let Some(page) = self.browser.active_page().filter(|_| same) else {
+            self.scroll_goal = None;
+            return;
+        };
+        let (sx, sy) = page.scroll();
+        let left = goal - sy;
+        let k = 1.0 - (-dt_ms.clamp(1.0, 100.0) / SCROLL_EASE_MS).exp();
+        let mut step = left * k;
+        if step.abs() < 1.0 {
+            step = left.signum() * left.abs().min(1.0);
+        }
+        let done = (left - step).abs() < 0.5;
+        let moved = page.scroll_to(sx, if done { goal } else { sy + step });
+        if done || !moved {
+            self.scroll_goal = None;
         }
     }
 
@@ -364,16 +439,24 @@ impl App {
             }
             Some(k) if !text_focus => {
                 let (_, sy) = page.scroll();
+                let _ = sy;
+                let glide = match k {
+                    Key::Down => Some(48.0),
+                    Key::Up => Some(-48.0),
+                    Key::PageDown => Some(view_h * 0.9),
+                    Key::PageUp => Some(-view_h * 0.9),
+                    _ => None,
+                };
                 let moved = match k {
-                    Key::Down => page.scroll_by(0.0, 48.0),
-                    Key::Up => page.scroll_by(0.0, -48.0),
-                    Key::PageDown => page.scroll_by(0.0, view_h * 0.9),
-                    Key::PageUp => page.scroll_by(0.0, -view_h * 0.9),
                     Key::Home => page.scroll_to(0.0, 0.0),
                     Key::End => page.scroll_to(0.0, f32::MAX),
                     _ => false,
                 };
-                let _ = sy;
+                if let Some(dy) = glide {
+                    self.scroll_smoothly(dy);
+                } else if moved {
+                    self.scroll_goal = None;
+                }
                 if moved {
                     PageAction::Redraw
                 } else {
@@ -382,11 +465,10 @@ impl App {
             }
             _ => {
                 // space scrolls a page that is not being typed into
-                if typing && !text_focus && text == Some(" ") && page.scroll_by(0.0, view_h * 0.9) {
-                    PageAction::Redraw
-                } else {
-                    PageAction::None
+                if typing && !text_focus && text == Some(" ") {
+                    self.scroll_smoothly(view_h * 0.9);
                 }
+                PageAction::None
             }
         };
         self.page_action(action);
@@ -423,6 +505,14 @@ impl App {
         }
     }
 
+    /// True if the next frame should follow this one without waiting for input.
+    fn wants_frames(&self) -> bool {
+        if self.hidden || self.window.as_ref().map_or(true, |w| w.is_minimized() == Some(true)) {
+            return false;
+        }
+        self.scroll_goal.is_some() || self.browser.active_wants_frame()
+    }
+
     fn animating(&mut self) -> bool {
         let loading = self.browser.tabs.iter().any(|t| t.loading());
         let typing = self.chrome.address_focused() || self.browser.active_page().map_or(false, |p| p.has_text_focus());
@@ -432,10 +522,21 @@ impl App {
 
     fn frame(&mut self) {
         let Some(window) = self.window.clone() else { return };
+        // timers and loading go on while the page animates (the loop only comes here then)
+        let started = Instant::now();
+        let dt_ms = started.duration_since(self.last_frame).as_secs_f32() * 1000.0;
+        self.last_frame = started;
+        self.presented = false;
+        if self.wants_frames() {
+            self.tick();
+        }
         let size = window.inner_size();
         if size.width == 0 || size.height == 0 || self.renderer.is_none() {
             return;
         }
+        // only a frame the animation loop asked for may turn out to have nothing to draw
+        let auto = self.auto_frame.replace(false);
+        let mut changed = self.redraw_wanted.replace(false) || !auto;
         let scale = window.scale_factor() as f32;
         let (lw, lh) = (size.width as f32 / scale, size.height as f32 / scale);
         let content = self.chrome.layout(lw, lh);
@@ -462,6 +563,15 @@ impl App {
             }
         }
 
+        // this frame's share of a gliding scroll, then what the page itself has queued for it
+        changed |= self.scroll_goal.is_some();
+        self.step_scroll(dt_ms);
+        let (tab_before, title_before) = self.browser.tabs.get(self.browser.active).map_or((0, String::new()), |t| (t.nav, t.title.clone()));
+        self.browser.frame_active();
+        if self.browser.tabs.get(self.browser.active).map_or(false, |t| t.nav != tab_before || t.title != title_before) {
+            self.sync();
+        }
+
         let active = self.browser.active;
         let mut canvas = Rgba::WHITE;
         let mut scroll = (0.0, 0.0);
@@ -470,11 +580,15 @@ impl App {
             let Browser { tabs, fonts, .. } = &mut self.browser;
             if let Some(lp) = tabs.get_mut(active).and_then(|t| t.page.as_mut()) {
                 lp.page.set_viewport(vw, vh);
-                lp.page.update(&mut fonts.borrow_mut());
+                changed |= lp.page.update(&mut fonts.borrow_mut());
                 if let Some(r) = self.renderer.as_mut() {
                     let mut upload = |w: u32, h: u32, px: &[u8]| r.create_image(w, h, px);
                     if crate::loader::rasterize_inline_svgs(&mut lp.page, scale * zoom, &mut upload) {
-                        lp.page.update(&mut fonts.borrow_mut());
+                        changed |= lp.page.update(&mut fonts.borrow_mut());
+                    }
+                    // an inline SVG that was drawn again leaves its old texture behind
+                    for id in lp.page.take_stale_images() {
+                        r.drop_image(id);
                     }
                 }
                 canvas = lp.page.canvas_color();
@@ -486,6 +600,14 @@ impl App {
         if active < self.browser.tabs.len() {
             self.browser.pump(active);
         }
+
+        // a frame that exists only because the page is animating, and in which nothing moved
+        // (an idle animation-frame loop, an animation still in its delay), draws nothing
+        if !changed && !self.redraw_wanted.get() {
+            return;
+        }
+        self.redraw_wanted.set(false);
+        self.presented = true;
 
         self.chrome_list.clear();
         self.chrome_glyphs.clear();
@@ -589,6 +711,13 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::RedrawRequested => self.frame(),
             WindowEvent::Focused(f) => {
                 self.chrome_input(Input::WindowFocus(f));
+                self.redraw_soon();
+            }
+            WindowEvent::Occluded(covered) => {
+                self.hidden = covered;
+                if !covered {
+                    self.redraw_soon();
+                }
             }
             WindowEvent::ModifiersChanged(m) => {
                 let s = m.state();
@@ -646,6 +775,9 @@ impl ApplicationHandler<UserEvent> for App {
     fn new_events(&mut self, _el: &ActiveEventLoop, cause: StartCause) {
         if matches!(cause, StartCause::ResumeTimeReached { .. }) {
             self.tick();
+            if self.wants_frames() {
+                self.next_animation_frame();
+            }
         }
     }
 
@@ -653,6 +785,21 @@ impl ApplicationHandler<UserEvent> for App {
         // Sleep until input arrives unless something on screen is still changing.
         // A page timer also wakes the loop, but never more often than every 4 ms.
         let timer = self.browser.next_script_wake().map(|ms| ms.max(4));
+        if self.wants_frames() {
+            // something on the page is moving: the next frame follows as soon as the gap allows
+            // (a frame that drew waited for the display; one that did not is paced here)
+            let gap = if self.presented { FRAME_GAP } else { IDLE_FRAME_GAP };
+            let now = Instant::now();
+            let next = self.last_frame.max(self.last_request) + gap;
+            if now >= next {
+                self.last_request = now;
+                self.next_animation_frame();
+                el.set_control_flow(ControlFlow::WaitUntil(now + gap));
+            } else {
+                el.set_control_flow(ControlFlow::WaitUntil(next));
+            }
+            return;
+        }
         if self.animating() {
             let ms = timer.map_or(120, |t| t.min(120));
             el.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(ms)));
@@ -694,6 +841,13 @@ pub fn run(start_url: Option<String>) -> i32 {
         page_rect: Rect::ZERO,
         last_click: (now, 0.0, 0.0, 0),
         last_tick: now,
+        last_frame: now,
+        redraw_wanted: std::cell::Cell::new(true),
+        presented: false,
+        auto_frame: std::cell::Cell::new(false),
+        last_request: now,
+        hidden: false,
+        scroll_goal: None,
         caret_elapsed: 0,
         caret_on: true,
         shown_address: String::new(),

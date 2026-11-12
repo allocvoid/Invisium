@@ -27,6 +27,49 @@ pub struct FontFaceRule {
     pub sources: Vec<(String, Option<String>)>,
     pub weight: (u16, u16),
     pub italic: bool,
+    /// `unicode-range`: inclusive code point ranges; empty = every character.
+    pub ranges: Vec<(u32, u32)>,
+}
+
+/// Parse the raw text of a `unicode-range` value (`U+0-7F, U+4??, U+20AC`). Items that do not
+/// parse are skipped; the list is capped at 512 ranges.
+fn parse_unicode_range(text: &str) -> Vec<(u32, u32)> {
+    fn hex(s: &str) -> Option<u32> {
+        if s.is_empty() || s.len() > 6 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        u32::from_str_radix(s, 16).ok()
+    }
+    let mut out = Vec::new();
+    for item in text.split(',') {
+        if out.len() >= 512 {
+            break;
+        }
+        let t = item.trim();
+        let Some(rest) = t.get(..2).filter(|p| p.eq_ignore_ascii_case("u+")).map(|_| &t[2..]) else { continue };
+        let range = if let Some((a, b)) = rest.split_once('-') {
+            hex(a).zip(hex(b))
+        } else if rest.contains('?') {
+            let digits = rest.trim_end_matches('?');
+            let q = rest.len() - digits.len();
+            if rest.len() > 6 || (!digits.is_empty() && hex(digits).is_none()) {
+                None
+            } else {
+                let lo = format!("{}{}", digits, "0".repeat(q));
+                let hi = format!("{}{}", digits, "F".repeat(q));
+                hex(&lo).zip(hex(&hi))
+            }
+        } else {
+            hex(rest).map(|v| (v, v))
+        };
+        if let Some((a, b)) = range {
+            let b = b.min(0x10FFFF);
+            if a <= b {
+                out.push((a, b));
+            }
+        }
+    }
+    out
 }
 
 pub enum Rule {
@@ -37,6 +80,14 @@ pub enum Rule {
     /// `@property --name { inherits: …; initial-value: … }`: a registered custom property.
     /// The `syntax` descriptor is not checked; the initial value is kept as text.
     Property { name: Atom, inherits: bool, initial: Option<Rc<str>> },
+    /// `@keyframes name { … }`.
+    Keyframes { name: Atom, frames: Rc<Vec<KeyframeRule>> },
+}
+
+/// One block of a `@keyframes` rule: the offsets it applies to (0..=1) and its declarations.
+pub struct KeyframeRule {
+    pub offsets: Vec<f32>,
+    pub decls: Vec<Declaration>,
 }
 
 pub struct Stylesheet {
@@ -651,10 +702,54 @@ impl<'a> Parser<'a> {
                     out.push(rule);
                 }
             }
-            // @keyframes, @page, @container, @counter-style, ...: skipped
+            "keyframes" | "-webkit-keyframes" | "-moz-keyframes" => {
+                let name = prelude.iter().find_map(|t| match t {
+                    Tok::Ident(n) | Tok::Str(n) => Some(Atom::new(n)),
+                    _ => None,
+                });
+                if let Some(name) = name {
+                    out.push(Rule::Keyframes { name, frames: Rc::new(self.keyframes(pos + 1, close)) });
+                }
+            }
+            // @page, @container, @counter-style, ...: skipped
             _ => {}
         }
         close + 1
+    }
+
+    /// The blocks of a `@keyframes` rule (`from`, `to`, percentages, comma lists of them).
+    fn keyframes(&mut self, start: usize, end: usize) -> Vec<KeyframeRule> {
+        let mut out = Vec::new();
+        let mut i = start;
+        while i < end {
+            let (pos, is_block) = self.scan_prelude(i, end);
+            if !is_block {
+                i = pos + 1;
+                continue;
+            }
+            let close = self.block_end(pos, end);
+            let mut offsets = Vec::new();
+            let mut ok = true;
+            for t in &self.toks[i..pos] {
+                match t {
+                    Tok::Whitespace | Tok::Comma => {}
+                    Tok::Ident(w) if w.eq_ignore_ascii_case("from") => offsets.push(0.0),
+                    Tok::Ident(w) if w.eq_ignore_ascii_case("to") => offsets.push(1.0),
+                    Tok::Percentage(p) if (0.0..=100.0).contains(p) => offsets.push(*p / 100.0),
+                    _ => ok = false,
+                }
+            }
+            if ok && !offsets.is_empty() {
+                let mut decls = Vec::new();
+                properties::parse_declarations(self.toks, self.spans, self.src, pos + 1, close.min(end), self.resolve, &mut decls);
+                out.push(KeyframeRule { offsets, decls });
+            }
+            i = close + 1;
+            if out.len() > 2000 {
+                break;
+            }
+        }
+        out
     }
 
     /// `@property --name { syntax: …; inherits: …; initial-value: … }`. `inherits` is required,
@@ -715,11 +810,14 @@ impl<'a> Parser<'a> {
         let mut sources = Vec::new();
         let mut weight = (400u16, 400u16);
         let mut italic = false;
+        let mut ranges = Vec::new();
         // split on top-level ';'
         let mut i = start;
         while i < end {
             let (pos, _) = self.scan_prelude(i, end);
-            let decl = &self.toks[i..pos.min(end)];
+            let from = i;
+            let decl_end = pos.min(end);
+            let decl = &self.toks[i..decl_end];
             i = pos + 1;
             let Some(colon) = decl.iter().position(|t| matches!(t, Tok::Colon)) else { continue };
             let name: String = decl[..colon]
@@ -784,10 +882,18 @@ impl<'a> Parser<'a> {
                     }
                 }
                 "font-style" => italic = value.iter().any(|t| t.is_ident("italic") || t.is_ident("oblique")),
+                "unicode-range" => {
+                    let (a, b) = (from + colon + 1, decl_end);
+                    let text = match (self.spans.get(a), b.checked_sub(1).and_then(|k| self.spans.get(k))) {
+                        (Some(s), Some(e)) if a < b => self.src.get(s.0 as usize..e.1 as usize),
+                        _ => None,
+                    };
+                    ranges = text.map(parse_unicode_range).unwrap_or_default();
+                }
                 _ => {}
             }
         }
-        Some(FontFaceRule { family: family?, sources, weight, italic })
+        Some(FontFaceRule { family: family?, sources, weight, italic, ranges })
     }
 }
 
@@ -871,5 +977,26 @@ mod tests {
         let q = parse_media_query_list(&super::super::tokenizer::tokenize_value("screen and (width >= 600px), print"));
         assert!(q.evaluate(&MediaEnv { width: 600.0, height: 1.0, dark: false }));
         assert!(!q.evaluate(&MediaEnv { width: 599.0, height: 1.0, dark: false }));
+    }
+
+    fn face_ranges(css: &str) -> Vec<(u32, u32)> {
+        match &sheet(css).rules[0] {
+            Rule::FontFace(f) => f.ranges.clone(),
+            _ => panic!("not a font-face"),
+        }
+    }
+
+    #[test]
+    fn font_face_unicode_range() {
+        let r = |v: &str| face_ranges(&format!("@font-face {{ font-family: X; src: url(a.woff2); unicode-range: {v}; }}"));
+        assert_eq!(r("U+0041"), vec![(0x41, 0x41)]);
+        assert_eq!(r("u+0000-00FF"), vec![(0, 0xFF)]);
+        assert_eq!(r("U+4??"), vec![(0x400, 0x4FF)]);
+        assert_eq!(r("U+0-7F, U+4??, u+20ac, U+1F600-1F64F"), vec![(0, 0x7F), (0x400, 0x4FF), (0x20AC, 0x20AC), (0x1F600, 0x1F64F)]);
+        assert_eq!(r("U+41, garbage, U+zz, U+4?1, U+50-40, U+42"), vec![(0x41, 0x41), (0x42, 0x42)]);
+        assert_eq!(r("U+10FFF0-1FFFFF"), vec![(0x10FFF0, 0x10FFFF)]);
+        assert!(face_ranges("@font-face { font-family: X; src: url(a.woff2) }").is_empty());
+        let many: Vec<String> = (0..600).map(|i| format!("U+{i:X}")).collect();
+        assert_eq!(r(&many.join(",")).len(), 512);
     }
 }

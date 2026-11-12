@@ -89,6 +89,8 @@ var SELECTION = {
 };
 
 class Document extends Node {
+  getAnimations() { return animationsOf(null, true); }
+  get timeline() { return documentTimeline; }
   get documentElement() { return n.special(0); }
   get head() { return n.special(1); }
   get body() { return n.special(2); }

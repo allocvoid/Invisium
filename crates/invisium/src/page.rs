@@ -23,6 +23,8 @@ use std::rc::Rc;
 
 #[path = "page_script.rs"]
 mod scripting;
+#[path = "page_anim.rs"]
+mod animating;
 
 /// Resolves a reference against a base URL: `(base, reference) -> absolute`.
 pub type UrlJoin = Rc<dyn Fn(&str, &str) -> Option<String>>;
@@ -32,7 +34,21 @@ pub enum ResKind {
     Stylesheet,
     Image,
     Script,
+    /// A web font (`@font-face`). Answer with `Page::font_loaded` (or `resource_failed`).
+    Font,
 }
+
+/// A `@font-face` rule of the page and whether its file has been asked for.
+pub(crate) struct WebFontRule {
+    family: Atom,
+    url: String,
+    weight: (u16, u16),
+    italic: bool,
+    ranges: Vec<(u32, u32)>,
+}
+
+/// Font scopes: every page gets its own, so that fonts one page loads are invisible to others.
+static NEXT_FONT_SCOPE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
 #[derive(Clone, Debug)]
 pub struct ResourceRequest {
@@ -197,6 +213,20 @@ pub struct Page {
     pub(crate) image_sizes: HashMap<NodeId, (f32, f32)>,
     pub(crate) bg_images: HashMap<String, PaintImage>,
     pub(crate) svg_skipped: HashSet<NodeId>,
+    /// What each inline `<svg>` looked like when it was last rasterised: its text colour
+    /// (`currentColor`) and box size. A difference means it has to be drawn again.
+    pub(crate) svg_state: HashMap<NodeId, (Rgba, f32, f32)>,
+    /// Inline `<svg>` elements whose content was changed by script since they were rasterised.
+    pub(crate) svg_dirty: HashSet<NodeId>,
+    /// Images that were replaced and can be released by the embedder.
+    pub(crate) stale_images: Vec<crate::draw::ImageId>,
+    /// This page's key in the font system (0 for a page that is only a stand-in).
+    pub(crate) font_scope: u32,
+    /// `@font-face` rules of the loaded stylesheets.
+    pub(crate) font_rules: Vec<WebFontRule>,
+    /// Font files that have been asked for (by address), and the request ids still open.
+    pub(crate) fonts_requested: HashSet<String>,
+    pub(crate) font_reqs: HashMap<u32, usize>,
     pub(crate) form_values: HashMap<NodeId, String>,
     pub(crate) select_values: HashMap<NodeId, String>,
     pub(crate) focus: NodeId,
@@ -210,6 +240,14 @@ pub struct Page {
     pub(crate) dirty_layout: bool,
     pub(crate) dirty_paint: bool,
     pub(crate) laid_out: bool,
+    /// Milliseconds the last style, layout and paint passes took (diagnostics).
+    pub(crate) pass_ms: [f32; 3],
+    /// Layout or the scroll position changed since scripts' observers were last run.
+    pub(crate) geom_changed: bool,
+    /// Transitions, CSS animations and script animations.
+    pub(crate) timeline: crate::anim::Timeline,
+    /// The values those animations currently lay over the styles.
+    pub(crate) anim_over: crate::style::Overrides,
     // -- scripting --
     pub(crate) script: Option<Box<ScriptEngine>>,
     /// Scripts that run in document order.
@@ -335,6 +373,51 @@ fn multipart_body(pairs: &[(String, String)], files: &[(usize, Option<Rc<PickedF
     (out, boundary)
 }
 
+/// The `@font-face` rules of a stylesheet (also those inside `@media` blocks), each with the
+/// first source this engine can decode.
+fn collect_font_rules(rules: &[Rule], out: &mut Vec<WebFontRule>) {
+    for r in rules {
+        match r {
+            Rule::FontFace(ff) => {
+                let usable = |format: &Option<String>| match format.as_deref() {
+                    None => true,
+                    Some(f) => matches!(f, "woff2" | "woff2-variations" | "truetype" | "opentype" | "truetype-variations" | "opentype-variations"),
+                };
+                let source = ff.sources.iter().find(|(url, format)| {
+                    let path = url.split(['?', '#']).next().unwrap_or("").to_ascii_lowercase();
+                    usable(format) && !(format.is_none() && (path.ends_with(".woff") || path.ends_with(".eot") || path.ends_with(".svg")))
+                });
+                if let Some((url, _)) = source {
+                    if out.len() < 512 && !ff.family.is_empty() {
+                        out.push(WebFontRule {
+                            family: Atom::new(&ff.family.to_ascii_lowercase()),
+                            url: url.clone(),
+                            weight: ff.weight,
+                            italic: ff.italic,
+                            ranges: ff.ranges.clone(),
+                        });
+                    }
+                }
+            }
+            Rule::Media { rules, .. } => collect_font_rules(rules, out),
+            _ => {}
+        }
+    }
+}
+
+impl Drop for Page {
+    fn drop(&mut self) {
+        // the fonts this page loaded go with it
+        if self.font_scope != 0 && !self.fonts_requested.is_empty() {
+            if let Some(fonts) = &self.fonts {
+                if let Ok(mut f) = fonts.try_borrow_mut() {
+                    f.drop_scope(self.font_scope);
+                }
+            }
+        }
+    }
+}
+
 fn form_encode(s: &str, out: &mut String) {
     for &b in s.as_bytes() {
         match b {
@@ -394,6 +477,13 @@ impl Page {
             image_sizes: HashMap::new(),
             bg_images: HashMap::new(),
             svg_skipped: HashSet::new(),
+            svg_state: HashMap::new(),
+            svg_dirty: HashSet::new(),
+            stale_images: Vec::new(),
+            font_scope: NEXT_FONT_SCOPE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            font_rules: Vec::new(),
+            fonts_requested: HashSet::new(),
+            font_reqs: HashMap::new(),
             form_values: HashMap::new(),
             select_values: HashMap::new(),
             focus: NO_NODE,
@@ -407,6 +497,10 @@ impl Page {
             dirty_layout: true,
             dirty_paint: true,
             laid_out: false,
+            pass_ms: [0.0; 3],
+            geom_changed: false,
+            timeline: crate::anim::Timeline::default(),
+            anim_over: HashMap::new(),
             script: None,
             scripts: VecDeque::new(),
             loose_scripts: Vec::new(),
@@ -686,6 +780,9 @@ impl Page {
     }
 
     pub fn resource_failed(&mut self, id: u32) {
+        if self.font_reqs.remove(&id).is_some() {
+            return;
+        }
         if let Some(pos) = self.slots.iter().position(|s| matches!(s.state, SlotState::Pending { id: i, .. } if i == id)) {
             self.slots[pos].state = SlotState::Failed;
             // a stylesheet that failed no longer blocks anything
@@ -713,8 +810,40 @@ impl Page {
 
     /// Attach a rasterised image to an element directly (inline `<svg>`).
     pub fn set_node_image(&mut self, node: NodeId, image: PaintImage) {
-        self.images.insert(node, image);
+        if let Some(old) = self.images.insert(node, image) {
+            if old.id != image.id {
+                self.stale_images.push(old.id);
+            }
+        }
+        if self.doc.is_valid(node) && self.doc.tag(node) == a::SVG {
+            self.svg_state.insert(node, (self.color_of(node), image.width, image.height));
+            self.svg_dirty.remove(&node);
+        }
         self.dirty_paint = true;
+    }
+
+    /// Images that were replaced since the last call (an inline `<svg>` drawn again); the
+    /// embedder releases them.
+    pub fn take_stale_images(&mut self) -> Vec<crate::draw::ImageId> {
+        std::mem::take(&mut self.stale_images)
+    }
+
+    /// Script changed something inside an inline `<svg>`: it has to be rasterised again.
+    pub(crate) fn svg_changed(&mut self, inside: NodeId) {
+        let mut n = inside;
+        for _ in 0..64 {
+            if n == NO_NODE || !self.doc.is_valid(n) {
+                return;
+            }
+            if self.doc.tag(n) == a::SVG {
+                self.svg_skipped.remove(&n);
+                if self.images.contains_key(&n) && self.svg_dirty.insert(n) {
+                    self.dirty_paint = true;
+                }
+                // keep going: an <svg> can be nested in another one
+            }
+            n = self.doc.parent(n);
+        }
     }
 
     /// Every image handle this page holds (for releasing GPU memory when the page is dropped).
@@ -758,8 +887,10 @@ impl Page {
         if !self.needs_update() {
             return false;
         }
+        fonts.set_scope(self.font_scope);
         self.update_style_layout(fonts);
         if self.dirty_paint {
+            let t0 = std::time::Instant::now();
             let out = paint(
                 &mut self.tree,
                 PaintInput {
@@ -778,18 +909,33 @@ impl Page {
             self.list = out.list;
             self.canvas = out.canvas;
             self.dirty_paint = false;
+            self.pass_ms[2] = t0.elapsed().as_secs_f32() * 1000.0;
         }
         true
     }
 
+    /// How long the last style, layout and paint passes took, in milliseconds.
+    pub fn pass_times(&self) -> [f32; 3] {
+        self.pass_ms
+    }
+
+    /// Mark styles stale so that the next `update` redoes everything (diagnostics).
+    pub fn invalidate(&mut self) {
+        self.dirty_style = true;
+    }
+
     /// The style and layout part of `update` (no painting).
     pub(crate) fn update_style_layout(&mut self, fonts: &mut FontSystem) {
+        fonts.set_scope(self.font_scope);
         if self.dirty_style {
+            let t0 = std::time::Instant::now();
             if self.sheets_dirty {
                 self.stylist.sheets.clear();
+                self.font_rules.clear();
                 for s in &self.slots {
                     if let SlotState::Loaded { sheet, media } = &s.state {
                         self.stylist.sheets.push(SheetEntry { sheet: sheet.clone(), media: media.clone() });
+                        collect_font_rules(&sheet.rules, &mut self.font_rules);
                     }
                 }
                 self.stylist.invalidate();
@@ -798,22 +944,49 @@ impl Page {
             let join = self.join.clone();
             let base = self.base_url.clone();
             let resolve = move |u: &str| join(&base, u);
+            let env = MediaEnv { width: self.viewport.0, height: self.viewport.1, dark: self.cfg.dark };
             let input = StyleInput {
                 doc: &self.doc,
-                env: MediaEnv { width: self.viewport.0, height: self.viewport.1, dark: self.cfg.dark },
+                env,
                 hover: &self.hover,
                 active: &[],
                 focus: self.focus,
                 target: self.target,
                 resolve: &resolve,
                 scripting: self.cfg.scripting,
+                animated: if self.anim_over.is_empty() { None } else { Some(&self.anim_over) },
             };
-            self.styles = self.stylist.compute(&input);
+            let fresh = self.stylist.compute(&input);
+            let old = std::mem::replace(&mut self.styles, fresh);
             self.dirty_style = false;
+            // Values that changed may start transitions, which begin at the old value: lay
+            // them over the fresh styles before anything is laid out or drawn.
+            if self.sync_animations(&old) {
+                self.refresh_overrides(self.clock_ms);
+                if self.dirty_style {
+                    let input = StyleInput {
+                        doc: &self.doc,
+                        env,
+                        hover: &self.hover,
+                        active: &[],
+                        focus: self.focus,
+                        target: self.target,
+                        resolve: &resolve,
+                        scripting: self.cfg.scripting,
+                        animated: if self.anim_over.is_empty() { None } else { Some(&self.anim_over) },
+                    };
+                    self.styles = self.stylist.compute(&input);
+                    self.dirty_style = false;
+                }
+            }
+            drop(old);
+            self.request_fonts();
             self.dirty_layout = true;
             self.discover_backgrounds();
+            self.pass_ms[0] = t0.elapsed().as_secs_f32() * 1000.0;
         }
         if self.dirty_layout {
+            let t0 = std::time::Instant::now();
             self.tree = layout_document(LayoutInput {
                 doc: &self.doc,
                 styles: &mut self.styles,
@@ -832,7 +1005,75 @@ impl Page {
                 }
             }
             self.clamp_scroll();
+            self.tree.place_sticky(&self.styles, self.scroll, self.viewport);
+            self.geom_changed = true;
+            self.pass_ms[1] = t0.elapsed().as_secs_f32() * 1000.0;
         }
+    }
+
+    /// Ask for the font files of `@font-face` families that some element actually uses and
+    /// whose `unicode-range` covers text of this document.
+    fn request_fonts(&mut self) {
+        if self.font_rules.is_empty() {
+            return;
+        }
+        let pending: Vec<usize> = (0..self.font_rules.len()).filter(|&i| !self.fonts_requested.contains(&self.font_rules[i].url)).collect();
+        if pending.is_empty() {
+            return;
+        }
+        let mut used: HashSet<Atom> = HashSet::new();
+        for st in &self.styles.styles {
+            used.extend(st.font_family.iter().copied());
+        }
+        // characters outside plain ASCII that the document's text uses (looked at only if a
+        // pending rule is for such a range)
+        let mut exotic: Option<HashSet<u32>> = None;
+        for i in pending {
+            let rule = &self.font_rules[i];
+            if !used.contains(&rule.family) {
+                continue;
+            }
+            let latin = rule.ranges.is_empty() || rule.ranges.iter().any(|&(a, b)| a <= 0x7e && b >= 0x20);
+            if !latin {
+                let chars = exotic.get_or_insert_with(|| {
+                    let mut set = HashSet::new();
+                    let mut budget = 400_000usize;
+                    for id in 0..self.doc.nodes.len() as NodeId {
+                        if let Some(t) = self.doc.text(id) {
+                            for c in t.chars().take(budget) {
+                                if c as u32 > 0x7e {
+                                    set.insert(c as u32);
+                                }
+                            }
+                            budget = budget.saturating_sub(t.len());
+                            if budget == 0 {
+                                break;
+                            }
+                        }
+                    }
+                    set
+                });
+                if !chars.iter().any(|c| rule.ranges.iter().any(|&(a, b)| *c >= a && *c <= b)) {
+                    continue;
+                }
+            }
+            let url = rule.url.clone();
+            self.fonts_requested.insert(url.clone());
+            let id = self.request(url, ResKind::Font);
+            self.font_reqs.insert(id, i);
+        }
+    }
+
+    /// A font file asked for with `ResKind::Font` arrived. Returns true if the font is usable
+    /// (text set in its family is then laid out again).
+    pub fn font_loaded(&mut self, id: u32, bytes: &[u8], fonts: &mut FontSystem) -> bool {
+        let Some(i) = self.font_reqs.remove(&id) else { return false };
+        let Some(rule) = self.font_rules.get(i) else { return false };
+        let ok = fonts.add_web_font(self.font_scope, rule.family.as_str(), rule.weight, rule.italic, &rule.ranges, bytes);
+        if ok {
+            self.dirty_layout = true;
+        }
+        ok
     }
 
     fn discover_backgrounds(&mut self) {
@@ -941,7 +1182,21 @@ impl Page {
         let before = self.scroll;
         self.scroll = (x, y);
         self.clamp_scroll();
-        before != self.scroll
+        let changed = before != self.scroll;
+        if changed {
+            self.after_scroll();
+        }
+        changed
+    }
+
+    /// The scroll position moved: boxes that stick to the viewport move with it.
+    pub(crate) fn after_scroll(&mut self) {
+        self.geom_changed = true;
+        if !self.tree.sticky.is_empty() && !self.dirty_layout && !self.dirty_style {
+            if self.tree.place_sticky(&self.styles, self.scroll, self.viewport) {
+                self.dirty_paint = true;
+            }
+        }
     }
 
     fn scroll_to_node(&mut self, node: NodeId) -> bool {
@@ -1479,10 +1734,19 @@ impl Page {
                 && self.doc.tag(b.node) == a::SVG
                 && b.w > 0.0
                 && b.h > 0.0
-                && !self.images.contains_key(&b.node)
                 && !self.svg_skipped.contains(&b.node)
             {
-                out.push((b.node, b.w, b.h));
+                // not drawn yet, changed by script, or drawn for another colour or size
+                let stale = match (self.images.contains_key(&b.node), self.svg_state.get(&b.node)) {
+                    (true, Some(&(color, w, h))) => {
+                        self.svg_dirty.contains(&b.node) || color != self.color_of(b.node) || (w - b.w).abs() > 0.5 || (h - b.h).abs() > 0.5
+                    }
+                    (true, None) => self.svg_dirty.contains(&b.node),
+                    (false, _) => true,
+                };
+                if stale {
+                    out.push((b.node, b.w, b.h));
+                }
             }
         }
         out

@@ -109,45 +109,13 @@ function mediaQueryList(query) {
   return mql;
 }
 
-// Observers. Mutation and resize notifications are not delivered yet; intersection observers
-// report every target as visible once, which is what lazy-loading code needs to proceed.
+// Mutation notifications are not delivered yet. (The size and visibility observers live with
+// the frame code.)
 class MutationObserver {
   constructor(cb) { hide(this, '_cb', cb); }
   observe() {}
   disconnect() {}
   takeRecords() { return []; }
-}
-class IntersectionObserver {
-  constructor(cb, opts) { hide(this, '_cb', cb); this.root = (opts && opts.root) || null; this.rootMargin = '0px'; this.thresholds = [0]; }
-  observe(target) {
-    var self = this;
-    if (!(target instanceof Element)) throw new TypeError('IntersectionObserver.observe: the target is not an Element');
-    g.setTimeout(function () {
-      try {
-        var r = target.getBoundingClientRect();
-        self._cb([{ target: target, isIntersecting: true, intersectionRatio: 1, boundingClientRect: r, intersectionRect: r, rootBounds: null, time: n.now() }], self);
-      } catch (e) { reportError(e); }
-    }, 0);
-  }
-  unobserve() {}
-  disconnect() {}
-  takeRecords() { return []; }
-}
-class ResizeObserver {
-  constructor(cb) { hide(this, '_cb', cb); }
-  observe(target) {
-    var self = this;
-    if (!(target instanceof Element)) throw new TypeError('ResizeObserver.observe: the target is not an Element');
-    g.setTimeout(function () {
-      try {
-        var r = target.getBoundingClientRect();
-        var size = [{ inlineSize: r.width, blockSize: r.height }];
-        self._cb([{ target: target, contentRect: r, borderBoxSize: size, contentBoxSize: size }], self);
-      } catch (e) { reportError(e); }
-    }, 0);
-  }
-  unobserve() {}
-  disconnect() {}
 }
 class PerformanceObserver {
   constructor() {}
@@ -275,8 +243,8 @@ function atob(s) {
     setTimeout: function (cb, delay) { return addTimer(cb, delay, false, rest(arguments, 2)); },
     setInterval: function (cb, delay) { return addTimer(cb, delay, true, rest(arguments, 2)); },
     clearTimeout: clearTimer, clearInterval: clearTimer,
-    requestAnimationFrame: function (cb) { return addTimer(function () { cb(n.now()); }, 16, false, []); },
-    cancelAnimationFrame: clearTimer,
+    requestAnimationFrame: requestFrame,
+    cancelAnimationFrame: cancelFrame,
     requestIdleCallback: function (cb) { return addTimer(function () { cb({ didTimeout: false, timeRemaining: function () { return 10; } }); }, 1, false, []); },
     cancelIdleCallback: clearTimer,
     getComputedStyle: function (el) { return new ComputedStyle(el); },
@@ -324,6 +292,8 @@ function atob(s) {
     CSSStyleDeclaration: CSSStyleDeclaration, CSSStyleSheet: CSSStyleSheet, Storage: Storage, URL: URL,
     URLSearchParams: URLSearchParams, Range: Range, TreeWalker: TreeWalker, NodeFilter: NodeFilter,
     MutationObserver: MutationObserver, IntersectionObserver: IntersectionObserver, ResizeObserver: ResizeObserver,
+    IntersectionObserverEntry: IntersectionObserverEntry, ResizeObserverEntry: ResizeObserverEntry,
+    Animation: Animation, AnimationEffect: AnimationEffect, KeyframeEffect: KeyframeEffect,
     PerformanceObserver: PerformanceObserver, AbortController: AbortController, AbortSignal: AbortSignal,
     XMLHttpRequest: XMLHttpRequest, Headers: Headers, Request: Request, Response: Response, FormData: FormData,
     DOMParser: DOMParser, XMLSerializer: XMLSerializer, MessageChannel: MessageChannel, MessagePort: MessagePort,
@@ -365,6 +335,12 @@ return {
   // an input event raised by the user; returns false if a listener cancelled it
   event: function (target, type, init) { return trusted(target === null ? g : target, type, init); },
   timer: fireTimer,
+  // a frame is about to be drawn: animation-frame callbacks, then the observers
+  frame: runFrame,
+  // a CSS transition or animation started or ended: (element, event type, name, seconds)
+  anim: cssAnimationEvent,
+  // script animations that reached their end: [id, ...]
+  animDone: animationsDone,
   // a script request finished: (id, ok, status, url, [name, value, ...], text)
   fetched: fetchDone,
   focus: function (prev, next) {

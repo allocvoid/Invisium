@@ -33,7 +33,7 @@ fn arg_value<T: std::str::FromStr>(args: &[String], name: &str, default: T) -> T
 /// Which navigation a network result belongs to.
 fn event_nav(e: &NetEvent) -> u64 {
     match e {
-        NetEvent::Document { nav, .. } | NetEvent::Sheet { nav, .. } | NetEvent::Script { nav, .. } | NetEvent::Fetch { nav, .. } | NetEvent::Image { nav, .. } => *nav,
+        NetEvent::Document { nav, .. } | NetEvent::Sheet { nav, .. } | NetEvent::Script { nav, .. } | NetEvent::Fetch { nav, .. } | NetEvent::Image { nav, .. } | NetEvent::Font { nav, .. } => *nav,
     }
 }
 
@@ -117,6 +117,14 @@ pub fn run(args: &[String]) -> i32 {
     let scripting = args.iter().any(|a| a == "--js");
     let show_console = args.iter().any(|a| a == "--console");
     let eval: Option<String> = args.iter().position(|a| a == "--eval").and_then(|i| args.get(i + 1)).cloned();
+    // --patch-script FIND REPLACE: edit the page's scripts as they arrive (to add logging to
+    // code that cannot be reached from outside)
+    let patch: Option<(String, String)> = args
+        .iter()
+        .position(|a| a == "--patch-script")
+        .and_then(|i| Some((args.get(i + 1)?.clone(), args.get(i + 2)?.clone())));
+    // like --eval, but run before any --scroll (to set up logging for what scrolling causes)
+    let pre: Option<String> = args.iter().position(|a| a == "--pre").and_then(|i| args.get(i + 1)).cloned();
 
     let mut settings = Settings::default();
     settings.letterbox = false;
@@ -143,9 +151,9 @@ pub fn run(args: &[String]) -> i32 {
     };
 
     let mut page = Page::new(&url, &html, loader::url_join(), viewport, cfg.clone());
+    page.set_fonts(fonts.clone());
     if scripting {
         page.set_cookie_access(loader::cookie_access(net.clone()));
-        page.set_fonts(fonts.clone());
         page.set_script_stack(loader::SCRIPT_STACK);
     }
     let mut renderer = match pollster::block_on(Renderer::new_headless(
@@ -164,6 +172,7 @@ pub fn run(args: &[String]) -> i32 {
     let mut outstanding = 0usize;
     let mut handles = Vec::new();
     let (mut sheets, mut images, mut scripts, mut fetches, mut blocked, mut failed) = (0u32, 0u32, 0u32, 0u32, 0u32, 0u32);
+    let mut web_fonts = 0u32;
     let mut console: Vec<invisium::script::ConsoleMessage> = Vec::new();
     // how long to keep running timers once the network is quiet (pages with intervals never settle)
     let mut settle_left = Duration::from_millis(arg_value(args, "--settle", 1500));
@@ -175,6 +184,9 @@ pub fn run(args: &[String]) -> i32 {
                 if !page.pump(now_ms(Instant::now())) {
                     break;
                 }
+            }
+            if page.wants_frame() {
+                page.frame(now_ms(Instant::now()));
             }
             console.extend(page.take_console());
             if let Some(action) = page.take_action() {
@@ -217,7 +229,13 @@ pub fn run(args: &[String]) -> i32 {
             let more = loader::fetch_subresources(&net, &sink, 1, nav, &mut page);
             if more.is_empty() {
                 // the network is quiet: give timers that are due soon a chance, then stop
-                let due = page.next_timer_ms().map(|t| Duration::from_secs_f64((t - now_ms(Instant::now())).max(0.0) / 1000.0));
+                // a page that animates gets a frame every 16 ms, as it would on screen
+                let frame_due = if page.wants_frame() { Some(now_ms(Instant::now()) + 16.0) } else { None };
+                let next = match (page.next_timer_ms(), frame_due) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
+                let due = next.map(|t| Duration::from_secs_f64((t - now_ms(Instant::now())).max(0.0) / 1000.0));
                 match due {
                     Some(d) if d <= settle_left && d < wait => {
                         settle_left -= d;
@@ -238,6 +256,10 @@ pub fn run(args: &[String]) -> i32 {
         if let Some(t) = page.next_timer_ms() {
             let until = Duration::from_secs_f64((t - now_ms(Instant::now())).max(1.0) / 1000.0);
             wait = wait.min(until);
+        }
+        // and for the next frame, if the page is animating or has frame callbacks queued
+        if scripting && page.wants_frame() {
+            wait = wait.min(Duration::from_millis(16));
         }
         let mut count_failure = |e: &invisium_net::NetError| {
             if loader::is_blocked(e) {
@@ -270,7 +292,14 @@ pub fn run(args: &[String]) -> i32 {
                 match result {
                     Ok(resp) if resp.status < 400 => {
                         scripts += 1;
-                        page.script_loaded(req, &invisium::page::decode_text(&resp.body, resp.charset.as_deref()));
+                        let mut source = invisium::page::decode_text(&resp.body, resp.charset.as_deref());
+                        if let Some((find, with)) = &patch {
+                            if source.contains(find.as_str()) {
+                                eprintln!("patched a script ({} bytes)", source.len());
+                                source = source.replace(find.as_str(), with);
+                            }
+                        }
+                        page.script_loaded(req, &source);
                     }
                     Ok(_) => {
                         failed += 1;
@@ -302,18 +331,35 @@ pub fn run(args: &[String]) -> i32 {
                     Err(e) => count_failure(&e),
                 }
             }
+            Ok(NetEvent::Font { req, result, .. }) => {
+                outstanding = outstanding.saturating_sub(1);
+                match result {
+                    Ok(resp) if resp.status < 400 => {
+                        if page.font_loaded(req, &resp.body, &mut fonts.borrow_mut()) {
+                            web_fonts += 1;
+                        }
+                    }
+                    Ok(_) => {
+                        failed += 1;
+                        page.resource_failed(req);
+                    }
+                    Err(e) => {
+                        count_failure(&e);
+                        page.resource_failed(req);
+                    }
+                }
+            }
             Ok(NetEvent::Document { .. }) => {}
             Err(mpsc::RecvTimeoutError::Timeout) => {} // a timer is due, or the deadline passed (checked above)
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
     drop(handles);
-    if let (true, Some(code)) = (scripting, eval.as_ref()) {
+    if let (true, Some(code)) = (scripting, pre.as_ref()) {
         page.update(&mut fonts.borrow_mut());
         page.eval(code);
         console.extend(page.take_console());
     }
-
     page.update(&mut fonts.borrow_mut());
     let (_, doc_h) = page.content_size();
     let mut out_h = height as f32;
@@ -329,14 +375,23 @@ pub fn run(args: &[String]) -> i32 {
         page.update(&mut fonts.borrow_mut());
         if scripting {
             // scroll listeners and the animations they start get a second to run
-            let until = Instant::now() + Duration::from_millis(1000);
+            let until = Instant::now() + Duration::from_millis(arg_value(args, "--after", 1000));
             while Instant::now() < until {
                 page.pump(now_ms(Instant::now()));
-                std::thread::sleep(Duration::from_millis(8));
+                page.frame(now_ms(Instant::now()));
+                page.update(&mut fonts.borrow_mut());
+                std::thread::sleep(Duration::from_millis(16));
             }
             console.extend(page.take_console());
             page.update(&mut fonts.borrow_mut());
         }
+    }
+    // the diagnostic script sees the page as it will be drawn (after any scrolling)
+    if let (true, Some(code)) = (scripting, eval.as_ref()) {
+        page.update(&mut fonts.borrow_mut());
+        page.eval(code);
+        console.extend(page.take_console());
+        page.update(&mut fonts.borrow_mut());
     }
     {
         let mut upload = |w: u32, h: u32, px: &[u8]| renderer.create_image(w, h, px);
@@ -388,6 +443,18 @@ pub fn run(args: &[String]) -> i32 {
             g.last_frame_draw_calls
         );
         eprintln!("network: {} requests, {} blocked, {} KB received", n.requests, n.blocked, n.bytes_received / 1024);
+        eprintln!("web fonts: {web_fonts} loaded, {} KB", fonts.borrow().web_font_bytes() / 1024);
+        // what one fully invalidated frame costs
+        let mut best = [f32::MAX; 3];
+        for _ in 0..5 {
+            page.invalidate();
+            page.update(&mut fonts.borrow_mut());
+            let t = page.pass_times();
+            for i in 0..3 {
+                best[i] = best[i].min(t[i]);
+            }
+        }
+        eprintln!("frame cost: style {:.2} ms, layout {:.2} ms, paint {:.2} ms (best of 5 full passes)", best[0], best[1], best[2]);
         if scripting {
             let errors = console.iter().filter(|m| m.level == invisium::script::ConsoleLevel::Error).count();
             eprintln!(

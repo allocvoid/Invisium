@@ -274,6 +274,7 @@ fn n_timer(rt: &mut Runtime, cx: &Cx, args: &[Value]) -> NRes {
     if st.timers.len() >= 10_000 {
         return Ok(Value::Undefined); // timer bombs
     }
+    // from the time script was entered (the page clock), so timers stay in step with the page
     let due = st.now_ms + delay;
     // repeating timers never fire faster than every 4 ms, as in other browsers
     st.timers.push(Timer { id, due, interval: if repeat { Some(delay.max(4.0)) } else { None } });
@@ -287,7 +288,8 @@ fn n_clear_timer(rt: &mut Runtime, cx: &Cx, args: &[Value]) -> NRes {
 }
 
 fn n_now(_rt: &mut Runtime, cx: &Cx, _args: &[Value]) -> NRes {
-    Ok(Value::Number(cx.st.borrow().now_ms.floor()))
+    // whole milliseconds: fine timers are a fingerprinting and side-channel surface
+    Ok(Value::Number(cx.st.borrow().live_now().floor()))
 }
 
 fn n_url(rt: &mut Runtime, cx: &Cx, _args: &[Value]) -> NRes {

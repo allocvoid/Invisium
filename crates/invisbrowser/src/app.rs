@@ -314,9 +314,10 @@ impl Browser {
         let scripting = self.settings.javascript && !internal;
         let cfg = PageConfig { dark: !self.settings.light_scheme_only, load_images: self.settings.load_images, scripting };
         let mut page = Page::new(&url, html, loader::url_join(), self.viewport, cfg);
+        // every page knows the font system: the fonts it loads are freed with it
+        page.set_fonts(self.fonts.clone());
         if scripting {
             page.set_cookie_access(loader::cookie_access(self.net.clone()));
-            page.set_fonts(self.fonts.clone());
             page.set_script_stack(crate::loader::SCRIPT_STACK);
         }
         let tab = &mut self.tabs[idx];
@@ -453,6 +454,19 @@ impl Browser {
                 let now = self.now_ms();
                 self.run_scripts(idx, now, true);
             }
+            NetEvent::Font { tab, nav, req, result } => {
+                let Some(idx) = self.index_of(tab) else { return };
+                self.tabs[idx].outstanding = self.tabs[idx].outstanding.saturating_sub(1);
+                let fonts = self.fonts.clone();
+                if let Some(page) = self.page_for(idx, nav) {
+                    match result {
+                        Ok(resp) if resp.status < 400 => {
+                            page.font_loaded(req, &resp.body, &mut fonts.borrow_mut());
+                        }
+                        _ => page.resource_failed(req),
+                    }
+                }
+            }
             NetEvent::Image { tab, nav, url, result } => {
                 let Some(idx) = self.index_of(tab) else { return };
                 self.tabs[idx].outstanding = self.tabs[idx].outstanding.saturating_sub(1);
@@ -535,6 +549,40 @@ impl Browser {
             _ => {}
         }
         ran
+    }
+
+    /// The visible page is about to be drawn: run what its scripts queued for this frame and
+    /// move its animations along, then start the fetches and navigations that caused.
+    pub fn frame_active(&mut self) {
+        let now = self.now_ms();
+        let idx = self.active;
+        let print = self.js_console;
+        let Some(page) = self.tabs.get_mut(idx).and_then(|t| t.page.as_mut()).map(|lp| &mut lp.page) else { return };
+        if !page.wants_frame() {
+            return;
+        }
+        page.frame(now);
+        let action = page.take_action().map(|a| (a, page.url.clone()));
+        for m in page.take_console() {
+            if print {
+                eprintln!("[js] {}", m.text);
+            }
+        }
+        self.pump(idx);
+        match action {
+            Some((PageAction::Navigate { url, .. }, from)) => {
+                self.navigate_from_page(idx, &from, &url, None, false);
+            }
+            Some((PageAction::Submit { url, body, content_type }, from)) => {
+                self.navigate_from_page(idx, &from, &url, body.map(|b| (b, content_type)), false);
+            }
+            _ => {}
+        }
+    }
+
+    /// True if the visible page changes by itself (animations, animation-frame callbacks).
+    pub fn active_wants_frame(&self) -> bool {
+        self.tabs.get(self.active).and_then(|t| t.page.as_ref()).map_or(false, |lp| lp.page.wants_frame())
     }
 
     /// Milliseconds until the visible page's next script timer, if it has one.

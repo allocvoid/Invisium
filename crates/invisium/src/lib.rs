@@ -6,6 +6,7 @@
 //! (`invisium-gfx`). Third-party crates are used only for platform plumbing: the GPU API, TLS
 //! cryptography, image codecs, font outlines and the Tor protocol.
 
+pub mod anim;
 pub mod atom;
 pub mod css;
 pub mod dom;

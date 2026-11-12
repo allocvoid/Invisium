@@ -27,6 +27,8 @@ pub enum NetEvent {
     /// The answer to a request made by page script (`fetch`, `XMLHttpRequest`).
     Fetch { tab: u64, nav: u64, id: u32, result: Result<Response, NetError> },
     Image { tab: u64, nav: u64, url: String, result: Result<DecodedImage, NetError> },
+    /// A web font file (`@font-face`).
+    Font { tab: u64, nav: u64, req: u32, result: Result<Response, NetError> },
 }
 
 /// Where network results are delivered (the UI thread's event queue, or a channel when headless).
@@ -177,6 +179,7 @@ pub fn fetch_subresources(net: &NetService, sink: &Sink, tab: u64, nav: u64, pag
             ResKind::Stylesheet => ResourceKind::Stylesheet,
             ResKind::Image => ResourceKind::Image,
             ResKind::Script => ResourceKind::Script,
+            ResKind::Font => ResourceKind::Font,
         };
         let mut req = Request::get(url, kind);
         // internal pages (invis://) are not a web origin: their requests carry no referrer
@@ -193,6 +196,10 @@ pub fn fetch_subresources(net: &NetService, sink: &Sink, tab: u64, nav: u64, pag
             ResKind::Script => {
                 let id = r.id;
                 net.fetch(req, move |result| sink(NetEvent::Script { tab, nav, req: id, result }))
+            }
+            ResKind::Font => {
+                let id = r.id;
+                net.fetch(req, move |result| sink(NetEvent::Font { tab, nav, req: id, result }))
             }
             ResKind::Image => {
                 let u = r.url.clone();

@@ -6,9 +6,9 @@
 use crate::atom::a;
 use crate::css::values::{BgSize, Color, GradientDir, Image, Len, LenCtx, RadialSize, Size, Stop as CssStop};
 use crate::dom::{Document, NodeId, NO_NODE};
-use crate::draw::{DrawList, ImageId, Item, Radii, Rect, Rgba, Stop, NO_RADII};
+use crate::draw::{affine_mul, Affine, DrawList, ImageId, Item, Radii, Rect, Rgba, Stop, NO_RADII};
 use crate::layout::*;
-use crate::style::{BgLayer, BorderStyle, ComputedStyle, ObjectFit, StyleStore, Visibility, DECO_LINE_THROUGH, DECO_OVERLINE, DECO_UNDERLINE};
+use crate::style::{is_translation, BgLayer, BorderStyle, ComputedStyle, ObjectFit, StyleStore, Visibility, DECO_LINE_THROUGH, DECO_OVERLINE, DECO_UNDERLINE};
 use crate::text::{FontSystem, LGlyph};
 use std::collections::HashMap;
 
@@ -46,7 +46,13 @@ fn rgba(c: Color, alpha: f32) -> Rgba {
     Rgba { r: c.r, g: c.g, b: c.b, a: (c.a as f32 * alpha).round().clamp(0.0, 255.0) as u8 }
 }
 
-type Clip = (Rect, Radii);
+/// What surrounds the box being painted, outermost first: clips and transforms that are open
+/// in the display list. A stacking context painted later replays the ones that apply to it.
+#[derive(Clone, Copy)]
+enum Env {
+    Clip(Rect, Radii),
+    Xf(Affine),
+}
 
 struct Deferred {
     id: BoxId,
@@ -54,7 +60,7 @@ struct Deferred {
     oy: f32,
     alpha: f32,
     z: i32,
-    clips: Vec<Clip>,
+    clips: Vec<Env>,
     fixed: bool,
 }
 
@@ -70,7 +76,7 @@ struct Painter<'a> {
     form_values: &'a HashMap<NodeId, String>,
     focus: NodeId,
     caret_on: bool,
-    clips: Vec<Clip>,
+    clips: Vec<Env>,
     cb_clip_len: usize,
     deferred: Vec<Deferred>,
     in_fixed: bool,
@@ -163,7 +169,7 @@ impl<'a> Painter<'a> {
     }
 
     fn push_clip(&mut self, rect: Rect, radii: Radii) {
-        self.clips.push((rect, radii));
+        self.clips.push(Env::Clip(rect, radii));
         self.list.push_clip(rect, radii);
     }
 
@@ -172,13 +178,26 @@ impl<'a> Painter<'a> {
         self.list.pop_clip();
     }
 
+    fn push_xf(&mut self, m: Affine) {
+        self.clips.push(Env::Xf(m));
+        self.list.push_transform(m);
+    }
+
+    fn pop_xf(&mut self) {
+        self.clips.pop();
+        self.list.pop_transform();
+    }
+
     /// Paint `id` as a stacking context. Precondition: no clip is open in the list.
     fn paint_context(&mut self, d: Deferred) {
         if d.fixed {
             self.list.push(Item::PushFixed);
         }
-        for (r, rad) in &d.clips {
-            self.list.push_clip(*r, *rad);
+        for e in &d.clips {
+            match e {
+                Env::Clip(r, rad) => self.list.push_clip(*r, *rad),
+                Env::Xf(m) => self.list.push_transform(*m),
+            }
         }
         let n_clips = d.clips.len();
         self.clips = d.clips;
@@ -189,8 +208,11 @@ impl<'a> Painter<'a> {
         self.paint_box(d.id, d.ox, d.oy, d.alpha);
 
         let mut mine = std::mem::replace(&mut self.deferred, saved_deferred);
-        for _ in 0..n_clips {
-            self.list.pop_clip();
+        for e in self.clips.iter().take(n_clips).rev() {
+            match e {
+                Env::Clip(..) => self.list.pop_clip(),
+                Env::Xf(_) => self.list.pop_transform(),
+            }
         }
         self.clips.clear();
         if d.fixed {
@@ -235,9 +257,20 @@ impl<'a> Painter<'a> {
             return;
         }
         let (mut x, mut y) = (ox + b.x, oy + b.y);
-        if let Some((tx, ty)) = &st.translate {
-            x += tx.px(b.w);
-            y += ty.px(b.h);
+        let mut xf = false;
+        if let Some(m) = st.transform_matrix(b.w, b.h) {
+            if is_translation(&m) {
+                x += m[4];
+                y += m[5];
+            } else if !matches!(b.kind, BoxKind::Marker | BoxKind::Inline | BoxKind::Text | BoxKind::Break) {
+                if m[0] * m[3] - m[1] * m[2] == 0.0 {
+                    return; // collapsed to nothing (`scale(0)`)
+                }
+                // the matrix is about the box's own corner; the list wants document coordinates
+                let world = affine_mul(&affine_mul(&[1.0, 0.0, 0.0, 1.0, x, y], &m), &[1.0, 0.0, 0.0, 1.0, -x, -y]);
+                self.push_xf(world);
+                xf = true;
+            }
         }
         let visible = st.visibility == Visibility::Visible;
         match b.kind {
@@ -288,6 +321,9 @@ impl<'a> Painter<'a> {
         self.cb_clip_len = saved_cb;
         if clip {
             self.pop_clip();
+        }
+        if xf {
+            self.pop_xf();
         }
     }
 
