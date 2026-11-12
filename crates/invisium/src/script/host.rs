@@ -66,6 +66,8 @@ pub(crate) struct Effects {
     pub navigate: Option<NavRequest>,
     /// `form.submit()` / `requestSubmit()`: (form, submitter or `NO_NODE`).
     pub submit: Option<(NodeId, NodeId)>,
+    /// A file control whose dialog a script asked for (during a user-input event).
+    pub pick_files: Option<NodeId>,
     pub reload: bool,
     pub scroll_to: Option<(f32, f32)>,
     pub focus: Option<NodeId>,
@@ -88,6 +90,8 @@ pub(crate) struct HostState {
     pub now_ms: f64,
     pub console: Vec<ConsoleMessage>,
     pub current_script: NodeId,
+    /// A user-input event (click, key press) is being dispatched right now.
+    pub user_gesture: bool,
     /// `wrapped[node]`: a JS wrapper exists (and is rooted) for this node.
     pub wrapped: Vec<bool>,
     /// Prototype objects registered by the bootstrap script, by tag or by `#kind`.
@@ -124,6 +128,7 @@ impl HostState {
             now_ms: 0.0,
             console: Vec::new(),
             current_script: NO_NODE,
+            user_gesture: false,
             wrapped: Vec::new(),
             protos: HashMap::new(),
             cookies: Vec::new(),

@@ -46,7 +46,7 @@ fn load_document(
     rx: &mpsc::Receiver<NetEvent>,
     settings: &mut Settings,
     url: &mut String,
-    body: Option<Vec<u8>>,
+    body: Option<loader::FormBody>,
     nav: u64,
     deadline: Instant,
     dump: bool,
@@ -180,7 +180,7 @@ pub fn run(args: &[String]) -> i32 {
             if let Some(action) = page.take_action() {
                 let (target, body) = match action {
                     invisium::page::PageAction::Navigate { url, .. } => (url, None),
-                    invisium::page::PageAction::Submit { url, body } => (url, body),
+                    invisium::page::PageAction::Submit { url, body, content_type } => (url, body.map(|b| (b, content_type))),
                     _ => (String::new(), None),
                 };
                 if target.is_empty() || script_hops >= 4 || !loader::page_may_open(&page.url, &target) {

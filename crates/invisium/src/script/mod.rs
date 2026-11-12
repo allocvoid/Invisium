@@ -65,6 +65,7 @@ struct Exports {
     ready: Value,
     loaded: Value,
     uncaught: Value,
+    files: Value,
 }
 
 pub(crate) struct ScriptEngine {
@@ -180,6 +181,7 @@ impl ScriptEngine {
                     ready: grab("ready"),
                     loaded: grab("loaded"),
                     uncaught: grab("uncaught"),
+                    files: grab("files"),
                 });
             }
             Err(e) => {
@@ -296,12 +298,37 @@ impl ScriptEngine {
             let v = wrap(&mut self.rt, &self.cx, init.submitter);
             let _ = self.rt.set(o, "submitter", v);
         }
+        // Things a page may only do in answer to the user (opening the file dialog) are
+        // allowed while one of these events is being handled.
+        let gesture = matches!(kind, "click" | "mousedown" | "mouseup" | "keydown" | "keyup" | "pointerdown" | "pointerup");
+        self.cx.st.borrow_mut().user_gesture = gesture;
         let r = self.call_export(ex.event, &[t, ty, o], "event listener");
+        self.cx.st.borrow_mut().user_gesture = false;
         self.release();
         match r {
             Some(v) => self.rt.to_boolean(v),
             None => true,
         }
+    }
+
+    /// The user chose files for a file control: (file id, name, type, last modified, size) each.
+    pub fn files_changed(&mut self, control: NodeId, files: &[(u32, String, String, f64, f64)]) {
+        let Some(ex) = self.exports else { return };
+        let node = wrap(&mut self.rt, &self.cx, control);
+        let mut flat = Vec::with_capacity(files.len() * 5);
+        for (id, name, mime, modified, size) in files {
+            flat.push(Value::Number(*id as f64));
+            let n = self.rt.string(name);
+            flat.push(self.keep(n));
+            let m = self.rt.string(mime);
+            flat.push(self.keep(m));
+            flat.push(Value::Number(*modified));
+            flat.push(Value::Number(*size));
+        }
+        let list = self.rt.array(&flat);
+        self.keep(list);
+        self.call_export(ex.files, &[node, list], "file selection");
+        self.release();
     }
 
     pub fn focus_changed(&mut self, prev: NodeId, next: NodeId) {

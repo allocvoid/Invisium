@@ -70,6 +70,9 @@ function activate(el) {
   } else if ((tag === 'input' && (type === 'submit' || type === 'image')) || (tag === 'button' && (type === '' || type === 'submit'))) {
     var f = el.form;
     if (f) f.requestSubmit(el);
+  } else if (tag === 'input' && type === 'file') {
+    // only opens the dialog while a click or key press of the user is being handled
+    n.pickFiles(el);
   } else if (tag === 'label') {
     var c = el.control;
     if (c) c.click();
@@ -311,11 +314,19 @@ class HTMLInputElement extends HTMLElement {
   get value() {
     var t = this.type;
     if (t === 'checkbox' || t === 'radio') { var v = n.getAttr(this, 'value'); return v === null ? 'on' : v; }
+    // a file control never reveals where the file is
+    if (t === 'file') return this._files && this._files.length ? 'C:\\fakepath\\' + this._files[0].name : '';
     return n.value(this);
   }
   set value(v) {
     var t = this.type;
     v = v === null ? '' : String(v);
+    if (t === 'file') {
+      if (v !== '') throw new DOMException('A file control can only be cleared by script', 'InvalidStateError');
+      n.clearFiles(this);
+      hide(this, '_files', new FileList());
+      return;
+    }
     if (t === 'checkbox' || t === 'radio' || t === 'hidden' || t === 'submit' || t === 'button' || t === 'reset' || t === 'image') n.setAttr(this, 'value', v);
     else n.setValue(this, v);
   }
@@ -323,7 +334,11 @@ class HTMLInputElement extends HTMLElement {
   set defaultValue(v) { n.setAttr(this, 'value', String(v)); }
   get valueAsNumber() { var v = parseFloat(this.value); return v; }
   set valueAsNumber(v) { this.value = String(v); }
-  get files() { return null; }
+  get files() {
+    if (this.type !== 'file') return null;
+    if (!this._files) hide(this, '_files', new FileList());
+    return this._files;
+  }
   get list() { return null; }
   get selectionStart() { return this.value.length; }
   set selectionStart(v) {}

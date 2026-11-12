@@ -508,6 +508,104 @@ fn binary_bodies_travel_both_ways() {
 }
 
 #[test]
+fn file_controls_pick_read_and_upload() {
+    use crate::page::PickedFile;
+    let mut t = T::new(
+        "<body><div id=drop style='height:40px'>drop a file</div>
+        <form id=f action='/up' method=post enctype='multipart/form-data'>
+          <input type=hidden name=kind value='doc'>
+          <input type=file id=file name=file accept='.txt,image/*' style='display:none'>
+        </form>
+        <script>
+        var input = document.getElementById('file'), kept = null;
+        // not in answer to the user: must not open anything
+        input.click();
+        console.log('start', input.files.length, input.files instanceof FileList, JSON.stringify(input.value));
+        document.getElementById('drop').addEventListener('click', function () { input.click(); });
+        input.addEventListener('change', function (e) {
+          var f = this.files[0];
+          kept = f;
+          console.log('change', e.isTrusted, this.files.length, f.name, f.size, f.type, f.lastModified, f instanceof File, this.value);
+          f.slice(-5).text().then(function (s) { console.log('tail', s, f.slice(2, 4).size); });
+          // the whole form, as a script would send it
+          var x = new XMLHttpRequest();
+          x.open('POST', '/upload');
+          x.upload.addEventListener('progress', function (p) { console.log('progress', p.lengthComputable, p.loaded === p.total, p.total > 12); });
+          x.onload = function () { console.log('uploaded', x.status); };
+          x.send(new FormData(document.getElementById('f')));
+          // one chunk of it, the way large uploads are split
+          var fd = new FormData();
+          fd.append('chunk', f.slice(0, 5), 'part0');
+          fd.append('name', f.name);
+          fetch('/chunk', { method: 'POST', body: fd });
+        });
+        </script>",
+    );
+    assert_eq!(t.errors(), Vec::<&String>::new(), "console: {:?}", t.log);
+    assert_eq!(t.p.take_action(), None, "a script may not open the file dialog by itself");
+    // the user clicks the drop zone; its handler forwards the click to the hidden control
+    let action = t.p.click(20.0, 20.0, false);
+    let control = t.id("file");
+    assert_eq!(action, PageAction::PickFiles { control, multiple: false, accept: ".txt,image/*".into() });
+    t.p.files_chosen(control, vec![PickedFile { name: "notes.txt".into(), mime: "text/plain".into(), last_modified_ms: 1234.0, bytes: b"hello\r\nworld".to_vec() }]);
+    t.step(1.0);
+    assert_eq!(t.errors(), Vec::<&String>::new(), "console: {:?}", t.log);
+    let reqs = t.p.take_fetches();
+    assert_eq!(reqs.len(), 2, "requests: {reqs:?}");
+    let text = |b: &Option<Vec<u8>>| String::from_utf8_lossy(b.as_deref().unwrap_or(&[])).into_owned();
+    let boundary = |r: &crate::page::ScriptFetch| {
+        let ct = &r.headers.iter().find(|(k, _)| k == "content-type").expect("content type").1;
+        ct.strip_prefix("multipart/form-data; boundary=").expect("multipart").to_string()
+    };
+    let b0 = boundary(&reqs[0]);
+    assert_eq!(
+        text(&reqs[0].body),
+        format!(
+            "--{b0}\r\nContent-Disposition: form-data; name=\"kind\"\r\n\r\ndoc\r\n--{b0}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"notes.txt\"\r\nContent-Type: text/plain\r\n\r\nhello\r\nworld\r\n--{b0}--\r\n"
+        )
+    );
+    let b1 = boundary(&reqs[1]);
+    assert_eq!(
+        text(&reqs[1].body),
+        format!(
+            "--{b1}\r\nContent-Disposition: form-data; name=\"chunk\"; filename=\"part0\"\r\nContent-Type: application/octet-stream\r\n\r\nhello\r\n--{b1}\r\nContent-Disposition: form-data; name=\"name\"\r\n\r\nnotes.txt\r\n--{b1}--\r\n"
+        )
+    );
+    t.p.fetch_done(reqs[0].id, Some(crate::page::FetchResult { status: 201, url: reqs[0].url.clone(), headers: vec![], body: vec![] }));
+    t.step(2.0);
+    // clearing the control: the selection goes, a File the script kept stays readable
+    t.p.eval("input.value = ''; console.log('cleared', input.files.length, JSON.stringify(input.value)); kept.text().then(function (s) { console.log('kept', s.length); });");
+    t.step(3.0);
+    assert_eq!(t.errors(), Vec::<&String>::new(), "console: {:?}", t.log);
+    assert_eq!(
+        t.logs(),
+        vec![
+            "start 0 true \"\"",
+            "change true 1 notes.txt 12 text/plain 1234 true C:\\fakepath\\notes.txt",
+            "tail world 2",
+            "progress true true true",
+            "uploaded 201",
+            "cleared 0 \"\"",
+            "kept 12",
+        ]
+    );
+    // a plain form submission carries the file too
+    t.p.files_chosen(control, vec![PickedFile { name: "a\"b.bin".into(), mime: String::new(), last_modified_ms: 0.0, bytes: vec![0, 255, 13, 10] }]);
+    t.p.eval("document.getElementById('f').submit();");
+    match t.p.take_action() {
+        Some(PageAction::Submit { url, body: Some(body), content_type: Some(ct) }) => {
+            assert_eq!(url, "https://example.test/up");
+            let b = ct.strip_prefix("multipart/form-data; boundary=").expect("multipart");
+            let mut want = format!("--{b}\r\nContent-Disposition: form-data; name=\"kind\"\r\n\r\ndoc\r\n--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a%22b.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n").into_bytes();
+            want.extend_from_slice(&[0, 255, 13, 10]);
+            want.extend_from_slice(format!("\r\n--{b}--\r\n").as_bytes());
+            assert_eq!(body, want);
+        }
+        other => panic!("expected a multipart submission, got {other:?}"),
+    }
+}
+
+#[test]
 fn current_script_is_still_set_in_the_scripts_microtasks() {
     let mut t = T::new(
         "<body><script id=one>

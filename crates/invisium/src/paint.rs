@@ -743,7 +743,22 @@ impl<'a> Painter<'a> {
                     let w = self.text_width(&label, st);
                     self.text(&label, st, content.x + ((content.w - w) / 2.0).max(0.0), baseline, color);
                 }
-                "range" | "color" | "file" => {}
+                "file" => {
+                    // a button, then the chosen file names (the page stores them as the value)
+                    let label = "Choose file";
+                    let bw = self.text_width(label, st) + 16.0;
+                    // everything stays inside the control's box: pages hide file controls by
+                    // shrinking them to a pixel
+                    self.list.push_clip(content, NO_RADII);
+                    let button = Rect::new(content.x, content.y + 1.0, bw.min(content.w), (content.h - 2.0).max(0.0));
+                    self.list.rounded_rect(button, rgba(Color::hex(0xe5e7eb), alpha), [3.0; 4]);
+                    self.list.stroke(button, 1.0, rgba(Color::hex(0x9ca3af), alpha), [3.0; 4]);
+                    self.text(label, st, button.x + 8.0, baseline, rgba(Color::hex(0x111827), alpha));
+                    let chosen = self.form_values.get(&node).filter(|v| !v.is_empty()).cloned().unwrap_or_else(|| "No file chosen".into());
+                    self.text(&chosen, st, button.x + bw + 8.0, baseline, color);
+                    self.list.pop_clip();
+                }
+                "range" | "color" => {}
                 _ => {
                     let value = self.form_values.get(&node).cloned().or_else(|| self.doc.attr(node, a::VALUE).map(|s| s.to_string())).unwrap_or_default();
                     self.list.push_clip(content, NO_RADII);

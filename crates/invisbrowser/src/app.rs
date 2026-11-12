@@ -195,7 +195,7 @@ impl Browser {
     }
 
     /// Go to `input` (an address, search terms, or an `invis://` page).
-    pub fn navigate(&mut self, idx: usize, input: &str, push: bool, body: Option<Vec<u8>>) {
+    pub fn navigate(&mut self, idx: usize, input: &str, push: bool, body: Option<loader::FormBody>) {
         let mut url = loader::fix_url(input, &self.settings.search);
         self.cancel_loads(idx);
         let nav = self.next_nav;
@@ -261,7 +261,7 @@ impl Browser {
 
     /// A navigation asked for by page content (a link, a form, a script) of the page at `from`.
     /// Returns the tab the navigation went to, or `None` if it was refused.
-    pub fn navigate_from_page(&mut self, idx: usize, from: &str, url: &str, body: Option<Vec<u8>>, new_tab: bool) -> Option<usize> {
+    pub fn navigate_from_page(&mut self, idx: usize, from: &str, url: &str, body: Option<loader::FormBody>, new_tab: bool) -> Option<usize> {
         if !loader::page_may_open(from, url) {
             self.status = Some("Blocked: a web page tried to open an internal browser page".into());
             return None;
@@ -529,8 +529,8 @@ impl Browser {
             Some((PageAction::Navigate { url, .. }, from)) => {
                 self.navigate_from_page(idx, &from, &url, None, false);
             }
-            Some((PageAction::Submit { url, body }, from)) => {
-                self.navigate_from_page(idx, &from, &url, body, false);
+            Some((PageAction::Submit { url, body, content_type }, from)) => {
+                self.navigate_from_page(idx, &from, &url, body.map(|b| (b, content_type)), false);
             }
             _ => {}
         }

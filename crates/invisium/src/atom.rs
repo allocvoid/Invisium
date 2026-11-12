@@ -140,7 +140,7 @@ pub mod a {
         VIEWBOX = "viewbox", D = "d", FILL = "fill", STROKE = "stroke", STROKE_WIDTH = "stroke-width",
         X = "x", Y = "y", CX = "cx", CY = "cy", R = "r", RX = "rx", RY = "ry", X1 = "x1", Y1 = "y1",
         X2 = "x2", Y2 = "y2", POINTS = "points", TRANSFORM = "transform", HSPACE = "hspace", VSPACE = "vspace",
-        ENCTYPE = "enctype", AUTOFOCUS = "autofocus", TABINDEX = "tabindex", DATA = "data", POSTER = "poster",
+        ENCTYPE = "enctype", ACCEPT = "accept", AUTOFOCUS = "autofocus", TABINDEX = "tabindex", DATA = "data", POSTER = "poster",
         FILL_RULE = "fill-rule", STROKE_LINECAP = "stroke-linecap", STROKE_LINEJOIN = "stroke-linejoin",
         OPACITY = "opacity", XLINK_HREF = "xlink:href",
     }

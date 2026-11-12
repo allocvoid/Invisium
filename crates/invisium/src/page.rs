@@ -94,8 +94,23 @@ pub enum PageAction {
     /// Something changed on screen.
     Redraw,
     Navigate { url: String, new_tab: bool },
-    /// Form submission. `body` is `Some` for POST (`application/x-www-form-urlencoded`).
-    Submit { url: String, body: Option<Vec<u8>> },
+    /// Form submission. `body` is `Some` for POST; `content_type` is `None` for the default
+    /// encoding (`application/x-www-form-urlencoded`) and set for `multipart/form-data`.
+    Submit { url: String, body: Option<Vec<u8>>, content_type: Option<String> },
+    /// The user activated a file control. The embedder shows its file dialog and answers with
+    /// `Page::files_chosen` (not at all if the dialog is cancelled).
+    PickFiles { control: NodeId, multiple: bool, accept: String },
+}
+
+/// A file the user chose for a file control. The embedder reads it; the page only ever sees
+/// files that were handed to it this way.
+#[derive(Debug)]
+pub struct PickedFile {
+    pub name: String,
+    /// MIME type guessed by the embedder ("" if unknown).
+    pub mime: String,
+    pub last_modified_ms: f64,
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -207,6 +222,11 @@ pub struct Page {
     pub(crate) console: Vec<ConsoleMessage>,
     /// A navigation or submission requested by script, for the embedder to pick up.
     pub(crate) pending_action: Option<PageAction>,
+    /// Every file the user has picked on this page, by id (script `File` objects refer to these
+    /// ids, so a file stays readable after its control is cleared).
+    pub(crate) picked: Vec<Rc<PickedFile>>,
+    /// Current selection of each file control: indices into `picked`.
+    pub(crate) file_values: HashMap<NodeId, Vec<u32>>,
     pub(crate) clock_ms: f64,
     /// Value of the focused text control when it received focus (for `change`).
     pub(crate) focus_value: Option<String>,
@@ -274,6 +294,45 @@ pub(crate) fn decode_bytes(bytes: &[u8], label: &str, guess: bool) -> String {
     } else {
         String::from_utf8_lossy(bytes).into_owned()
     }
+}
+
+/// A `multipart/form-data` body for the form entries; returns it with its boundary.
+fn multipart_body(pairs: &[(String, String)], files: &[(usize, Option<Rc<PickedFile>>)]) -> (Vec<u8>, String) {
+    // the boundary only has to be absent from the body; a clock-derived one is enough here
+    let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let mut boundary = format!("----InvisiumFormBoundary{seed:032x}");
+    let in_body = |b: &str| {
+        let needle = b.as_bytes();
+        pairs.iter().any(|(k, v)| k.contains(b) || v.contains(b))
+            || files.iter().any(|(_, f)| f.as_ref().map_or(false, |f| f.bytes.windows(needle.len()).any(|w| w == needle)))
+    };
+    while in_body(&boundary) {
+        boundary.push('x');
+    }
+    let quote = |s: &str| s.replace('"', "%22").replace('\r', "%0D").replace('\n', "%0A");
+    let mut out = Vec::new();
+    for (i, (name, value)) in pairs.iter().enumerate() {
+        out.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        match files.iter().find(|(at, _)| *at == i) {
+            Some((_, file)) => {
+                let (fname, mime, bytes): (&str, &str, &[u8]) = match file {
+                    Some(f) => (&f.name, if f.mime.is_empty() { "application/octet-stream" } else { &f.mime }, &f.bytes),
+                    None => ("", "application/octet-stream", &[]),
+                };
+                out.extend_from_slice(
+                    format!("Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\nContent-Type: {mime}\r\n\r\n", quote(name), quote(fname)).as_bytes(),
+                );
+                out.extend_from_slice(bytes);
+            }
+            None => {
+                out.extend_from_slice(format!("Content-Disposition: form-data; name=\"{}\"\r\n\r\n", quote(name)).as_bytes());
+                out.extend_from_slice(value.as_bytes());
+            }
+        }
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    (out, boundary)
 }
 
 fn form_encode(s: &str, out: &mut String) {
@@ -355,6 +414,8 @@ impl Page {
             lifecycle: 0,
             console: Vec::new(),
             pending_action: None,
+            picked: Vec::new(),
+            file_values: HashMap::new(),
             clock_ms: 0.0,
             focus_value: None,
             script_redraw: false,
@@ -1141,6 +1202,7 @@ impl Page {
                 self.dirty_style = true;
                 PageAction::Redraw
             }
+            a::INPUT if ty == "file" => self.pick_action(control),
             a::INPUT if matches!(ty.as_str(), "submit" | "image") => self.submit(control, control),
             a::BUTTON if ty.is_empty() || ty == "submit" => self.submit(control, control),
             a::SELECT => {
@@ -1282,6 +1344,8 @@ impl Page {
             return PageAction::None;
         }
         let mut pairs: Vec<(String, String)> = Vec::new();
+        // entries of `pairs` that are files: (index, the file or `None` for "nothing chosen")
+        let mut files: Vec<(usize, Option<Rc<PickedFile>>)> = Vec::new();
         let controls: Vec<NodeId> = self.doc.descendants(form).collect();
         for n in controls {
             let tag = self.doc.tag(n);
@@ -1303,7 +1367,18 @@ impl Page {
                                 pairs.push((name, self.doc.attr(n, a::VALUE).unwrap_or("").to_string()));
                             }
                         }
-                        "file" => {}
+                        "file" => {
+                            let chosen = self.file_values.get(&n).cloned().unwrap_or_default();
+                            if chosen.is_empty() {
+                                files.push((pairs.len(), None));
+                                pairs.push((name.clone(), String::new()));
+                            }
+                            for id in chosen {
+                                let f = self.picked[id as usize].clone();
+                                files.push((pairs.len(), Some(f.clone())));
+                                pairs.push((name.clone(), f.name.clone()));
+                            }
+                        }
                         _ => pairs.push((name, self.current_value(n))),
                     }
                 }
@@ -1338,12 +1413,61 @@ impl Page {
         let target = if action.trim().is_empty() { self.url.split('#').next().unwrap_or("").to_string() } else { action };
         let Some(abs) = self.resolve(&target) else { return PageAction::None };
         let post = self.doc.attr(form, a::METHOD).map_or(false, |m| m.eq_ignore_ascii_case("post"));
-        if post {
-            PageAction::Submit { url: abs, body: Some(encoded.into_bytes()) }
+        let multipart = post && self.doc.attr(form, a::ENCTYPE).map_or(false, |e| e.trim().eq_ignore_ascii_case("multipart/form-data"));
+        if multipart {
+            let (body, boundary) = multipart_body(&pairs, &files);
+            PageAction::Submit { url: abs, body: Some(body), content_type: Some(format!("multipart/form-data; boundary={boundary}")) }
+        } else if post {
+            PageAction::Submit { url: abs, body: Some(encoded.into_bytes()), content_type: None }
         } else {
             let base = abs.split('#').next().unwrap_or("").split('?').next().unwrap_or("").to_string();
-            PageAction::Submit { url: format!("{base}?{encoded}"), body: None }
+            PageAction::Submit { url: format!("{base}?{encoded}"), body: None, content_type: None }
         }
+    }
+
+    fn pick_action(&self, control: NodeId) -> PageAction {
+        PageAction::PickFiles {
+            control,
+            multiple: self.doc.attr(control, a::MULTIPLE).is_some(),
+            accept: self.doc.attr(control, a::ACCEPT).unwrap_or("").to_string(),
+        }
+    }
+
+    /// The answer to `PageAction::PickFiles`: these files become the control's selection
+    /// (replacing an earlier one) and scripts hear `input` and `change`.
+    pub fn files_chosen(&mut self, control: NodeId, files: Vec<PickedFile>) {
+        let is_file_control = self.doc.is_valid(control)
+            && self.doc.tag(control) == a::INPUT
+            && self.doc.attr(control, a::TYPE).map_or(false, |t| t.eq_ignore_ascii_case("file"));
+        if !is_file_control || files.is_empty() {
+            return;
+        }
+        let multiple = self.doc.attr(control, a::MULTIPLE).is_some();
+        let mut ids = Vec::new();
+        for f in files.into_iter().take(if multiple { usize::MAX } else { 1 }) {
+            ids.push(self.picked.len() as u32);
+            self.picked.push(Rc::new(f));
+        }
+        self.file_values.insert(control, ids.clone());
+        // what the control shows next to its button
+        let shown = ids.iter().map(|&i| self.picked[i as usize].name.as_str()).collect::<Vec<_>>().join(", ");
+        self.form_values.insert(control, shown);
+        self.dirty_paint = true;
+        if self.script.is_some() {
+            let infos: Vec<(u32, String, String, f64, f64)> = ids
+                .iter()
+                .map(|&id| {
+                    let f = &self.picked[id as usize];
+                    (id, f.name.clone(), f.mime.clone(), f.last_modified_ms, f.bytes.len() as f64)
+                })
+                .collect();
+            self.script(|e| e.files_changed(control, &infos));
+        }
+    }
+
+    /// Names of the files chosen for a file control (what the control shows).
+    pub fn chosen_file_names(&self, control: NodeId) -> Vec<&str> {
+        self.file_values.get(&control).map_or(Vec::new(), |ids| ids.iter().map(|&i| self.picked[i as usize].name.as_str()).collect())
     }
 
     /// Inline `<svg>` elements that still need rasterising, with their laid-out size. The
@@ -1534,7 +1658,7 @@ mod tests {
         assert!(p.has_text_focus());
         p.text_input("rust & c++");
         p.backspace();
-        assert_eq!(p.enter(), PageAction::Submit { url: "https://example.test/search?q=rust+%26+c%2B&h=a+b&c=on".into(), body: None });
+        assert_eq!(p.enter(), PageAction::Submit { url: "https://example.test/search?q=rust+%26+c%2B&h=a+b&c=on".into(), body: None, content_type: None });
     }
 
     #[test]

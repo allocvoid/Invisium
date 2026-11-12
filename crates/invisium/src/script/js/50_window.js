@@ -331,7 +331,7 @@ function atob(s) {
     Attr: Attr, NamedNodeMap: NamedNodeMap, Navigator: Navigator, Location: Location, History: History,
     Screen: Screen, DOMImplementation: DOMImplementation, Selection: Selection, MediaQueryList: MediaQueryList,
     CSSRule: CSSRule, CSSStyleRule: CSSStyleRule, StyleSheet: StyleSheet, HTMLSlotElement: HTML_CLASSES.HTMLSlotElement,
-    CustomElementRegistry: CustomElementRegistry, Blob: Blob, File: File, FileReader: FileReader,
+    CustomElementRegistry: CustomElementRegistry, Blob: Blob, File: File, FileReader: FileReader, FileList: FileList,
     ReadableStream: ReadableStream, ReadableStreamDefaultReader: ReadableStreamDefaultReader,
     ReadableStreamDefaultController: ReadableStreamDefaultController, WritableStream: WritableStream,
     WritableStreamDefaultWriter: WritableStreamDefaultWriter, TransformStream: TransformStream,
@@ -383,6 +383,14 @@ return {
       trusted(g, 'load', { bubbles: false, cancelable: false });
       trusted(g, 'pageshow', { bubbles: false, cancelable: false });
     }
+  },
+  // the user chose files for a file control: [file id, name, type, last modified, size, ...]
+  files: function (input, flat) {
+    var list = new FileList();
+    for (var i = 0; i + 4 < flat.length; i += 5) list.push(lazyFile(flat[i], 0, flat[i + 4], flat[i + 1], flat[i + 2], flat[i + 3]));
+    hide(input, '_files', list);
+    trusted(input, 'input', { bubbles: true, cancelable: false });
+    trusted(input, 'change', { bubbles: true, cancelable: false });
   },
   // a resource element finished loading (or failed)
   loaded: function (node, ok) { trusted(node, ok ? 'load' : 'error', { bubbles: false, cancelable: false }); },

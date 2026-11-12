@@ -4,6 +4,7 @@
 //!   invisbrowser --screenshot <address> <png>    render one page without a window (see headless.rs)
 
 mod app;
+mod filedialog;
 mod headless;
 mod internal;
 mod loader;

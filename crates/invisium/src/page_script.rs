@@ -347,6 +347,11 @@ impl Page {
                 self.pending_action = Some(action);
             }
         }
+        if let Some(control) = fx.pick_files {
+            if self.doc.is_valid(control) {
+                self.pending_action = Some(self.pick_action(control));
+            }
+        }
     }
 
     fn run_pending(&mut self, s: PendingScript) {

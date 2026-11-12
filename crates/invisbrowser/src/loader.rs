@@ -102,11 +102,14 @@ pub fn query_param(url: &str, key: &str) -> Option<String> {
     None
 }
 
-pub fn fetch_document(net: &NetService, sink: &Sink, tab: u64, nav: u64, url: Url, body: Option<Vec<u8>>, referrer: Option<Url>) -> RequestHandle {
+/// A form submission's body with its content type (`None` = `application/x-www-form-urlencoded`).
+pub type FormBody = (Vec<u8>, Option<String>);
+
+pub fn fetch_document(net: &NetService, sink: &Sink, tab: u64, nav: u64, url: Url, body: Option<FormBody>, referrer: Option<Url>) -> RequestHandle {
     let mut req = Request::get(url, ResourceKind::Document);
-    if let Some(b) = body {
+    if let Some((b, content_type)) = body {
         req.method = Method::Post;
-        req.headers.push(("Content-Type".to_string(), "application/x-www-form-urlencoded".to_string()));
+        req.headers.push(("Content-Type".to_string(), content_type.unwrap_or_else(|| "application/x-www-form-urlencoded".to_string())));
         req.body = Some(b);
     }
     req.referrer = referrer;

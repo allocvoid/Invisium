@@ -490,9 +490,44 @@ fn n_fetch(rt: &mut Runtime, cx: &Cx, args: &[Value]) -> NRes {
         headers.push((k, v));
         i += 2;
     }
-    // a string goes out as UTF-8, an ArrayBuffer as it is
+    // A string goes out as UTF-8, an ArrayBuffer as it is. With the seventh argument set, the
+    // body is a list of parts (a multipart form): strings, buffers, and three consecutive
+    // numbers `file id, start, end` for a range of a picked file, which is copied straight from
+    // the page's copy of the file.
+    let in_parts = rt.to_boolean(arg(args, 6));
     let body = match arg(args, 3) {
         Value::Null | Value::Undefined => None,
+        v if in_parts => {
+            let n = rt.get(v, "length").map(|l| rt.to_number(l)).unwrap_or(0.0).clamp(0.0, 100_000.0) as u32;
+            let mut out: Vec<u8> = Vec::new();
+            let mut i = 0;
+            while i < n {
+                let part = rt.get_index(v, i).unwrap_or(Value::Undefined);
+                if rt.type_of(part) == "number" {
+                    let mut num = |k: u32| {
+                        let x = rt.get_index(v, k).unwrap_or(Value::Undefined);
+                        rt.to_number(x)
+                    };
+                    let (id, start, end) = (num(i), num(i + 1), num(i + 2));
+                    i += 3;
+                    let st = cx.st.borrow();
+                    if let Some(f) = st.page.picked.get(id as usize).filter(|_| id >= 0.0) {
+                        let len = f.bytes.len();
+                        let a = (start.max(0.0) as usize).min(len);
+                        let b = (end.max(0.0) as usize).clamp(a, len);
+                        out.extend_from_slice(&f.bytes[a..b]);
+                    }
+                    continue;
+                }
+                if let Some(bytes) = rt.buffer_bytes(part) {
+                    out.extend_from_slice(&bytes);
+                } else {
+                    out.extend_from_slice(rt.to_string_lossy(part).as_bytes());
+                }
+                i += 1;
+            }
+            Some(out)
+        }
         v => Some(match rt.buffer_bytes(v) {
             Some(bytes) => bytes,
             None => rt.to_string_lossy(v).into_bytes(),
@@ -569,6 +604,48 @@ fn n_decode(rt: &mut Runtime, _cx: &Cx, args: &[Value]) -> NRes {
     Ok(rt.string(&text))
 }
 
+/// pickFiles(input): ask for the file dialog of a file control. Only honoured while a
+/// user-input event is being handled, so a page cannot open dialogs on its own.
+fn n_pick_files(rt: &mut Runtime, cx: &Cx, args: &[Value]) -> NRes {
+    let control = node(rt, cx, arg(args, 0))?;
+    let mut st = cx.st.borrow_mut();
+    if st.user_gesture {
+        st.fx.pick_files = Some(control);
+    }
+    Ok(Value::Bool(st.user_gesture))
+}
+
+/// clearFiles(input): forget the selection of a file control.
+fn n_clear_files(rt: &mut Runtime, cx: &Cx, args: &[Value]) -> NRes {
+    let control = node(rt, cx, arg(args, 0))?;
+    let mut st = cx.st.borrow_mut();
+    if st.page.file_values.remove(&control).is_some() {
+        st.page.form_values.remove(&control);
+        st.fx.dirty_paint = true;
+    }
+    Ok(Value::Undefined)
+}
+
+/// fileBytes(id, start, end): a copy of a byte range of a picked file, as an ArrayBuffer.
+fn n_file_bytes(rt: &mut Runtime, cx: &Cx, args: &[Value]) -> NRes {
+    let id = rt.to_number(arg(args, 0));
+    let start = rt.to_number(arg(args, 1));
+    let end = rt.to_number(arg(args, 2));
+    let bytes: Option<Vec<u8>> = {
+        let st = cx.st.borrow();
+        st.page.picked.get(id as usize).filter(|_| id >= 0.0).map(|f| {
+            let len = f.bytes.len();
+            let a = (start.max(0.0) as usize).min(len);
+            let b = (end.max(0.0) as usize).clamp(a, len);
+            f.bytes[a..b].to_vec()
+        })
+    };
+    match bytes {
+        Some(b) => Ok(rt.array_buffer(&b)),
+        None => Err(rt.throw_error("TypeError", "no such file")),
+    }
+}
+
 fn n_abort_fetch(rt: &mut Runtime, cx: &Cx, args: &[Value]) -> NRes {
     let id = rt.to_number(arg(args, 0)) as u32;
     cx.st.borrow_mut().fx.fetch_aborts.push(id);
@@ -586,8 +663,11 @@ fn n_submit(rt: &mut Runtime, cx: &Cx, args: &[Value]) -> NRes {
 pub(crate) fn install(rt: &mut Runtime, n: Value, cx: &Rc<Cx>) {
     let table: &[(&str, u32, Native)] = &[
         ("submit", 2, n_submit),
-        ("fetch", 6, n_fetch),
+        ("fetch", 7, n_fetch),
         ("abortFetch", 1, n_abort_fetch),
+        ("pickFiles", 1, n_pick_files),
+        ("clearFiles", 1, n_clear_files),
+        ("fileBytes", 3, n_file_bytes),
         ("encode", 1, n_encode),
         ("decode", 2, n_decode),
         ("random", 1, n_random),

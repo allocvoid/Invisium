@@ -4,10 +4,11 @@
 // A failure is always reported to script as the same opaque error, whatever its cause.
 
 var pendingFetches = Object.create(null);
-function startFetch(method, url, headers, body, sameOrigin, credentials, done) {
+// `body` is a string, an ArrayBuffer, null, or (with `inParts`) a list of multipart pieces.
+function startFetch(method, url, headers, body, sameOrigin, credentials, done, inParts) {
   var flat = [];
   headers.forEach(function (v, k) { flat.push(k, v); });
-  var id = n.fetch(method, url, flat, body, sameOrigin, credentials);
+  var id = n.fetch(method, url, flat, body, sameOrigin, credentials, !!inParts);
   pendingFetches[id] = done;
   return id;
 }
@@ -87,12 +88,23 @@ class FormData {
       if (!name || n.hasAttr(el, 'disabled')) continue;
       if (tag === 'input') {
         if (type === 'checkbox' || type === 'radio') { if (n.hasAttr(el, 'checked')) this.append(name, el.value); }
-        else if (type !== 'submit' && type !== 'button' && type !== 'reset' && type !== 'image' && type !== 'file') this.append(name, el.value);
+        else if (type === 'file') {
+          var fl = el.files;
+          if (!fl.length) this.append(name, new File([], '', { type: 'application/octet-stream' }));
+          for (var j = 0; j < fl.length; j++) this.append(name, fl[j]);
+        }
+        else if (type !== 'submit' && type !== 'button' && type !== 'reset' && type !== 'image') this.append(name, el.value);
       } else if (tag === 'select' || tag === 'textarea') this.append(name, el.value);
     }
   }
-  append(k, v) { this._e.push([String(k), String(v)]); }
-  set(k, v) { this.delete(k); this.append(k, v); }
+  // a value is a string or a File (a Blob is wrapped in one, named "blob" unless told otherwise)
+  append(k, v, filename) {
+    if (v instanceof Blob) {
+      if (!(v instanceof File) || filename !== undefined) v = fileFrom(v, filename !== undefined ? String(filename) : v instanceof File ? v.name : 'blob');
+    } else v = String(v);
+    this._e.push([String(k), v]);
+  }
+  set(k, v, filename) { this.delete(k); this.append(k, v, filename); }
   delete(k) { k = String(k); this._e = this._e.filter(function (p) { return p[0] !== k; }); }
   get(k) { k = String(k); for (var i = 0; i < this._e.length; i++) if (this._e[i][0] === k) return this._e[i][1]; return null; }
   getAll(k) { k = String(k); var out = []; for (var i = 0; i < this._e.length; i++) if (this._e[i][0] === k) out.push(this._e[i][1]); return out; }
@@ -104,10 +116,27 @@ class FormData {
   [Symbol.iterator]() { return this.entries(); }
 }
 
-// Binary data. A Blob owns one ArrayBuffer that nothing else can reach, so it is immutable.
+// Binary data. A Blob's bytes are either in an ArrayBuffer of its own that nothing else can
+// reach (`_buf`), or a range of a file the user picked (`_fid`, `_start`, `_end`), which is read
+// from the page's copy only when something asks for the bytes. Either way it is immutable.
+function blobBuffer(b) { return b._buf !== null ? b._buf : n.fileBytes(b._fid, b._start, b._end); }
+// A File over a range of a picked file, or over another blob's bytes under a new name.
+function lazyFile(fid, start, end, name, type, modified) {
+  var f = Object.create(File.prototype);
+  hide(f, '_buf', null); hide(f, '_fid', fid); hide(f, '_start', start); hide(f, '_end', end);
+  f.type = type; f.name = name; f.lastModified = modified; f.webkitRelativePath = '';
+  return f;
+}
+function fileFrom(blob, name) {
+  var modified = blob instanceof File ? blob.lastModified : Date.now();
+  if (blob._buf === null) return lazyFile(blob._fid, blob._start, blob._end, name, blob.type, modified);
+  var f = new File([], name, { type: blob.type, lastModified: modified });
+  f._buf = blob._buf;   // shared: neither ever changes it
+  return f;
+}
 function blobPart(p) {
   if (typeof p === 'string') return new Uint8Array(n.encode(p));
-  if (p instanceof Blob) return new Uint8Array(p._buf);
+  if (p instanceof Blob) return new Uint8Array(blobBuffer(p));
   if (p instanceof ArrayBuffer) return new Uint8Array(p);
   if (ArrayBuffer.isView(p)) return new Uint8Array(p.buffer, p.byteOffset, p.byteLength);
   return new Uint8Array(n.encode(String(p)));
@@ -121,19 +150,33 @@ class Blob {
     }
     var out = new Uint8Array(total), at = 0;
     for (i = 0; i < chunks.length; i++) { out.set(chunks[i], at); at += chunks[i].byteLength; }
-    hide(this, '_buf', out.buffer);
-    var type = opts && opts.type !== undefined ? String(opts.type) : '';
-    this.type = /[^\x20-\x7e]/.test(type) ? '' : type.toLowerCase();
+    hide(this, '_buf', out.buffer); hide(this, '_fid', -1); hide(this, '_start', 0); hide(this, '_end', 0);
+    this.type = blobType(opts && opts.type);
   }
-  get size() { return this._buf.byteLength; }
+  get size() { return this._buf !== null ? this._buf.byteLength : this._end - this._start; }
   slice(start, end, type) {
-    var len = this._buf.byteLength;
-    return new Blob([this._buf.slice(start === undefined ? 0 : start, end === undefined ? len : end)], { type: type });
+    var len = this.size;
+    var rel = function (v, d) { v = v === undefined ? d : Math.trunc(Number(v)) || 0; return v < 0 ? Math.max(len + v, 0) : Math.min(v, len); };
+    var a = rel(start, 0), b = Math.max(rel(end, len), a);
+    if (this._buf !== null) return new Blob([this._buf.slice(a, b)], { type: type });
+    // a range of a picked file stays a range: nothing is read until it is needed
+    var out = Object.create(Blob.prototype);
+    hide(out, '_buf', null); hide(out, '_fid', this._fid); hide(out, '_start', this._start + a); hide(out, '_end', this._start + b);
+    out.type = blobType(type);
+    return out;
   }
-  text() { return Promise.resolve(n.decode(this._buf, 'utf-8')); }
-  arrayBuffer() { return Promise.resolve(this._buf.slice(0)); }
-  bytes() { return Promise.resolve(new Uint8Array(this._buf.slice(0))); }
-  stream() { var buf = this._buf; return bytesStream(function () { return new Uint8Array(buf.slice(0)); }); }
+  text() { return Promise.resolve(n.decode(blobBuffer(this), 'utf-8')); }
+  arrayBuffer() { return Promise.resolve(this._buf !== null ? this._buf.slice(0) : blobBuffer(this)); }
+  bytes() { return this.arrayBuffer().then(function (b) { return new Uint8Array(b); }); }
+  stream() { var self = this; return bytesStream(function () { return new Uint8Array(self._buf !== null ? self._buf.slice(0) : blobBuffer(self)); }); }
+}
+function blobType(t) {
+  t = t === undefined || t === null ? '' : String(t);
+  return /[^\x20-\x7e]/.test(t) ? '' : t.toLowerCase();
+}
+// What `input.files` returns.
+class FileList extends Array {
+  item(i) { return this[i] || null; }
 }
 class File extends Blob {
   constructor(parts, name, opts) {
@@ -161,7 +204,7 @@ class FileReader extends EventTarget {
     this.readyState = 1; this.result = null;
     g.setTimeout(function () {
       if (self.readyState !== 1) return;
-      self.result = make(blob._buf, blob.type);
+      self.result = make(blobBuffer(blob), blob.type);
       self.readyState = 2;
       var done = { lengthComputable: true, loaded: blob.size, total: blob.size };
       dispatch(self, new ProgressEvent('load', done));
@@ -192,20 +235,40 @@ function toBody(body) {
   if (body === null || body === undefined) return [null, null];
   if (typeof body === 'string') return [body, 'text/plain;charset=UTF-8'];
   if (body instanceof ReadableStream) throw new TypeError('Streaming request bodies are not supported');
-  if (body instanceof Blob) return [body._buf.slice(0), body.type || null];
+  if (body instanceof Blob) return [body._buf !== null ? body._buf.slice(0) : blobBuffer(body), body.type || null];
   if (body instanceof ArrayBuffer) return [body.slice(0), null];
   if (ArrayBuffer.isView(body)) return [body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength), null];
   if (body instanceof URLSearchParams) return [body.toString(), 'application/x-www-form-urlencoded;charset=UTF-8'];
   if (body instanceof FormData) {
-    var boundary = '----invisium', hex = '0123456789abcdef', i, s = '';
+    // A list of pieces for the engine to join: text, buffers, and `file id, start, end` number
+    // triples for ranges of picked files (so a large upload is not copied through script).
+    var boundary = '----invisium', hex = '0123456789abcdef', i, parts = [], s = '';
+    var quote = function (t) { return t.split('"').join('%22').split('\r').join('%0D').split('\n').join('%0A'); };
     for (i = 0; i < 24; i++) boundary += hex[Math.floor(Math.random() * 16)];
     for (i = 0; i < body._e.length; i++) {
-      var name = body._e[i][0].split('"').join('%22').split('\r').join('%0D').split('\n').join('%0A');
-      s += '--' + boundary + '\r\nContent-Disposition: form-data; name="' + name + '"\r\n\r\n' + body._e[i][1] + '\r\n';
+      var v = body._e[i][1];
+      s += '--' + boundary + '\r\nContent-Disposition: form-data; name="' + quote(body._e[i][0]) + '"';
+      if (typeof v === 'string') { s += '\r\n\r\n' + v + '\r\n'; continue; }
+      s += '; filename="' + quote(v.name) + '"\r\nContent-Type: ' + (v.type || 'application/octet-stream') + '\r\n\r\n';
+      parts.push(s); s = '\r\n';
+      if (v._buf !== null) parts.push(v._buf); else parts.push(v._fid, v._start, v._end);
     }
-    return [s + '--' + boundary + '--\r\n', 'multipart/form-data; boundary=' + boundary];
+    parts.push(s + '--' + boundary + '--\r\n');
+    return [parts, 'multipart/form-data; boundary=' + boundary, true];
   }
   return [String(body), 'text/plain;charset=UTF-8'];
+}
+// Size in bytes of an encoded body (text counted as UTF-8 only roughly: one byte per unit).
+function bodySize(data, inParts) {
+  if (data === null) return 0;
+  if (!inParts) return typeof data === 'string' ? data.length : data.byteLength;
+  var total = 0;
+  for (var i = 0; i < data.length; i++) {
+    var p = data[i];
+    if (typeof p === 'number') { total += data[i + 2] - data[i + 1]; i += 2; }
+    else total += typeof p === 'string' ? p.length : p.byteLength;
+  }
+  return total;
 }
 function unsupportedBody(what) {
   return Promise.reject(new DOMException(what + ' is not supported yet', 'NotSupportedError'));
@@ -312,7 +375,7 @@ function fetch(input, init) {
       r._data = buf;
       r.url = url; r.redirected = url !== req.url; r.type = 'basic';
       resolve(r);
-    });
+    }, enc[2]);
     if (signal && typeof signal.addEventListener === 'function') {
       signal.addEventListener('abort', function () { cancelFetch(id); reject(signal.reason); });
     }
@@ -329,7 +392,7 @@ class XMLHttpRequest extends EventTarget {
     this.onabort = null; this.ontimeout = null; this.onprogress = null; this.onloadstart = null;
     hide(this, '_method', 'GET'); hide(this, '_url', ''); hide(this, '_headers', new Headers());
     hide(this, '_resp', null); hide(this, '_id', 0); hide(this, '_sent', false); hide(this, '_timer', 0);
-    hide(this, '_buf', null);
+    hide(this, '_buf', null); hide(this, '_up', 0);
   }
   open(method, url, async) {
     if (async === false) {
@@ -358,21 +421,27 @@ class XMLHttpRequest extends EventTarget {
     try {
       this._id = startFetch(m, this._url, this._headers, enc[0], false, this.withCredentials ? 2 : 1, function (ok, status, url, flat, buf, charset) {
         self._done(ok, status, url, flat, buf, charset);
-      });
+      }, enc[2]);
     } catch (e) {
       g.setTimeout(function () { self._fail('error'); }, 0);
       return;
     }
+    // Upload progress cannot be observed (the network stack sends a body in one piece), so the
+    // upload reports its start now and its whole size once the response is in.
+    this._up = bodySize(enc[0], enc[2]);
     this._fire('loadstart');
+    if (this._up > 0) this._upload('loadstart', 0);
     if (this.timeout > 0) this._timer = g.setTimeout(function () { cancelFetch(self._id); self._fail('timeout'); }, this.timeout);
   }
   _state(s) { this.readyState = s; dispatch(this, new Event('readystatechange')); }
   _fire(type) { dispatch(this, new ProgressEvent(type, { loaded: this._buf ? this._buf.byteLength : this.responseText.length })); }
+  _upload(type, loaded) { dispatch(this.upload, new ProgressEvent(type, { lengthComputable: true, loaded: loaded, total: this._up })); }
   _done(ok, status, url, flat, buf, charset) {
     if (this._timer) { g.clearTimeout(this._timer); this._timer = 0; }
     if (!ok) { this._fail('error'); return; }
     this.status = status; this.statusText = STATUS_TEXT[status] || ''; this.responseURL = url;
     this._resp = headersFromFlat(flat);
+    if (this._up > 0) { this._upload('progress', this._up); this._upload('load', this._up); this._upload('loadend', this._up); this._up = 0; }
     this._state(2);
     // binary response types keep the bytes; the others keep only the decoded text
     if (this.responseType === 'arraybuffer' || this.responseType === 'blob') this._buf = buf;
@@ -386,6 +455,7 @@ class XMLHttpRequest extends EventTarget {
     if (this._timer) { g.clearTimeout(this._timer); this._timer = 0; }
     this._id = 0; this.status = 0; this.statusText = ''; this.responseText = ''; this._resp = null; this._buf = null;
     this._state(4);
+    if (this._up > 0) { this._upload(type, 0); this._upload('loadend', 0); this._up = 0; }
     this._fire(type);
     this._fire('loadend');
   }

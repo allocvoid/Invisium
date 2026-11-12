@@ -173,12 +173,50 @@ impl App {
                 self.browser.navigate_from_page(active, &from, &url, None, new_tab);
                 self.sync();
             }
-            PageAction::Submit { url, body } => {
+            PageAction::Submit { url, body, content_type } => {
                 let from = self.browser.shown_url(active);
-                self.browser.navigate_from_page(active, &from, &url, body, false);
+                self.browser.navigate_from_page(active, &from, &url, body.map(|b| (b, content_type)), false);
                 self.sync();
             }
+            PageAction::PickFiles { control, multiple, accept } => self.pick_files(control, multiple, &accept),
         }
+    }
+
+    /// The page asked for files (the user activated a file control): show the system dialog,
+    /// read what was chosen and hand it to the page. Only files picked here ever reach a page.
+    fn pick_files(&mut self, control: invisium::dom::NodeId, multiple: bool, accept: &str) {
+        let owner = self.window.as_ref().map_or(0, |w| native_handle(w));
+        let paths = crate::filedialog::pick_files(owner, multiple, accept);
+        if paths.is_empty() {
+            return;
+        }
+        let mut files = Vec::new();
+        let mut total: u64 = 0;
+        for path in paths {
+            let Ok(meta) = std::fs::metadata(&path) else { continue };
+            total += meta.len();
+            if total > MAX_PICKED_BYTES {
+                self.browser.status = Some("That selection is too large to load (limit 1 GB)".into());
+                break;
+            }
+            let Ok(bytes) = std::fs::read(&path) else { continue };
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let modified = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0.0, |d| d.as_millis() as f64);
+            files.push(invisium::page::PickedFile { mime: mime_of(&name).to_string(), name, last_modified_ms: modified, bytes });
+        }
+        if files.is_empty() {
+            return;
+        }
+        if let Some(page) = self.browser.active_page() {
+            page.files_chosen(control, files);
+        }
+        self.browser.tick();
+        self.sync();
+        self.redraw_soon();
     }
 
     fn mouse_move(&mut self, x: f32, y: f32) {
@@ -669,5 +707,62 @@ pub fn run(start_url: Option<String>) -> i32 {
             eprintln!("event loop error: {e}");
             1
         }
+    }
+}
+
+/// Most bytes one file selection may load into memory.
+const MAX_PICKED_BYTES: u64 = 1 << 30;
+
+/// The window's native handle for system dialogs (an HWND on Windows); 0 where there is none.
+fn native_handle(w: &Window) -> isize {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match w.window_handle().map(|h| h.as_raw()) {
+        Ok(RawWindowHandle::Win32(h)) => h.hwnd.get(),
+        _ => 0,
+    }
+}
+
+/// MIME type of a picked file, from its extension ("" if unknown, as browsers report it).
+fn mime_of(name: &str) -> &'static str {
+    let ext = name.rsplit_once('.').map(|p| p.1.to_ascii_lowercase()).unwrap_or_default();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        "avif" => "image/avif",
+        "txt" | "log" => "text/plain",
+        "csv" => "text/csv",
+        "html" | "htm" => "text/html",
+        "css" => "text/css",
+        "js" | "mjs" => "text/javascript",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "md" => "text/markdown",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "gz" => "application/gzip",
+        "7z" => "application/x-7z-compressed",
+        "rar" => "application/vnd.rar",
+        "tar" => "application/x-tar",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "ogg" => "audio/ogg",
+        "flac" => "audio/flac",
+        "m4a" => "audio/mp4",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "mkv" => "video/x-matroska",
+        "mov" => "video/quicktime",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "exe" => "application/x-msdownload",
+        "wasm" => "application/wasm",
+        _ => "",
     }
 }
