@@ -251,8 +251,21 @@ pub fn decode_text(bytes: &[u8], charset: Option<&str>) -> String {
         None
     };
     let cs = charset.map(|c| c.trim().to_ascii_lowercase()).or(sniffed).unwrap_or_default();
-    let latin = matches!(cs.as_str(), "iso-8859-1" | "latin1" | "windows-1252" | "cp1252" | "us-ascii" | "ascii" | "iso8859-1" | "iso-8859-15");
-    let text = if latin || (cs.is_empty() && std::str::from_utf8(bytes).is_err()) {
+    let text = decode_bytes(bytes, &cs, true);
+    if text.contains('\r') {
+        text.replace("\r\n", "\n").replace('\r', "\n")
+    } else {
+        text
+    }
+}
+
+/// Bytes to text without touching line endings (script-visible bodies must arrive as sent).
+/// `label` is a lower-case charset label; a UTF-8 byte order mark is dropped. With `guess`,
+/// an unlabelled body that is not valid UTF-8 is read as windows-1252.
+pub(crate) fn decode_bytes(bytes: &[u8], label: &str, guess: bool) -> String {
+    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    let latin = matches!(label, "iso-8859-1" | "latin1" | "windows-1252" | "cp1252" | "us-ascii" | "ascii" | "iso8859-1" | "iso-8859-15");
+    if latin || (guess && label.is_empty() && std::str::from_utf8(bytes).is_err()) {
         const C1: [char; 32] = [
             '€', '\u{81}', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\u{8d}', 'Ž', '\u{8f}', '\u{90}', '‘', '’', '“',
             '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '\u{9d}', 'ž', 'Ÿ',
@@ -260,11 +273,6 @@ pub fn decode_text(bytes: &[u8], charset: Option<&str>) -> String {
         bytes.iter().map(|&b| if (0x80..0xA0).contains(&b) { C1[(b - 0x80) as usize] } else { b as char }).collect()
     } else {
         String::from_utf8_lossy(bytes).into_owned()
-    };
-    if text.contains('\r') {
-        text.replace("\r\n", "\n").replace('\r', "\n")
-    } else {
-        text
     }
 }
 

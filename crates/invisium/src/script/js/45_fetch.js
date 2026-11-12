@@ -11,11 +11,12 @@ function startFetch(method, url, headers, body, sameOrigin, credentials, done) {
   pendingFetches[id] = done;
   return id;
 }
-function fetchDone(id, ok, status, url, flat, text) {
+// The body arrives as an ArrayBuffer with the charset label of its Content-Type (or null).
+function fetchDone(id, ok, status, url, flat, buf, charset) {
   var cb = pendingFetches[id];
   if (!cb) return;
   delete pendingFetches[id];
-  try { cb(ok, status, url, flat, text); } catch (e) { reportError(e); }
+  try { cb(ok, status, url, flat, buf, charset); } catch (e) { reportError(e); }
 }
 function cancelFetch(id) {
   if (pendingFetches[id]) { delete pendingFetches[id]; n.abortFetch(id); }
@@ -103,10 +104,95 @@ class FormData {
   [Symbol.iterator]() { return this.entries(); }
 }
 
-// A request body as [text or null, default Content-Type or null].
-function encodeBody(body) {
+// Binary data. A Blob owns one ArrayBuffer that nothing else can reach, so it is immutable.
+function blobPart(p) {
+  if (typeof p === 'string') return new Uint8Array(n.encode(p));
+  if (p instanceof Blob) return new Uint8Array(p._buf);
+  if (p instanceof ArrayBuffer) return new Uint8Array(p);
+  if (ArrayBuffer.isView(p)) return new Uint8Array(p.buffer, p.byteOffset, p.byteLength);
+  return new Uint8Array(n.encode(String(p)));
+}
+class Blob {
+  constructor(parts, opts) {
+    var chunks = [], total = 0, i;
+    if (parts !== undefined && parts !== null) {
+      if (typeof parts !== 'object' || typeof parts[Symbol.iterator] !== 'function') throw new TypeError("Failed to construct 'Blob': the parts are not a sequence");
+      for (var p of parts) { var c = blobPart(p); chunks.push(c); total += c.byteLength; }
+    }
+    var out = new Uint8Array(total), at = 0;
+    for (i = 0; i < chunks.length; i++) { out.set(chunks[i], at); at += chunks[i].byteLength; }
+    hide(this, '_buf', out.buffer);
+    var type = opts && opts.type !== undefined ? String(opts.type) : '';
+    this.type = /[^\x20-\x7e]/.test(type) ? '' : type.toLowerCase();
+  }
+  get size() { return this._buf.byteLength; }
+  slice(start, end, type) {
+    var len = this._buf.byteLength;
+    return new Blob([this._buf.slice(start === undefined ? 0 : start, end === undefined ? len : end)], { type: type });
+  }
+  text() { return Promise.resolve(n.decode(this._buf, 'utf-8')); }
+  arrayBuffer() { return Promise.resolve(this._buf.slice(0)); }
+  bytes() { return Promise.resolve(new Uint8Array(this._buf.slice(0))); }
+}
+class File extends Blob {
+  constructor(parts, name, opts) {
+    super(parts, opts);
+    this.name = String(name);
+    this.lastModified = opts && opts.lastModified !== undefined ? Number(opts.lastModified) : Date.now();
+    this.webkitRelativePath = '';
+  }
+}
+function binaryString(buf) {
+  var u = new Uint8Array(buf), s = '', i;
+  for (i = 0; i < u.length; i += 4096) s += String.fromCharCode.apply(null, u.subarray(i, i + 4096));
+  return s;
+}
+class FileReader extends EventTarget {
+  constructor() {
+    super();
+    this.readyState = 0; this.result = null; this.error = null;
+    this.onloadstart = null; this.onprogress = null; this.onload = null; this.onabort = null; this.onerror = null; this.onloadend = null;
+  }
+  _read(blob, make) {
+    if (!(blob instanceof Blob)) throw new TypeError('FileReader: the argument is not a Blob');
+    if (this.readyState === 1) throw new DOMException('The reader is busy', 'InvalidStateError');
+    var self = this;
+    this.readyState = 1; this.result = null;
+    g.setTimeout(function () {
+      if (self.readyState !== 1) return;
+      self.result = make(blob._buf, blob.type);
+      self.readyState = 2;
+      var done = { lengthComputable: true, loaded: blob.size, total: blob.size };
+      dispatch(self, new ProgressEvent('load', done));
+      dispatch(self, new ProgressEvent('loadend', done));
+    }, 0);
+  }
+  readAsText(blob) { this._read(blob, function (buf) { return n.decode(buf, 'utf-8'); }); }
+  readAsArrayBuffer(blob) { this._read(blob, function (buf) { return buf.slice(0); }); }
+  readAsBinaryString(blob) { this._read(blob, binaryString); }
+  readAsDataURL(blob) {
+    this._read(blob, function (buf, type) { return 'data:' + (type || 'application/octet-stream') + ';base64,' + btoa(binaryString(buf)); });
+  }
+  abort() {
+    if (this.readyState !== 1) return;
+    this.readyState = 2; this.result = null;
+    dispatch(this, new ProgressEvent('abort'));
+    dispatch(this, new ProgressEvent('loadend'));
+  }
+}
+(function () {
+  var states = { EMPTY: 0, LOADING: 1, DONE: 2 };
+  for (var k in states) { FileReader[k] = states[k]; FileReader.prototype[k] = states[k]; }
+})();
+
+// A body as [data, default Content-Type or null]; data is a string, an ArrayBuffer that the
+// caller may keep (always a private copy), or null.
+function toBody(body) {
   if (body === null || body === undefined) return [null, null];
   if (typeof body === 'string') return [body, 'text/plain;charset=UTF-8'];
+  if (body instanceof Blob) return [body._buf.slice(0), body.type || null];
+  if (body instanceof ArrayBuffer) return [body.slice(0), null];
+  if (ArrayBuffer.isView(body)) return [body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength), null];
   if (body instanceof URLSearchParams) return [body.toString(), 'application/x-www-form-urlencoded;charset=UTF-8'];
   if (body instanceof FormData) {
     var boundary = '----invisium', hex = '0123456789abcdef', i, s = '';
@@ -133,21 +219,33 @@ class Response {
     this.redirected = false;
     this.type = 'default';
     this.bodyUsed = false;
-    hide(this, '_text', body === null || body === undefined ? '' : String(body));
+    var enc = toBody(body);
+    hide(this, '_data', enc[0]);   // string, ArrayBuffer or null
+    if (enc[1] && !this.headers.has('content-type')) this.headers.set('content-type', enc[1]);
   }
   get ok() { return this.status >= 200 && this.status < 300; }
   get body() { return null; }
-  text() {
+  _take() {
     if (this.bodyUsed) return Promise.reject(new TypeError('The body has already been read'));
     this.bodyUsed = true;
-    return Promise.resolve(this._text);
+    return Promise.resolve(this._data);
   }
+  // `text()` is always UTF-8, whatever the Content-Type says (the Fetch standard)
+  text() { return this._take().then(function (d) { return d === null ? '' : typeof d === 'string' ? d : n.decode(d, 'utf-8'); }); }
   json() { return this.text().then(function (t) { return JSON.parse(t); }); }
-  arrayBuffer() { return unsupportedBody('Response.arrayBuffer'); }
-  blob() { return unsupportedBody('Response.blob'); }
+  arrayBuffer() {
+    return this._take().then(function (d) { return d === null ? new ArrayBuffer(0) : typeof d === 'string' ? n.encode(d) : d.slice(0); });
+  }
+  bytes() { return this.arrayBuffer().then(function (b) { return new Uint8Array(b); }); }
+  blob() {
+    var type = this.headers.get('content-type') || '';
+    return this.arrayBuffer().then(function (b) { return new Blob([b], { type: type }); });
+  }
   formData() { return unsupportedBody('Response.formData'); }
   clone() {
-    var r = new Response(this._text, { status: this.status, statusText: this.statusText, headers: this.headers });
+    if (this.bodyUsed) throw new TypeError('The body has already been read');
+    var r = new Response(null, { status: this.status, statusText: this.statusText, headers: this.headers });
+    r._data = this._data;   // shared: neither copy ever changes it
     r.url = this.url; r.redirected = this.redirected; r.type = this.type;
     return r;
   }
@@ -181,16 +279,17 @@ class Request {
 function fetch(input, init) {
   return new Promise(function (resolve, reject) {
     var req = new Request(input, init);
-    var enc = encodeBody(req._body);
+    var enc = toBody(req._body);
     if (enc[0] !== null && (req.method === 'GET' || req.method === 'HEAD')) throw new TypeError('A GET or HEAD request cannot have a body');
     var headers = new Headers(req.headers);
     if (enc[1] && !headers.has('content-type')) headers.set('content-type', enc[1]);
     var signal = req.signal;
     if (signal && signal.aborted) { reject(signal.reason); return; }
     var cred = req.credentials === 'include' ? 2 : req.credentials === 'omit' ? 0 : 1;
-    var id = startFetch(req.method, req.url, headers, enc[0], req.mode === 'same-origin', cred, function (ok, status, url, flat, text) {
+    var id = startFetch(req.method, req.url, headers, enc[0], req.mode === 'same-origin', cred, function (ok, status, url, flat, buf) {
       if (!ok) { reject(new TypeError('Failed to fetch')); return; }
-      var r = new Response(text, { status: status, statusText: STATUS_TEXT[status] || '', headers: headersFromFlat(flat) });
+      var r = new Response(null, { status: status, statusText: STATUS_TEXT[status] || '', headers: headersFromFlat(flat) });
+      r._data = buf;
       r.url = url; r.redirected = url !== req.url; r.type = 'basic';
       resolve(r);
     });
@@ -210,6 +309,7 @@ class XMLHttpRequest extends EventTarget {
     this.onabort = null; this.ontimeout = null; this.onprogress = null; this.onloadstart = null;
     hide(this, '_method', 'GET'); hide(this, '_url', ''); hide(this, '_headers', new Headers());
     hide(this, '_resp', null); hide(this, '_id', 0); hide(this, '_sent', false); hide(this, '_timer', 0);
+    hide(this, '_buf', null);
   }
   open(method, url, async) {
     if (async === false) {
@@ -221,7 +321,7 @@ class XMLHttpRequest extends EventTarget {
     this._method = normMethod(method);
     this._url = abs;
     this._headers = new Headers();
-    this._resp = null; this._sent = false; this._id = 0;
+    this._resp = null; this._sent = false; this._id = 0; this._buf = null;
     this.status = 0; this.statusText = ''; this.responseText = ''; this.responseURL = '';
     this._state(1);
   }
@@ -233,11 +333,11 @@ class XMLHttpRequest extends EventTarget {
     if (this.readyState !== 1 || this._sent) throw new DOMException('The request is not open', 'InvalidStateError');
     this._sent = true;
     var m = this._method, self = this;
-    var enc = m === 'GET' || m === 'HEAD' ? [null, null] : encodeBody(body);
+    var enc = m === 'GET' || m === 'HEAD' ? [null, null] : toBody(body);
     if (enc[1] && !this._headers.has('content-type')) this._headers.set('content-type', enc[1]);
     try {
-      this._id = startFetch(m, this._url, this._headers, enc[0], false, this.withCredentials ? 2 : 1, function (ok, status, url, flat, text) {
-        self._done(ok, status, url, flat, text);
+      this._id = startFetch(m, this._url, this._headers, enc[0], false, this.withCredentials ? 2 : 1, function (ok, status, url, flat, buf, charset) {
+        self._done(ok, status, url, flat, buf, charset);
       });
     } catch (e) {
       g.setTimeout(function () { self._fail('error'); }, 0);
@@ -247,14 +347,16 @@ class XMLHttpRequest extends EventTarget {
     if (this.timeout > 0) this._timer = g.setTimeout(function () { cancelFetch(self._id); self._fail('timeout'); }, this.timeout);
   }
   _state(s) { this.readyState = s; dispatch(this, new Event('readystatechange')); }
-  _fire(type) { dispatch(this, new ProgressEvent(type, { loaded: this.responseText.length })); }
-  _done(ok, status, url, flat, text) {
+  _fire(type) { dispatch(this, new ProgressEvent(type, { loaded: this._buf ? this._buf.byteLength : this.responseText.length })); }
+  _done(ok, status, url, flat, buf, charset) {
     if (this._timer) { g.clearTimeout(this._timer); this._timer = 0; }
     if (!ok) { this._fail('error'); return; }
     this.status = status; this.statusText = STATUS_TEXT[status] || ''; this.responseURL = url;
     this._resp = headersFromFlat(flat);
     this._state(2);
-    this.responseText = text;
+    // binary response types keep the bytes; the others keep only the decoded text
+    if (this.responseType === 'arraybuffer' || this.responseType === 'blob') this._buf = buf;
+    else this.responseText = n.decode(buf, charset || 'utf-8');
     this._state(3);
     this._state(4);
     this._fire('load');
@@ -262,7 +364,7 @@ class XMLHttpRequest extends EventTarget {
   }
   _fail(type) {
     if (this._timer) { g.clearTimeout(this._timer); this._timer = 0; }
-    this._id = 0; this.status = 0; this.statusText = ''; this.responseText = ''; this._resp = null;
+    this._id = 0; this.status = 0; this.statusText = ''; this.responseText = ''; this._resp = null; this._buf = null;
     this._state(4);
     this._fire(type);
     this._fire('loadend');
@@ -272,6 +374,11 @@ class XMLHttpRequest extends EventTarget {
     this.readyState = 0;
   }
   get response() {
+    if (this.responseType === 'arraybuffer') return this.readyState === 4 ? this._buf : null;
+    if (this.responseType === 'blob') {
+      if (this.readyState !== 4 || !this._buf) return null;
+      return new Blob([this._buf], { type: (this._resp && this._resp.get('content-type')) || '' });
+    }
     if (this.responseType === 'json') {
       if (this.readyState !== 4) return null;
       try { return JSON.parse(this.responseText); } catch (e) { return null; }

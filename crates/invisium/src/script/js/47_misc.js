@@ -159,3 +159,52 @@ class MediaQueryList extends EventTarget {}
 class CSSRule {}
 class CSSStyleRule extends CSSRule {}
 class StyleSheet {}
+
+// IndexedDB. This browser keeps nothing on disk and has no in-memory database yet, so the
+// interfaces exist (libraries wrap their prototypes when they load) and opening a database
+// fails the way it does in a browser whose storage is unavailable: with an `error` event.
+class IDBRequest extends EventTarget {
+  constructor() {
+    super();
+    this.result = undefined; this.error = null; this.source = null; this.transaction = null;
+    this.readyState = 'pending'; this.onsuccess = null; this.onerror = null;
+  }
+}
+class IDBOpenDBRequest extends IDBRequest {
+  constructor() { super(); this.onblocked = null; this.onupgradeneeded = null; }
+}
+class IDBDatabase extends EventTarget {}
+class IDBObjectStore {}
+class IDBIndex {}
+class IDBCursor {}
+class IDBCursorWithValue extends IDBCursor {}
+class IDBTransaction extends EventTarget {}
+class IDBVersionChangeEvent extends Event {}
+class IDBKeyRange {
+  constructor(lower, upper, lowerOpen, upperOpen) {
+    this.lower = lower; this.upper = upper; this.lowerOpen = !!lowerOpen; this.upperOpen = !!upperOpen;
+  }
+  includes(key) {
+    if (this.lower !== undefined && (key < this.lower || (this.lowerOpen && key === this.lower))) return false;
+    if (this.upper !== undefined && (key > this.upper || (this.upperOpen && key === this.upper))) return false;
+    return true;
+  }
+  static only(v) { return new IDBKeyRange(v, v, false, false); }
+  static lowerBound(v, open) { return new IDBKeyRange(v, undefined, open, true); }
+  static upperBound(v, open) { return new IDBKeyRange(undefined, v, true, open); }
+  static bound(a, b, aOpen, bOpen) { return new IDBKeyRange(a, b, aOpen, bOpen); }
+}
+class IDBFactory {
+  open() { return idbUnavailable(new IDBOpenDBRequest()); }
+  deleteDatabase() { return idbUnavailable(new IDBOpenDBRequest()); }
+  databases() { return Promise.resolve([]); }
+  cmp(a, b) { return a < b ? -1 : a > b ? 1 : 0; }
+}
+function idbUnavailable(req) {
+  g.setTimeout(function () {
+    req.readyState = 'done';
+    req.error = new DOMException('IndexedDB is not available in this browser', 'InvalidStateError');
+    dispatch(req, new Event('error', { bubbles: true, cancelable: true }));
+  }, 0);
+  return req;
+}

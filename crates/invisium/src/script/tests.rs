@@ -438,6 +438,114 @@ fn the_global_object_is_a_window() {
 }
 
 #[test]
+fn binary_bodies_travel_both_ways() {
+    use crate::page::FetchResult;
+    let mut t = T::new(
+        "<body><script>
+        var hex = function (b) { return Array.prototype.map.call(new Uint8Array(b), function (x) { return (x < 16 ? '0' : '') + x.toString(16); }).join(''); };
+        // request bodies: a typed-array window, a Blob with a type, text
+        fetch('/a', { method: 'POST', body: new Uint8Array([9, 0, 255, 128, 7]).subarray(1, 4) })
+            .then(function (r) { return r.arrayBuffer(); })
+            .then(function (b) { console.log('a', b instanceof ArrayBuffer, hex(b)); });
+        fetch('/b', { method: 'POST', body: new Blob(['h\\u00e9', new Uint8Array([0, 1])], { type: 'Application/X-Thing' }) })
+            .then(function (r) { var c = r.clone(); return Promise.all([r.blob(), c.text()]); })
+            .then(function (v) { console.log('b', v[0].size, v[0].type, JSON.stringify(v[1])); return v[0].slice(1, 3).arrayBuffer(); })
+            .then(function (b) { console.log('slice', hex(b)); });
+        var x = new XMLHttpRequest();
+        x.open('POST', '/c'); x.responseType = 'arraybuffer';
+        x.onload = function () { console.log('c', x.response instanceof ArrayBuffer, hex(x.response), x.responseText === ''); };
+        x.send('caf\\u00e9');
+        var y = new XMLHttpRequest();
+        y.open('GET', '/d');
+        y.onload = function () { console.log('d', JSON.stringify(y.responseText)); };
+        y.send();
+        // Blob, File and FileReader on their own
+        var f = new File(['ab', new Blob(['cd'])], 'n.txt', { type: 'text/plain', lastModified: 5 });
+        console.log('file', f.size, f.name, f.type, f.lastModified, f instanceof Blob, Object.prototype.toString.call(f));
+        var fr = new FileReader();
+        fr.onload = function () { console.log('reader', fr.result, fr.readyState); };
+        fr.readAsDataURL(f);
+        new Response('x\\r\\ny').text().then(function (s) { console.log('resp', JSON.stringify(s)); });
+        </script>",
+    );
+    assert_eq!(t.errors(), Vec::<&String>::new(), "console: {:?}", t.log);
+    let reqs = t.p.take_fetches();
+    assert_eq!(reqs.len(), 4, "requests: {reqs:?}");
+    assert_eq!(reqs[0].body.as_deref(), Some(&[0u8, 255, 128][..]));
+    assert!(!reqs[0].headers.iter().any(|(k, _)| k == "content-type"), "{:?}", reqs[0].headers);
+    assert_eq!(reqs[1].body.as_deref(), Some(&[b'h', 0xC3, 0xA9, 0, 1][..]));
+    assert!(reqs[1].headers.contains(&("content-type".to_string(), "application/x-thing".to_string())), "{:?}", reqs[1].headers);
+    assert_eq!(reqs[2].body.as_deref(), Some("café".as_bytes()));
+    let reply = |i: usize, ct: &str, body: &[u8]| FetchResult {
+        status: 200,
+        url: reqs[i].url.clone(),
+        headers: vec![("Content-Type".into(), ct.into())],
+        body: body.to_vec(),
+    };
+    t.p.fetch_done(reqs[0].id, Some(reply(0, "application/octet-stream", &[0, 200, 13, 10, 255])));
+    t.p.fetch_done(reqs[1].id, Some(reply(1, "image/png", &[b'o', b'k', 13, 10])));
+    t.p.fetch_done(reqs[2].id, Some(reply(2, "application/octet-stream", &[1, 2, 250])));
+    // a Latin-1 label is honoured by XMLHttpRequest, and line endings arrive as sent
+    t.p.fetch_done(reqs[3].id, Some(reply(3, "text/plain; charset=ISO-8859-1", &[b'a', 0xE9, 13, 10, b'b'])));
+    t.step(1.0);
+    t.step(10.0);
+    assert_eq!(t.errors(), Vec::<&String>::new(), "console: {:?}", t.log);
+    let mut logs: Vec<String> = t.logs().iter().map(|s| s.to_string()).collect();
+    logs.sort();
+    assert_eq!(
+        logs,
+        vec![
+            "a true 00c80d0aff",
+            "b 4 image/png \"ok\\r\\n\"",
+            "c true 0102fa true",
+            "d \"a\u{e9}\\r\\nb\"",
+            "file 4 n.txt text/plain 5 true [object File]",
+            "reader data:text/plain;base64,YWJjZA== 2",
+            "resp \"x\\r\\ny\"",
+            "slice 6b0d",
+        ]
+    );
+}
+
+#[test]
+fn dom_objects_name_their_interface_and_storage_fails_politely() {
+    let mut t = T::new(
+        "<body><div id=d>x</div><script>
+        var str = function (x) { return Object.prototype.toString.call(x); };
+        var d = document.getElementById('d');
+        console.log(str(d), str(document.createTextNode('t')), str(window), str(new Event('x')), str({}), str([]));
+        // what a reactive library does: only plain objects get wrapped
+        console.log(str(d) === '[object Object]', str(document.body), str(document.createElement('section')));
+        // observers refuse things that are not elements at the call, not later in a timer
+        var threw = [];
+        try { new ResizeObserver(function () {}).observe(new Proxy({}, {})); } catch (e) { threw.push(e instanceof TypeError); }
+        try { new IntersectionObserver(function () {}).observe(document.createTextNode('t')); } catch (e) { threw.push(e instanceof TypeError); }
+        console.log(threw.join(','));
+        new ResizeObserver(function (entries) { console.log('resize', entries[0].target === d, entries[0].contentRect.width > 0); }).observe(d);
+        // IndexedDB: the interfaces exist, opening reports an error instead of throwing
+        console.log(typeof IDBIndex, typeof IDBKeyRange.bound, indexedDB instanceof IDBFactory, IDBKeyRange.bound(1, 5).includes(3));
+        var req = indexedDB.open('db', 1);
+        req.onsuccess = function () { console.log('opened'); };
+        req.onerror = function (e) { console.log('idb', e.target === req, req.error.name, req.readyState); };
+        </script>",
+    );
+    t.step(1.0);
+    t.step(10.0);
+    assert_eq!(t.errors(), Vec::<&String>::new(), "console: {:?}", t.log);
+    assert_eq!(
+        t.logs(),
+        vec![
+            "[object HTMLDivElement] [object Text] [object Window] [object Event] [object Object] [object Array]",
+            "false [object HTMLBodyElement] [object HTMLElement]",
+            "true,true",
+            "function function true true",
+            "resize true true",
+            "idb true InvalidStateError done",
+        ]
+    );
+}
+
+#[test]
 fn custom_elements_upgrade_and_get_their_callbacks() {
     let mut t = T::new(
         "<style>body{margin:0} x-box{display:block}</style><body><x-box id=parsed size=3></x-box><script>

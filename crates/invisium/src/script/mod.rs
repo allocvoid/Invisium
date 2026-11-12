@@ -345,10 +345,18 @@ impl ScriptEngine {
                     let low = v.to_ascii_lowercase();
                     low.find("charset=").map(|p| low[p + 8..].trim_matches(|c: char| c == '"' || c == '\'' || c == ' ').split(';').next().unwrap_or("").to_string())
                 });
-                let text = crate::page::decode_text(&r.body, charset.as_deref());
-                let body = self.rt.string(&text);
+                // the bytes go to script as they are; text is decoded there only if it is asked for
+                let body = self.rt.array_buffer(&r.body);
                 self.keep(body);
-                self.call_export(ex.fetched, &[idv, Value::Bool(true), Value::Number(r.status as f64), url, headers, body], "request callback");
+                let charset = match charset {
+                    Some(c) => {
+                        let v = self.rt.string(&c);
+                        self.keep(v)
+                    }
+                    None => Value::Null,
+                };
+                let args = [idv, Value::Bool(true), Value::Number(r.status as f64), url, headers, body, charset];
+                self.call_export(ex.fetched, &args, "request callback");
             }
             None => {
                 self.call_export(ex.fetched, &[idv, Value::Bool(false)], "request callback");

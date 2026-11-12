@@ -121,9 +121,10 @@ class IntersectionObserver {
   constructor(cb, opts) { hide(this, '_cb', cb); this.root = (opts && opts.root) || null; this.rootMargin = '0px'; this.thresholds = [0]; }
   observe(target) {
     var self = this;
+    if (!(target instanceof Element)) throw new TypeError('IntersectionObserver.observe: the target is not an Element');
     g.setTimeout(function () {
-      var r = target.getBoundingClientRect();
       try {
+        var r = target.getBoundingClientRect();
         self._cb([{ target: target, isIntersecting: true, intersectionRatio: 1, boundingClientRect: r, intersectionRect: r, rootBounds: null, time: n.now() }], self);
       } catch (e) { reportError(e); }
     }, 0);
@@ -136,10 +137,13 @@ class ResizeObserver {
   constructor(cb) { hide(this, '_cb', cb); }
   observe(target) {
     var self = this;
+    if (!(target instanceof Element)) throw new TypeError('ResizeObserver.observe: the target is not an Element');
     g.setTimeout(function () {
-      var r = target.getBoundingClientRect();
-      var size = [{ inlineSize: r.width, blockSize: r.height }];
-      try { self._cb([{ target: target, contentRect: r, borderBoxSize: size, contentBoxSize: size }], self); } catch (e) { reportError(e); }
+      try {
+        var r = target.getBoundingClientRect();
+        var size = [{ inlineSize: r.width, blockSize: r.height }];
+        self._cb([{ target: target, contentRect: r, borderBoxSize: size, contentBoxSize: size }], self);
+      } catch (e) { reportError(e); }
     }, 0);
   }
   unobserve() {}
@@ -327,10 +331,23 @@ function atob(s) {
     Attr: Attr, NamedNodeMap: NamedNodeMap, Navigator: Navigator, Location: Location, History: History,
     Screen: Screen, DOMImplementation: DOMImplementation, Selection: Selection, MediaQueryList: MediaQueryList,
     CSSRule: CSSRule, CSSStyleRule: CSSStyleRule, StyleSheet: StyleSheet, HTMLSlotElement: HTML_CLASSES.HTMLSlotElement,
-    CustomElementRegistry: CustomElementRegistry
+    CustomElementRegistry: CustomElementRegistry, Blob: Blob, File: File, FileReader: FileReader,
+    IDBFactory: IDBFactory, IDBRequest: IDBRequest, IDBOpenDBRequest: IDBOpenDBRequest, IDBDatabase: IDBDatabase,
+    IDBObjectStore: IDBObjectStore, IDBIndex: IDBIndex, IDBCursor: IDBCursor, IDBCursorWithValue: IDBCursorWithValue,
+    IDBTransaction: IDBTransaction, IDBKeyRange: IDBKeyRange, IDBVersionChangeEvent: IDBVersionChangeEvent
   };
   if (HAS_BYTES) { classes.TextEncoder = TextEncoder; classes.TextDecoder = TextDecoder; }
+  globals.indexedDB = new IDBFactory();
+  // `Object.prototype.toString.call(x)` has to name the interface: libraries tell DOM objects from
+  // plain ones this way (Vue wraps whatever answers "[object Object]" in a Proxy, and a Proxy is
+  // not a node any more when it reaches a native method).
+  var tag = function (name, C) {
+    if (typeof C !== 'function' || !C.prototype || Object.prototype.hasOwnProperty.call(C.prototype, Symbol.toStringTag)) return;
+    Object.defineProperty(C.prototype, Symbol.toStringTag, { value: name, configurable: true });
+  };
   var k;
+  for (k in classes) tag(k, classes[k]);
+  for (k in HTML_CLASSES) tag(k, HTML_CLASSES[k]);
   for (k in globals) hide(g, k, globals[k]);
   for (k in classes) hide(g, k, classes[k]);
   for (k in HTML_CLASSES) hide(g, k, HTML_CLASSES[k]);

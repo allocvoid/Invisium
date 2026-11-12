@@ -490,9 +490,13 @@ fn n_fetch(rt: &mut Runtime, cx: &Cx, args: &[Value]) -> NRes {
         headers.push((k, v));
         i += 2;
     }
+    // a string goes out as UTF-8, an ArrayBuffer as it is
     let body = match arg(args, 3) {
         Value::Null | Value::Undefined => None,
-        v => Some(rt.to_string_lossy(v).into_bytes()),
+        v => Some(match rt.buffer_bytes(v) {
+            Some(bytes) => bytes,
+            None => rt.to_string_lossy(v).into_bytes(),
+        }),
     };
     let same_origin = rt.to_boolean(arg(args, 4));
     let credentials = (rt.to_number(arg(args, 5)) as i32).clamp(0, 2) as u8;
@@ -545,6 +549,26 @@ fn n_random(rt: &mut Runtime, _cx: &Cx, args: &[Value]) -> NRes {
     Ok(rt.array_buffer(&os_random(len)))
 }
 
+/// encode(text): the UTF-8 bytes of a string, as a new ArrayBuffer.
+fn n_encode(rt: &mut Runtime, _cx: &Cx, args: &[Value]) -> NRes {
+    let text = rt.to_string_lossy(arg(args, 0));
+    Ok(rt.array_buffer(text.as_bytes()))
+}
+
+/// decode(buffer, charset): the text of an ArrayBuffer (or of the window a view covers). UTF-8
+/// unless the label names a Latin-1 family encoding; line endings are left alone.
+fn n_decode(rt: &mut Runtime, _cx: &Cx, args: &[Value]) -> NRes {
+    let Some(bytes) = rt.buffer_bytes(arg(args, 0)) else {
+        return Err(rt.throw_error("TypeError", "argument is not a buffer"));
+    };
+    let label = match arg(args, 1) {
+        Value::Null | Value::Undefined => String::new(),
+        v => rt.to_string_lossy(v).trim().to_ascii_lowercase(),
+    };
+    let text = crate::page::decode_bytes(&bytes, &label, false);
+    Ok(rt.string(&text))
+}
+
 fn n_abort_fetch(rt: &mut Runtime, cx: &Cx, args: &[Value]) -> NRes {
     let id = rt.to_number(arg(args, 0)) as u32;
     cx.st.borrow_mut().fx.fetch_aborts.push(id);
@@ -564,6 +588,8 @@ pub(crate) fn install(rt: &mut Runtime, n: Value, cx: &Rc<Cx>) {
         ("submit", 2, n_submit),
         ("fetch", 6, n_fetch),
         ("abortFetch", 1, n_abort_fetch),
+        ("encode", 1, n_encode),
+        ("decode", 2, n_decode),
         ("random", 1, n_random),
         ("rect", 1, n_rect),
         ("offsetParent", 1, n_offset_parent),
