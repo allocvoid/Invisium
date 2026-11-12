@@ -46,17 +46,6 @@ fn hex_digit(c: u8) -> Option<u8> {
     (c as char).to_digit(16).map(|d| d as u8)
 }
 
-fn channel(s: &str, scale: f32) -> Option<u8> {
-    let s = s.trim();
-    let v = if let Some(p) = s.strip_suffix('%') {
-        p.trim().parse::<f32>().ok()? / 100.0 * scale
-    } else {
-        s.parse::<f32>().ok()?
-    };
-    v.is_finite().then(|| v.clamp(0.0, scale))
-        .map(|v| (v / scale * 255.0).round() as u8)
-}
-
 /// Parse a CSS colour. Returns `None` for anything unrecognised.
 pub fn parse(s: &str) -> Option<Rgba> {
     let s = s.trim();
@@ -77,20 +66,152 @@ pub fn parse(s: &str) -> Option<Rgba> {
         };
     }
     let lower = s.to_ascii_lowercase();
-    if let Some(args) = lower.strip_prefix("rgba(").or_else(|| lower.strip_prefix("rgb(")) {
-        let args = args.strip_suffix(')')?;
-        let parts: Vec<&str> = args.split(|c: char| c == ',' || c == '/' || c.is_whitespace()).filter(|p| !p.is_empty()).collect();
-        if parts.len() < 3 || parts.len() > 4 {
-            return None;
-        }
-        let a = match parts.get(3) {
-            Some(p) => channel(p, if p.ends_with('%') { 255.0 } else { 1.0 })?,
-            None => 255,
-        };
-        return Some(Rgba::new(channel(parts[0], 255.0)?, channel(parts[1], 255.0)?, channel(parts[2], 255.0)?, a));
+    if lower.contains('(') {
+        return functional(&lower);
     }
     if lower == "transparent" {
         return Some(Rgba::TRANSPARENT);
     }
     named(&lower)
+}
+
+/// One component of a colour function.
+#[derive(Clone, Copy)]
+enum Comp {
+    Num(f32),
+    /// Fraction (50 % = 0.5).
+    Pct(f32),
+    /// An angle with a unit, in degrees.
+    Deg(f32),
+}
+
+fn comp(t: &str) -> Option<Comp> {
+    let num = |s: &str| s.trim().parse::<f32>().ok().filter(|v| v.is_finite());
+    if t == "none" {
+        return Some(Comp::Num(0.0));
+    }
+    if let Some(p) = t.strip_suffix('%') {
+        return num(p).map(|v| Comp::Pct(v / 100.0));
+    }
+    for (unit, k) in [("deg", 1.0), ("grad", 0.9), ("rad", 180.0 / std::f32::consts::PI), ("turn", 360.0)] {
+        if let Some(p) = t.strip_suffix(unit) {
+            return num(p).map(|v| Comp::Deg(v * k));
+        }
+    }
+    num(t).map(Comp::Num)
+}
+
+/// A number, or a percentage of `full`.
+fn val(c: Comp, full: f32) -> Option<f32> {
+    match c {
+        Comp::Num(v) => Some(v),
+        Comp::Pct(p) => Some(p * full),
+        Comp::Deg(_) => None,
+    }
+}
+
+fn hue(c: Comp) -> Option<f32> {
+    match c {
+        Comp::Num(v) | Comp::Deg(v) => Some(v),
+        Comp::Pct(_) => None,
+    }
+}
+
+fn hsl(h: f32, s: f32, l: f32) -> [f32; 3] {
+    let (h, s, l) = (h.rem_euclid(360.0), s.clamp(0.0, 1.0), l.clamp(0.0, 1.0));
+    let f = |n: f32| {
+        let k = (n + h / 30.0) % 12.0;
+        let a = s * l.min(1.0 - l);
+        l - a * (k - 3.0).min(9.0 - k).clamp(-1.0, 1.0)
+    };
+    [f(0.0), f(8.0), f(4.0)]
+}
+
+fn mat(m: &[[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
+    [0, 1, 2].map(|r| m[r][0] * v[0] + m[r][1] * v[1] + m[r][2] * v[2])
+}
+
+/// Linear-light sRGB to gamma-encoded sRGB.
+fn encode(v: [f32; 3]) -> [f32; 3] {
+    v.map(|c| {
+        let a = c.abs();
+        let e = if a <= 0.003_130_8 { 12.92 * a } else { 1.055 * a.powf(1.0 / 2.4) - 0.055 };
+        e.copysign(c)
+    })
+}
+
+fn oklab(l: f32, a: f32, b: f32) -> [f32; 3] {
+    let lms = mat(&[[1.0, 0.396_337_78, 0.215_803_76], [1.0, -0.105_561_35, -0.063_854_17], [1.0, -0.089_484_18, -1.291_485_5]], [l, a, b]);
+    let lms = lms.map(|v| v * v * v);
+    encode(mat(
+        &[[4.076_741_7, -3.307_711_6, 0.230_969_94], [-1.268_438, 2.609_757_4, -0.341_319_4], [-0.004_196_086, -0.703_418_6, 1.707_614_7]],
+        lms,
+    ))
+}
+
+/// CIE Lab (D50) to sRGB.
+fn lab(l: f32, a: f32, b: f32) -> [f32; 3] {
+    const K: f32 = 24389.0 / 27.0;
+    const E: f32 = 216.0 / 24389.0;
+    let fy = (l + 16.0) / 116.0;
+    let (fx, fz) = (fy + a / 500.0, fy - b / 200.0);
+    let inv = |f: f32| if f * f * f > E { f * f * f } else { (116.0 * f - 16.0) / K };
+    let y = if l > K * E { fy * fy * fy } else { l / K };
+    let xyz50 = [inv(fx) * 0.964_22, y, inv(fz) * 0.825_21];
+    let xyz65 = mat(&[[0.955_473_4, -0.023_098_46, 0.063_259_24], [-0.028_369_71, 1.009_995_4, 0.021_041_44], [0.012_314_01, -0.020_507_65, 1.330_365_9]], xyz50);
+    encode(mat(&[[3.240_97, -1.537_383_2, -0.498_610_76], [-0.969_243_6, 1.875_967_5, 0.041_555_06], [0.055_630_08, -0.203_976_96, 1.056_971_5]], xyz65))
+}
+
+/// `rgb()`, `hsl()`, `hwb()`, `lab()`, `lch()`, `oklab()`, `oklch()`, comma or space syntax.
+fn functional(s: &str) -> Option<Rgba> {
+    let open = s.find('(')?;
+    let name = s[..open].trim();
+    let inner = s[open + 1..].trim_end().strip_suffix(')')?;
+    let (main, slash) = match inner.split_once('/') {
+        Some((m, a)) => (m, Some(a)),
+        None => (inner, None),
+    };
+    let comps: Vec<Comp> = main.split(|c: char| c == ',' || c.is_whitespace()).filter(|t| !t.is_empty()).map(comp).collect::<Option<_>>()?;
+    let alpha = match (comps.len(), slash) {
+        (3, None) => Comp::Num(1.0),
+        (4, None) => comps[3],
+        (3, Some(a)) => comp(a.trim())?,
+        _ => return None,
+    };
+    let alpha = val(alpha, 1.0)?;
+    let [c0, c1, c2] = [comps[0], comps[1], comps[2]];
+    let polar = |c: f32, h: f32| {
+        let (sn, cs) = h.to_radians().sin_cos();
+        (c.max(0.0) * cs, c.max(0.0) * sn)
+    };
+    let rgb = match name {
+        "rgb" | "rgba" => [c0, c1, c2].map(|c| val(c, 255.0).map(|v| v / 255.0)),
+        "hsl" | "hsla" => {
+            let frac = |c: Comp| val(c, 100.0).map(|v| v / 100.0);
+            hsl(hue(c0)?, frac(c1)?, frac(c2)?).map(Some)
+        }
+        "hwb" => {
+            let frac = |c: Comp| val(c, 100.0).map(|v| (v / 100.0).clamp(0.0, 1.0));
+            let (h, w, b) = (hue(c0)?, frac(c1)?, frac(c2)?);
+            if w + b >= 1.0 {
+                [w / (w + b); 3].map(Some)
+            } else {
+                hsl(h, 1.0, 0.5).map(|v| Some(v * (1.0 - w - b) + w))
+            }
+        }
+        "lab" => lab(val(c0, 100.0)?, val(c1, 125.0)?, val(c2, 125.0)?).map(Some),
+        "lch" => {
+            let (a, b) = polar(val(c1, 150.0)?, hue(c2)?);
+            lab(val(c0, 100.0)?, a, b).map(Some)
+        }
+        "oklab" => oklab(val(c0, 1.0)?, val(c1, 0.4)?, val(c2, 0.4)?).map(Some),
+        "oklch" => {
+            let (a, b) = polar(val(c1, 0.4)?, hue(c2)?);
+            oklab(val(c0, 1.0)?, a, b).map(Some)
+        }
+        _ => return None,
+    };
+    let [r, g, b] = rgb;
+    let to8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    Some(Rgba::new(to8(r?), to8(g?), to8(b?), to8(alpha)))
 }

@@ -2,8 +2,11 @@
 //! Element and attribute names are matched ASCII-case-insensitively.
 
 mod color;
+mod dash;
+mod paint;
 mod path;
 mod raster;
+mod tree;
 mod xml;
 
 use crate::draw::Rgba;
@@ -98,22 +101,36 @@ enum Paint {
     None,
     Color(Rgba),
     Current,
+    /// A gradient element (node index in the document tree).
+    Server(u32),
 }
 
-fn parse_paint(v: &str) -> Option<Paint> {
+/// Looks up a gradient element by id.
+type Ids<'a> = dyn Fn(&str) -> Option<u32> + 'a;
+
+fn simple_paint(v: &str) -> Option<Paint> {
     let v = v.trim();
     if v.eq_ignore_ascii_case("none") {
-        return Some(Paint::None);
+        Some(Paint::None)
+    } else if v.eq_ignore_ascii_case("currentcolor") {
+        Some(Paint::Current)
+    } else {
+        color::parse(v).map(Paint::Color)
     }
-    if v.eq_ignore_ascii_case("currentcolor") {
-        return Some(Paint::Current);
+}
+
+fn parse_paint(v: &str, ids: &Ids) -> Option<Paint> {
+    let v = v.trim();
+    if !v.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("url(")) {
+        return simple_paint(v);
     }
-    if v.len() >= 4 && v[..4].eq_ignore_ascii_case("url(") {
-        // Paint servers are out of scope: use the fallback colour if one is given.
-        let fallback = v.find(')').map(|i| v[i + 1..].trim()).unwrap_or("");
-        return Some(if fallback.is_empty() { Paint::None } else { parse_paint(fallback)? });
+    let Some(close) = v.find(')') else { return Some(Paint::None) };
+    let id = v[4..close].trim().trim_matches(|c| c == '"' || c == '\'').trim();
+    if let Some(i) = id.strip_prefix('#').and_then(ids) {
+        return Some(Paint::Server(i));
     }
-    color::parse(v).map(Paint::Color)
+    let fallback = v[close + 1..].trim();
+    Some(if fallback.is_empty() { Paint::None } else { simple_paint(fallback)? })
 }
 
 #[derive(Clone, Copy)]
@@ -124,6 +141,9 @@ struct Style {
     cap: Cap,
     join: Join,
     miter_limit: f32,
+    dash: dash::Dash,
+    /// `stroke-dashoffset`: value, and whether it is a percentage.
+    dash_offset: (f32, bool),
     even_odd: bool,
     fill_opacity: f32,
     stroke_opacity: f32,
@@ -151,6 +171,8 @@ impl Style {
             cap: Cap::Butt,
             join: Join::Miter,
             miter_limit: 4.0,
+            dash: dash::Dash::SOLID,
+            dash_offset: (0.0, false),
             even_odd: false,
             fill_opacity: 1.0,
             stroke_opacity: 1.0,
@@ -161,14 +183,14 @@ impl Style {
         }
     }
 
-    fn set(&mut self, name: &str, value: &str) {
+    fn set(&mut self, name: &str, value: &str, ids: &Ids) {
         let v = value.trim().trim_end_matches("!important").trim();
         if v.eq_ignore_ascii_case("inherit") {
             return;
         }
         match name.trim().to_ascii_lowercase().as_str() {
-            "fill" => self.fill = parse_paint(v).unwrap_or(self.fill),
-            "stroke" => self.stroke = parse_paint(v).unwrap_or(self.stroke),
+            "fill" => self.fill = parse_paint(v, ids).unwrap_or(self.fill),
+            "stroke" => self.stroke = parse_paint(v, ids).unwrap_or(self.stroke),
             "color" => self.color = color::parse(v).unwrap_or(self.color),
             "stroke-width" => {
                 if let Some(w) = length(v).filter(|w| *w >= 0.0) {
@@ -192,6 +214,8 @@ impl Style {
                     self.miter_limit = m;
                 }
             }
+            "stroke-dasharray" => self.dash = dash::parse_array(v).unwrap_or(self.dash),
+            "stroke-dashoffset" => self.dash_offset = dash::length_or_pct(v).unwrap_or(self.dash_offset),
             "fill-rule" => match v.to_ascii_lowercase().as_str() {
                 "evenodd" => self.even_odd = true,
                 "nonzero" => self.even_odd = false,
@@ -208,17 +232,17 @@ impl Style {
 
     /// Inherit from `self` and apply an element's presentation attributes, `style` and
     /// `transform`.
-    fn child(&self, attrs: &Attrs) -> Style {
+    fn child(&self, attrs: &Attrs, ids: &Ids) -> Style {
         let mut s = *self;
         for (n, v) in attrs {
             if !n.eq_ignore_ascii_case("style") && !n.eq_ignore_ascii_case("transform") {
-                s.set(n, v);
+                s.set(n, v, ids);
             }
         }
         if let Some(css) = attr(attrs, "style") {
             for decl in css.split(';') {
                 if let Some((n, v)) = decl.split_once(':') {
-                    s.set(n, v);
+                    s.set(n, v, ids);
                 }
             }
         }
@@ -230,7 +254,7 @@ impl Style {
 
     fn resolve(&self, p: Paint, alpha: f32) -> Option<[f32; 4]> {
         let c = match p {
-            Paint::None => return None,
+            Paint::None | Paint::Server(_) => return None,
             Paint::Color(c) => c,
             Paint::Current => self.color,
         };

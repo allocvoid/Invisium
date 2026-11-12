@@ -7,6 +7,18 @@ const SUB: usize = 16;
 /// Upper bound on edges in one fill (keeps memory bounded on hostile input).
 pub const MAX_EDGES: usize = 400_000;
 
+/// A paint: premultiplied colour (0..1) at the centre of pixel (`x`, `y`).
+pub trait Shade {
+    fn at(&self, x: usize, y: usize) -> [f32; 4];
+}
+
+impl Shade for [f32; 4] {
+    #[inline]
+    fn at(&self, _: usize, _: usize) -> [f32; 4] {
+        *self
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Edge {
     x0: f32,
@@ -71,9 +83,9 @@ impl Rasterizer {
         }
     }
 
-    /// Scan-convert the collected edges and composite `color` (premultiplied, 0..1) onto the
-    /// premultiplied RGBA8 `canvas`.
-    pub fn fill(&mut self, canvas: &mut [u8], w: usize, h: usize, even_odd: bool, color: [f32; 4]) {
+    /// Scan-convert the collected edges and composite the paint `shade` (premultiplied, 0..1)
+    /// onto the premultiplied RGBA8 `canvas`.
+    pub fn fill<S: Shade>(&mut self, canvas: &mut [u8], w: usize, h: usize, even_odd: bool, shade: &S) {
         if self.edges.is_empty() || w == 0 || h == 0 {
             return;
         }
@@ -145,6 +157,7 @@ impl Rasterizer {
                     continue;
                 }
                 let px = &mut line[x * 4..x * 4 + 4];
+                let color = shade.at(x, row);
                 let sa = color[3] * cov;
                 for c in 0..4 {
                     let src = color[c] * cov;

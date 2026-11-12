@@ -9,6 +9,7 @@ pub use wgpu;
 
 pub mod images;
 pub mod svg;
+mod xform;
 
 use draw::{GlyphSource, ImageId, Item, Layer, Rect, Rgba};
 use std::collections::HashMap;
@@ -31,6 +32,10 @@ const KIND_IMAGE: u32 = 7;
 
 const FLAG_REPEAT: u32 = 1;
 const FLAG_ROUNDED_CLIP: u32 = 2;
+/// The item is evaluated in its own (transformed) space: `xf`/`xt.xy` map physical → local.
+const FLAG_XF: u32 = 4;
+/// The exact clip lives in a transformed space: `cxf`/`xt.zw` map physical → clip space.
+const FLAG_CLIP_XF: u32 = 8;
 
 #[derive(Clone, Debug)]
 pub struct GpuOptions {
@@ -70,6 +75,12 @@ struct Instance {
     p1: [f32; 4],
     /// kind, kind-specific (stop start / sigma bits), stop count, flags
     info: [u32; 4],
+    /// Linear part (a, b, c, d) of the physical → item-space map (`FLAG_XF`).
+    xf: [f32; 4],
+    /// Linear part of the physical → clip-space map (`FLAG_CLIP_XF`).
+    cxf: [f32; 4],
+    /// Translations: item map (e, f), clip map (e, f).
+    xt: [f32; 4],
 }
 
 const INSTANCE_SIZE: usize = std::mem::size_of::<Instance>();
@@ -152,8 +163,11 @@ struct Segment {
 
 #[derive(Clone, Copy)]
 struct Clip {
+    /// Physical bounds of the clip region (exact for axis-aligned clips).
     rect: Rect,
-    rounded: Option<(Rect, [f32; 4])>,
+    /// The innermost clip that a rectangle cannot express (rounded, or rotated/skewed): its
+    /// box and radii in its own space, plus the physical → that-space map if transformed.
+    rounded: Option<(Rect, [f32; 4], Option<draw::Affine>)>,
 }
 
 #[derive(Clone, Copy)]
@@ -218,6 +232,9 @@ pub struct Renderer {
     stops: Vec<[u32; 2]>,
     clip_stack: Vec<Clip>,
     fixed_stack: Vec<usize>,
+    xstack: xform::XStack,
+    /// Local → physical map of the item being built (`None`: no rotation/scale active).
+    cur_map: Option<xform::Map>,
     instance_buf: Option<wgpu::Buffer>,
     instance_cap: usize,
     stop_buf: wgpu::Buffer,
@@ -419,7 +436,8 @@ impl Renderer {
         });
         let attrs = wgpu::vertex_attr_array![
             0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4,
-            5 => Uint32x4, 6 => Float32x4, 7 => Float32x4, 8 => Uint32x4
+            5 => Uint32x4, 6 => Float32x4, 7 => Float32x4, 8 => Uint32x4,
+            9 => Float32x4, 10 => Float32x4, 11 => Float32x4
         ];
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("invisium-gfx pipeline"),
@@ -518,6 +536,8 @@ impl Renderer {
             stops: Vec::new(),
             clip_stack: Vec::new(),
             fixed_stack: Vec::new(),
+            xstack: xform::XStack::default(),
+            cur_map: None,
             instance_buf: None,
             instance_cap: 0,
             stop_buf,
@@ -711,23 +731,57 @@ impl Renderer {
         fixed.clear();
         clips.push(base);
 
+        let mut xs = std::mem::take(&mut self.xstack);
+        xs.clear();
         for item in &list.items {
             let is_fixed = !fixed.is_empty();
-            let xf = Xf {
-                ox: layer.viewport.x,
-                oy: layer.viewport.y,
-                sx: if is_fixed { 0.0 } else { scroll_x },
-                sy: if is_fixed { 0.0 } else { scroll_y },
-                s,
-            };
+            let (sx, sy) = if is_fixed { (0.0, 0.0) } else { (scroll_x, scroll_y) };
+            let mut xf = Xf { ox: layer.viewport.x, oy: layer.viewport.y, sx, sy, s };
+            // The accumulated transform: a translation folds into the origin, anything else
+            // becomes a per-instance map; under a singular one nothing is drawn.
+            let mut singular = false;
+            self.cur_map = None;
+            if !xs.is_empty() {
+                match xs.current() {
+                    None => singular = true,
+                    Some(t) if t[0] == 1.0 && t[1] == 0.0 && t[2] == 0.0 && t[3] == 1.0 => {
+                        xf.ox += t[4] * s;
+                        xf.oy += t[5] * s;
+                    }
+                    Some(t) => match xform::Map::new(&t, xf.ox, xf.oy, (sx, sy), s) {
+                        Some(m) => self.cur_map = Some(m),
+                        None => singular = true,
+                    },
+                }
+            }
+            let map = self.cur_map;
             let clip = *clips.last().unwrap_or(&base);
+            let structural = matches!(
+                item,
+                Item::PushClip { .. } | Item::PopClip | Item::PushFixed | Item::PopFixed | Item::PushTransform { .. } | Item::PopTransform
+            );
+            if singular && !structural {
+                continue;
+            }
             match item {
                 Item::PushClip { rect, radii } => {
                     let r = xf.rect(rect);
-                    let r = if finite_rect(&r) { r } else { Rect::ZERO };
+                    let r = if finite_rect(&r) && !singular { r } else { Rect::ZERO };
                     let rad = fix_radii(&r, xf.radii(radii));
-                    let rounded = if max4(&rad) > 0.0 { Some((r, rad)) } else { clip.rounded };
-                    clips.push(Clip { rect: clip.rect.intersect(&r), rounded });
+                    let pushed = match map {
+                        None => {
+                            let rounded = if max4(&rad) > 0.0 { Some((r, rad, None)) } else { clip.rounded };
+                            Clip { rect: clip.rect.intersect(&r), rounded }
+                        }
+                        Some(m) => {
+                            let exact = max4(&rad) > 0.0 || !m.axis_aligned();
+                            let rounded = if exact { Some((r, rad, Some(m.inv))) } else { clip.rounded };
+                            let phys = m.bounds(&r);
+                            let rect = if finite_rect(&phys) { clip.rect.intersect(&phys) } else { Rect::ZERO };
+                            Clip { rect, rounded }
+                        }
+                    };
+                    clips.push(pushed);
                 }
                 Item::PopClip => {
                     let floor = fixed.last().map(|n| n + 1).unwrap_or(1);
@@ -744,6 +798,8 @@ impl Renderer {
                         clips.truncate(n.max(1));
                     }
                 }
+                Item::PushTransform { m } => xs.push(m),
+                Item::PopTransform => xs.pop(),
                 Item::Rect { rect, color, radii } => {
                     if color.a == 0 {
                         continue;
@@ -754,7 +810,11 @@ impl Renderer {
                     }
                     let rad = fix_radii(&r, xf.radii(radii));
                     // Clamp huge shapes so the SDF stays numerically sane; corners stay out of view.
-                    let shape = r.intersect(&clip.rect.inflate(max4(&rad) + 2.0));
+                    let clip_local = match map {
+                        Some(m) => m.inv_bounds(&clip.rect),
+                        None => clip.rect,
+                    };
+                    let shape = r.intersect(&clip_local.inflate(max4(&rad) + 2.0));
                     let inst = Instance {
                         shape: r4(&shape),
                         radii: rad,
@@ -898,7 +958,10 @@ impl Renderer {
                     if color.a == 0 {
                         continue;
                     }
-                    let px_size = size * s;
+                    // `k`: physical pixels per local unit; glyphs are rasterised at their final size.
+                    let k = map.map_or(1.0, |m| m.scale());
+                    let local_size = size * s;
+                    let px_size = local_size * k;
                     if !(px_size.is_finite() && px_size > 0.0 && px_size <= MAX_GLYPH_PX) {
                         continue;
                     }
@@ -906,12 +969,14 @@ impl Renderer {
                     if size_q == 0 {
                         continue;
                     }
-                    let base_y = xf.y(*baseline).round();
+                    let base_y = if map.is_none() { xf.y(*baseline).round() } else { xf.y(*baseline) };
                     if !base_y.is_finite() || !x.is_finite() {
                         continue;
                     }
                     if w.is_finite() && *w >= 0.0 {
-                        let run = Rect::new(xf.x(*x) - px_size, base_y - px_size * 1.5, w * s + 2.0 * px_size, px_size * 2.5);
+                        let run =
+                            Rect::new(xf.x(*x) - local_size, base_y - local_size * 1.5, w * s + 2.0 * local_size, local_size * 2.5);
+                        let run = map.map_or(run, |m| m.bounds(&run));
                         if !run.intersects(&clip.rect) {
                             continue;
                         }
@@ -921,7 +986,27 @@ impl Renderer {
                     let packed = pack(*color);
                     let mut pen = *x;
                     for g in layer.glyphs.get(lo..hi).unwrap_or(&[]) {
-                        if g.id != 0 {
+                        if g.id != 0 && map.is_some() {
+                            // Transformed: no pen snapping; the bitmap is sampled bilinearly.
+                            let key = GlyphKey { face: g.face, id: g.id, size_q, sub: 0 };
+                            if let Some(e) = self.glyph_entry(key, src, view) {
+                                let gx = xf.x(pen);
+                                let quad = Rect::new(
+                                    gx + e.left as f32 / k,
+                                    base_y + e.top as f32 / k,
+                                    e.w as f32 / k,
+                                    e.h as f32 / k,
+                                );
+                                let inst = Instance {
+                                    shape: r4(&quad),
+                                    colors: [packed, 0, 0, 0],
+                                    p1: [e.x as f32, e.y as f32, e.w as f32, e.h as f32],
+                                    info: [KIND_GLYPH, 0, 0, 0],
+                                    ..Default::default()
+                                };
+                                self.push(inst, quad, &clip, None);
+                            }
+                        } else if g.id != 0 {
                             let q = (xf.x(pen) * 4.0).round();
                             let ix = (q / 4.0).floor();
                             let sub = ((q - ix * 4.0) as u8).min(3);
@@ -947,6 +1032,8 @@ impl Renderer {
         }
         self.clip_stack = clips;
         self.fixed_stack = fixed;
+        self.xstack = xs;
+        self.cur_map = None;
     }
 
     fn add_stops(&mut self, all: &[draw::Stop], span: draw::Span) -> Option<(u32, u32)> {
@@ -968,16 +1055,34 @@ impl Renderer {
         Some((start, (hi - lo) as u32))
     }
 
+    /// Queue an instance. `bounds` is in the item's local space; under a transform the quad is
+    /// its physical bounding box (plus an anti-aliasing pixel) and the shader maps back.
     fn push(&mut self, mut inst: Instance, bounds: Rect, clip: &Clip, image: Option<ImageId>) {
+        let bounds = match self.cur_map {
+            Some(m) => {
+                inst.xf = [m.inv[0], m.inv[1], m.inv[2], m.inv[3]];
+                inst.xt[0] = m.inv[4];
+                inst.xt[1] = m.inv[5];
+                inst.info[3] |= FLAG_XF;
+                m.bounds(&bounds).inflate(1.0)
+            }
+            None => bounds,
+        };
         let q = bounds.intersect(&clip.rect);
         if !(finite_rect(&q) && q.w > 0.0 && q.h > 0.0) {
             return;
         }
         inst.quad = r4(&q);
-        if let Some((r, rad)) = clip.rounded {
+        if let Some((r, rad, space)) = clip.rounded {
             inst.clip = r4(&r);
             inst.clip_radii = rad;
             inst.info[3] |= FLAG_ROUNDED_CLIP;
+            if let Some(m) = space {
+                inst.cxf = [m[0], m[1], m[2], m[3]];
+                inst.xt[2] = m[4];
+                inst.xt[3] = m[5];
+                inst.info[3] |= FLAG_CLIP_XF;
+            }
         }
         let n = self.instances.len() as u32;
         match self.segments.last_mut() {
@@ -1242,6 +1347,7 @@ impl Renderer {
         self.stops = Vec::new();
         self.clip_stack = Vec::new();
         self.fixed_stack = Vec::new();
+        self.xstack = xform::XStack::default();
         self.instance_buf = None;
         self.instance_cap = 0;
         if self.stop_cap > MIN_STOP_CAP {

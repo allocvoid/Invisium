@@ -129,6 +129,41 @@ pub struct Stop {
     pub color: Rgba,
 }
 
+/// A 2D affine map `[a, b, c, d, e, f]`, laid out like CSS `matrix(a, b, c, d, e, f)`:
+/// `x' = a*x + c*y + e`, `y' = b*x + d*y + f`.
+pub type Affine = [f32; 6];
+pub const IDENTITY: Affine = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+
+/// The map that applies `inner` first and `outer` second.
+#[inline]
+pub fn affine_mul(outer: &Affine, inner: &Affine) -> Affine {
+    let (o, i) = (outer, inner);
+    [
+        o[0] * i[0] + o[2] * i[1],
+        o[1] * i[0] + o[3] * i[1],
+        o[0] * i[2] + o[2] * i[3],
+        o[1] * i[2] + o[3] * i[3],
+        o[0] * i[4] + o[2] * i[5] + o[4],
+        o[1] * i[4] + o[3] * i[5] + o[5],
+    ]
+}
+
+/// Map the point (`x`, `y`) through `m`.
+#[inline]
+pub fn affine_point(m: &Affine, x: f32, y: f32) -> (f32, f32) {
+    (m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5])
+}
+
+/// The inverse of `m`, or `None` if it collapses the plane (determinant near zero).
+pub fn affine_inverse(m: &Affine) -> Option<Affine> {
+    let det = m[0] * m[3] - m[1] * m[2];
+    if !det.is_finite() || det.abs() < 1e-9 {
+        return None;
+    }
+    let (a, b, c, d) = (m[3] / det, -m[1] / det, -m[2] / det, m[0] / det);
+    Some([a, b, c, d, -(a * m[4] + c * m[5]), -(b * m[4] + d * m[5])])
+}
+
 /// Handle to a texture owned by the renderer (created with `Renderer::create_image`).
 pub type ImageId = u32;
 
@@ -167,6 +202,16 @@ pub enum Item {
     /// Clips pushed inside are fixed too; an enclosing scrolling clip does not apply.
     PushFixed,
     PopFixed,
+    /// Until the matching `PopTransform`, every item and every clip pushed inside is drawn
+    /// through `m`, which is given in list units: a point `p` of an item lands at
+    /// `physical = viewport.origin + (m(p) - scroll) * scale`. Nested transforms compose, the
+    /// innermost applied first. A clip pushed *before* the transform keeps clipping in its own
+    /// (outer) space. Shapes keep their analytic edges in their own space (a scaled rounded
+    /// rectangle has scaled corners; a rotated one has rotated, anti-aliased edges). Glyphs are
+    /// rasterised at the size they end up on screen. A transform that collapses the plane
+    /// (determinant 0, e.g. `scale(0)`) draws nothing.
+    PushTransform { m: Affine },
+    PopTransform,
 }
 
 /// An ordered list of drawing commands plus the gradient stops they reference.
@@ -239,6 +284,14 @@ impl DrawList {
 
     pub fn pop_clip(&mut self) {
         self.items.push(Item::PopClip);
+    }
+
+    pub fn push_transform(&mut self, m: Affine) {
+        self.items.push(Item::PushTransform { m });
+    }
+
+    pub fn pop_transform(&mut self) {
+        self.items.push(Item::PopTransform);
     }
 
     /// Approximate heap bytes held by this list.
@@ -327,6 +380,23 @@ mod tests {
         assert!(a.contains(9.9, 0.0) && !a.contains(10.0, 0.0));
         assert!(a.intersect(&Rect::new(20.0, 0.0, 5.0, 5.0)).is_empty());
         assert_eq!(a.inflate(2.0), Rect::new(-2.0, -2.0, 14.0, 14.0));
+    }
+
+    #[test]
+    fn affine_math() {
+        let scale: Affine = [2.0, 0.0, 0.0, 3.0, 0.0, 0.0];
+        let shift: Affine = [1.0, 0.0, 0.0, 1.0, 10.0, 20.0];
+        // scale first, then shift
+        let m = affine_mul(&shift, &scale);
+        assert_eq!(affine_point(&m, 1.0, 1.0), (12.0, 23.0));
+        // shift first, then scale
+        let m = affine_mul(&scale, &shift);
+        assert_eq!(affine_point(&m, 1.0, 1.0), (22.0, 63.0));
+        let inv = affine_inverse(&m).unwrap();
+        let (x, y) = affine_point(&inv, 22.0, 63.0);
+        assert!((x - 1.0).abs() < 1e-5 && (y - 1.0).abs() < 1e-5);
+        assert!(affine_inverse(&[0.0, 0.0, 0.0, 1.0, 0.0, 0.0]).is_none());
+        assert_eq!(affine_mul(&IDENTITY, &m), m);
     }
 
     #[test]
