@@ -1,7 +1,7 @@
 //! Headless mode: load one page without a window and write a PNG.
 //!
 //!   invisbrowser --screenshot <url> <out.png> [--width N] [--height N] [--scale F]
-//!                [--wait MS] [--full] [--dump] [--js] [--console]
+//!                [--wait MS] [--full] [--scroll Y] [--dump] [--js] [--console]
 //!
 //! `--full` renders the whole document height (capped), `--dump` prints page statistics,
 //! `--settle MS` is how long timers may keep running once the network is quiet (default 1500),
@@ -104,13 +104,14 @@ fn load_document(
 
 pub fn run(args: &[String]) -> i32 {
     let (Some(url_arg), Some(out)) = (args.first(), args.get(1)) else {
-        eprintln!("usage: invisbrowser --screenshot <url> <out.png> [--width N] [--height N] [--scale F] [--wait MS] [--full] [--dump] [--js] [--console]");
+        eprintln!("usage: invisbrowser --screenshot <url> <out.png> [--width N] [--height N] [--scale F] [--wait MS] [--full] [--scroll Y] [--dump] [--js] [--console]");
         return 2;
     };
     let width: u32 = arg_value(args, "--width", 1280);
     let height: u32 = arg_value(args, "--height", 800);
     let scale: f32 = arg_value(args, "--scale", 1.0);
     let wait_ms: u64 = arg_value(args, "--wait", 15_000);
+    let scroll_y: f32 = arg_value(args, "--scroll", 0.0);
     let full = args.iter().any(|a| a == "--full");
     let dump = args.iter().any(|a| a == "--dump");
     let scripting = args.iter().any(|a| a == "--js");
@@ -321,6 +322,21 @@ pub fn run(args: &[String]) -> i32 {
         renderer.resize((width as f32 * scale) as u32, (out_h * scale) as u32);
         page.set_viewport(width as f32, out_h);
         page.update(&mut fonts.borrow_mut());
+    } else if scroll_y > 0.0 {
+        // look at another part of the page at the real viewport height (`--full` grows the
+        // viewport, which inflates everything sized in viewport units)
+        page.scroll_to(0.0, scroll_y);
+        page.update(&mut fonts.borrow_mut());
+        if scripting {
+            // scroll listeners and the animations they start get a second to run
+            let until = Instant::now() + Duration::from_millis(1000);
+            while Instant::now() < until {
+                page.pump(now_ms(Instant::now()));
+                std::thread::sleep(Duration::from_millis(8));
+            }
+            console.extend(page.take_console());
+            page.update(&mut fonts.borrow_mut());
+        }
     }
     {
         let mut upload = |w: u32, h: u32, px: &[u8]| renderer.create_image(w, h, px);
@@ -334,7 +350,7 @@ pub fn run(args: &[String]) -> i32 {
         list: page.display_list(),
         glyphs: page.glyphs(),
         viewport: Rect::new(0.0, 0.0, width as f32 * scale, out_h * scale),
-        scroll: (0.0, 0.0),
+        scroll: page.scroll(),
         scale,
     };
     let canvas: Rgba = page.canvas_color();

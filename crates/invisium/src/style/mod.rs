@@ -140,6 +140,14 @@ struct RuleIndex {
     by_tag: HashMap<Atom, Vec<u32>>,
     universal: Vec<u32>,
     dynamic: bool,
+    /// `@property` registrations; a later rule for the same name replaces an earlier one
+    registered: HashMap<Atom, Registered>,
+}
+
+/// A custom property registered with `@property`.
+pub struct Registered {
+    pub inherits: bool,
+    pub initial: Option<Rc<str>>,
 }
 
 impl RuleIndex {
@@ -179,9 +187,39 @@ impl RuleIndex {
                         self.add_rules(rules, origin, env);
                     }
                 }
+                Rule::Property { name, inherits, initial } => {
+                    self.registered.insert(*name, Registered { inherits: *inherits, initial: initial.clone() });
+                }
                 Rule::Import { .. } | Rule::FontFace(_) => {}
             }
         }
+    }
+}
+
+/// What `var()` can see while one element is cascaded.
+pub struct VarScope<'a> {
+    /// Inherited custom properties, the element's own included.
+    pub chain: Option<&'a VarMap>,
+    /// The element's own values of registered properties that do not inherit.
+    pub local: &'a [(Atom, Rc<str>)],
+    pub registered: Option<&'a HashMap<Atom, Registered>>,
+}
+
+impl VarScope<'_> {
+    /// A scope with no registrations (plain inherited custom properties only).
+    pub fn plain(chain: Option<&VarMap>) -> VarScope<'_> {
+        VarScope { chain, local: &[], registered: None }
+    }
+
+    fn get(&self, name: Atom) -> Option<Rc<str>> {
+        let reg = self.registered.and_then(|r| r.get(&name));
+        let found = match reg {
+            Some(r) if !r.inherits => self.local.iter().rev().find(|(n, _)| *n == name).map(|(_, v)| v.clone()),
+            _ => self.chain.and_then(|m| m.get(name)).cloned(),
+        };
+        // `--x: initial` means "as if never set"
+        let found = found.filter(|v| !v.trim().eq_ignore_ascii_case("initial"));
+        found.or_else(|| reg.and_then(|r| r.initial.clone()))
     }
 }
 
@@ -450,7 +488,7 @@ fn starts_with_ci(hay: &[u8], needle: &[u8]) -> bool {
 }
 
 /// Replace `var()` / `env()` references. Returns `None` if a reference has no value and no fallback.
-pub fn substitute_vars(text: &str, vars: Option<&VarMap>, depth: u32) -> Option<String> {
+pub fn substitute_vars(text: &str, vars: &VarScope, depth: u32) -> Option<String> {
     if depth > 24 {
         return None;
     }
@@ -495,7 +533,7 @@ pub fn substitute_vars(text: &str, vars: Option<&VarMap>, depth: u32) -> Option<
             let name = text[args_start..name_end].trim();
             let fallback = comma.map(|c| &text[c + 1..j]);
             out.push_str(&text[last..i]);
-            let val: Option<Rc<str>> = if is_var { vars.and_then(|m| m.get(Atom::new(name)).cloned()) } else { None };
+            let val: Option<Rc<str>> = if is_var { vars.get(Atom::new(name)) } else { None };
             match val {
                 Some(v) => {
                     if v.contains("var(") {
@@ -829,7 +867,7 @@ fn is_inherited(p: PropId) -> bool {
         p,
         Color | FontFamily | FontSize | FontWeight | FontStyle | LineHeight | TextAlign | TextTransform
             | TextIndent | LetterSpacing | WordSpacing | WhiteSpace | Visibility | Cursor | ListStyleType
-            | BorderCollapse | BorderSpacing | OverflowWrap | WordBreak | PointerEvents
+            | BorderCollapse | BorderSpacing | OverflowWrap | WordBreak | PointerEvents | TextFillColor
     )
 }
 
@@ -887,6 +925,9 @@ fn copy_prop(d: &mut ComputedStyle, s: &ComputedStyle, p: PropId) {
         Bottom => d.inset[2] = s.inset[2].clone(),
         Left => d.inset[3] = s.inset[3].clone(),
         Color => d.color = s.color,
+        TextFillColor => d.text_fill = s.text_fill,
+        BackgroundClip => d.bg_clip_text = s.bg_clip_text,
+        Translate => d.translate = s.translate.clone(),
         BackgroundColor => d.background_color = s.background_color,
         BackgroundImage | BackgroundSize | BackgroundPosition | BackgroundRepeat => d.background = s.background.clone(),
         FontFamily => d.font_family = s.font_family.clone(),
@@ -1167,6 +1208,14 @@ fn apply(st: &mut ComputedStyle, parent: &ComputedStyle, prop: PropId, v: &Value
                 _ => parent.color,
             }
         }
+        TextFillColor => {
+            st.text_fill = match v {
+                Value::Color(CssColor::Rgba(c)) => Some(*c),
+                Value::Color(CssColor::Current) => None,
+                _ => parent.text_fill,
+            }
+        }
+        BackgroundClip => st.bg_clip_text = kw == Some(Kw::Text),
         BackgroundColor => {
             st.background_color = match v {
                 Value::Color(CssColor::Rgba(c)) => *c,
@@ -1505,7 +1554,7 @@ fn apply(st: &mut ComputedStyle, parent: &ComputedStyle, prop: PropId, v: &Value
                 _ => None,
             }
         }
-        Transform => {
+        Transform | Translate => {
             st.translate = match v {
                 Value::Translate(x, y) => Some((x.to_size(&lc), y.to_size(&lc))),
                 _ => None,
@@ -1590,30 +1639,48 @@ fn cascade(
     seq.append(&mut important);
     seq.append(&mut ua_important);
 
-    // Custom properties first: they feed var() in everything else.
+    // Custom properties first: they feed var() in everything else. Registered properties that
+    // do not inherit stay with this element (`local`); the rest join the inherited chain.
+    let registered = &index.registered;
     let mut own: Vec<(Atom, Rc<str>)> = Vec::new();
+    let mut local: Vec<(Atom, Rc<str>)> = Vec::new();
     for d in &seq {
         if let Value::Custom(name, text) = &d.value {
-            own.push((*name, text.clone()));
+            if registered.get(name).map_or(false, |r| !r.inherits) {
+                local.push((*name, text.clone()));
+            } else {
+                own.push((*name, text.clone()));
+            }
         }
     }
-    if !own.is_empty() {
-        let needs_resolve = own.iter().any(|(_, t)| t.contains("var("));
-        let raw = Rc::new(VarMap { parent: st.vars.take(), own });
+    if !own.is_empty() || !local.is_empty() {
+        let needs_resolve = own.iter().chain(local.iter()).any(|(_, t)| t.contains("var("));
+        let had_own = !own.is_empty();
+        let raw = if had_own { Some(Rc::new(VarMap { parent: st.vars.clone(), own })) } else { None };
         if needs_resolve {
-            let resolved: Vec<(Atom, Rc<str>)> = raw
-                .own
-                .iter()
-                .filter_map(|(n, t)| {
-                    if t.contains("var(") {
-                        substitute_vars(t, Some(&raw), 0).map(|s| (*n, Rc::from(s.as_str())))
-                    } else {
-                        Some((*n, t.clone()))
-                    }
-                })
-                .collect();
-            st.vars = Some(Rc::new(VarMap { parent: raw.parent.clone(), own: resolved }));
-        } else {
+            let chain = match &raw {
+                Some(r) => Some(&**r),
+                None => st.vars.as_deref(),
+            };
+            let scope = VarScope { chain, local: &local, registered: Some(registered) };
+            let resolve = |list: &[(Atom, Rc<str>)]| -> Vec<(Atom, Rc<str>)> {
+                list.iter()
+                    .filter_map(|(n, t)| {
+                        if t.contains("var(") {
+                            substitute_vars(t, &scope, 0).map(|s| (*n, Rc::from(s.as_str())))
+                        } else {
+                            Some((*n, t.clone()))
+                        }
+                    })
+                    .collect()
+            };
+            let resolved_own = raw.as_ref().map(|r| resolve(&r.own));
+            let resolved_local = resolve(&local);
+            if let Some(resolved) = resolved_own {
+                st.vars = Some(Rc::new(VarMap { parent: st.vars.take(), own: resolved }));
+            }
+            local = resolved_local;
+        } else if let Some(raw) = raw {
             st.vars = Some(raw);
         }
     }
@@ -1625,7 +1692,8 @@ fn cascade(
         match &d.value {
             Value::Custom(..) => {}
             Value::Pending(text) => {
-                match substitute_vars(text, st.vars.as_deref(), 0) {
+                let scope = VarScope { chain: st.vars.as_deref(), local: &local, registered: Some(registered) };
+                match substitute_vars(text, &scope, 0) {
                     Some(s) => {
                         let toks = tokenize_value(&s);
                         tmp.clear();
@@ -1700,6 +1768,9 @@ fn cascade(
             st.background = None;
         }
     }
+    if st.bg_clip_text {
+        st.text_bg = st.background.clone();
+    }
     st
 }
 
@@ -1767,6 +1838,68 @@ mod tests {
         assert_eq!(b.font_weight, 700);
         assert_eq!(b.color, Color::rgb(255, 0, 0));
         assert_eq!(b.display, Display::Inline);
+    }
+
+    #[test]
+    fn registered_properties_have_initial_values_and_may_not_inherit() {
+        // the shape of what utility-class frameworks emit
+        let css = "
+            @property --bs { syntax: \"*\"; inherits: false; initial-value: solid }
+            @property --w { syntax: \"<length>\"; inherits: false; initial-value: 0px }
+            @property --shared { syntax: \"*\"; inherits: true; initial-value: 7px }
+            @property --broken { syntax: \"*\" }
+            .border { border-style: var(--bs); border-width: 2px }
+            .dashed { --bs: dashed }
+            .pad { padding-left: var(--w) }
+            .wide { --w: 30px }
+            .m { margin-left: var(--shared) }
+            .set { --shared: 11px }
+            .reset { --w: initial }
+            .x { margin-top: var(--broken, 3px) }";
+        let (doc, st) = styles(
+            "<div id=a class='border dashed wide pad set m'><div id=b class='border pad m'><span id=c class='pad wide reset x'>t</span></div></div>
+             <div id=d class='border m'></div>",
+            css,
+        );
+        let get = |id: &str| st.get(doc.element_by_id(id)).unwrap();
+        // declared on the element itself
+        assert_eq!(get("a").border_style[0], crate::style::computed::BorderStyle::Dashed);
+        assert_eq!(get("a").padding[3], Size::Px(30.0));
+        assert_eq!(get("a").margin[3], Size::Px(11.0));
+        // not inherited: the child is back at the registered initial values...
+        assert_eq!(get("b").border_style[0], crate::style::computed::BorderStyle::Solid);
+        assert_eq!(get("b").border_width[0], 2.0);
+        assert_eq!(get("b").padding[3], Size::Px(0.0));
+        // ...while an inheriting registration does reach it
+        assert_eq!(get("b").margin[3], Size::Px(11.0));
+        // `initial` wins over an earlier value on the same element
+        assert_eq!(get("c").padding[3], Size::Px(0.0));
+        // a registration without `inherits` is invalid and ignored
+        assert_eq!(get("c").margin[0], Size::Px(3.0));
+        // never set anywhere: the initial value
+        assert_eq!(get("d").border_style[0], crate::style::computed::BorderStyle::Solid);
+        assert_eq!(get("d").margin[3], Size::Px(7.0));
+    }
+
+    #[test]
+    fn framework_idioms_for_text() {
+        let (doc, st) = styles(
+            "<h3 id=a class=t>x</h3><p id=b class=g><b id=c>y</b></p><p id=d class=moved>z</p>",
+            ":root { --lh: calc(2 / 1.5) } .t { font-size: 24px; line-height: var(--lh) }
+             .g { background: linear-gradient(90deg, red, blue); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent }
+             .moved { translate: 10px -50% }",
+        );
+        let get = |id: &str| st.get(doc.element_by_id(id)).unwrap();
+        // a calc() of plain numbers is a multiplier, not 1.33 pixels
+        assert_eq!(get("a").line_height, crate::style::computed::LineHeight::Number(2.0 / 1.5));
+        // gradient text: the element keeps its background for its text, descendants inherit it
+        assert!(get("b").bg_clip_text && get("b").text_bg.is_some());
+        assert_eq!(get("b").text_fill, Some(Color::TRANSPARENT));
+        assert!(!get("c").bg_clip_text && get("c").text_bg.is_some());
+        assert_eq!(get("c").text_fill, Some(Color::TRANSPARENT));
+        assert!(get("a").text_bg.is_none() && get("a").text_fill.is_none());
+        // the standalone translate property
+        assert_eq!(get("d").translate, Some((Size::Px(10.0), Size::Pct(-50.0))));
     }
 
     #[test]

@@ -145,7 +145,8 @@ props! {
         MaskImage = "mask-image",
         BoxShadow = "box-shadow", BorderCollapse = "border-collapse", BorderSpacing = "border-spacing",
         TableLayout = "table-layout", Content = "content", ObjectFit = "object-fit",
-        AspectRatio = "aspect-ratio", Transform = "transform",
+        AspectRatio = "aspect-ratio", Transform = "transform", Translate = "translate",
+        BackgroundClip = "background-clip", TextFillColor = "-webkit-text-fill-color",
         OutlineWidth = "outline-width", OutlineStyle = "outline-style", OutlineColor = "outline-color",
         OutlineOffset = "outline-offset",
     }
@@ -234,7 +235,7 @@ pub fn prop_from_name(name: &str) -> Option<PropId> {
                 | "flex-wrap" | "flex-flow" | "flex-grow" | "flex-shrink" | "flex-basis" | "order"
                 | "justify-content" | "align-items" | "align-self" | "align-content"
                 | "border-top-left-radius" | "border-top-right-radius" | "border-bottom-left-radius"
-                | "border-bottom-right-radius" | "background-size" => prop_lookup(stripped),
+                | "border-bottom-right-radius" | "background-size" | "background-clip" => prop_lookup(stripped),
                 _ => None,
             };
         }
@@ -305,7 +306,7 @@ pub fn longhands(sh: PropId) -> &'static [PropId] {
         BorderStyle => &[BorderTopStyle, BorderRightStyle, BorderBottomStyle, BorderLeftStyle],
         BorderColor => &[BorderTopColor, BorderRightColor, BorderBottomColor, BorderLeftColor],
         BorderRadius => &[BorderTopLeftRadius, BorderTopRightRadius, BorderBottomRightRadius, BorderBottomLeftRadius],
-        Background => &[BackgroundColor, BackgroundImage, BackgroundSize, BackgroundPosition, BackgroundRepeat],
+        Background => &[BackgroundColor, BackgroundImage, BackgroundSize, BackgroundPosition, BackgroundRepeat, BackgroundClip],
         Font => &[FontStyle, FontWeight, FontSize, LineHeight, FontFamily],
         Flex => &[FlexGrow, FlexShrink, FlexBasis],
         FlexFlow => &[FlexDirection, FlexWrap],
@@ -573,10 +574,46 @@ fn parse_font_size(toks: &[Tok]) -> Option<Value> {
     len_only(toks).map(Value::Len)
 }
 
+/// The value of a `calc()` tree that contains only numbers; `None` if a length is involved.
+fn calc_number(c: &Calc) -> Option<f32> {
+    Some(match c {
+        Calc::Num(n) => *n,
+        Calc::Leaf(_) => return None,
+        Calc::Add(a, b) => calc_number(a)? + calc_number(b)?,
+        Calc::Sub(a, b) => calc_number(a)? - calc_number(b)?,
+        Calc::Mul(a, b) => calc_number(a)? * calc_number(b)?,
+        Calc::Div(a, b) => {
+            let d = calc_number(b)?;
+            if d == 0.0 {
+                return None;
+            }
+            calc_number(a)? / d
+        }
+        Calc::Min(list) => list.iter().map(calc_number).collect::<Option<Vec<f32>>>()?.into_iter().fold(f32::INFINITY, f32::min),
+        Calc::Max(list) => list.iter().map(calc_number).collect::<Option<Vec<f32>>>()?.into_iter().fold(f32::NEG_INFINITY, f32::max),
+        Calc::Clamp(lo, v, hi) => calc_number(v)?.max(calc_number(lo)?).min(calc_number(hi)?),
+    })
+}
+
 fn parse_line_height(toks: &[Tok]) -> Option<Value> {
     match toks {
         [Tok::Number(n)] if *n >= 0.0 => Some(Value::Num(*n)),
-        _ => len_or_kw(toks, &[Kw::Normal]),
+        _ => {
+            // `calc()` over plain numbers is a multiplier, not a length: utility frameworks
+            // write `line-height: calc(2 / 1.5)`
+            let mut c = Cur::new(toks);
+            c.skip_ws();
+            if let Some(Tok::Function(f)) = c.peek() {
+                if f.eq_ignore_ascii_case("calc") {
+                    c.next();
+                    let mut inner = c.block();
+                    if let (Some(n), true) = (parse_calc_sum(&mut inner).and_then(|v| calc_number(&v)), c.at_end()) {
+                        return (n >= 0.0).then_some(Value::Num(n));
+                    }
+                }
+            }
+            len_or_kw(toks, &[Kw::Normal])
+        }
     }
 }
 
@@ -634,6 +671,23 @@ fn parse_content(toks: &[Tok]) -> Option<Value> {
         }
     }
     Some(Value::Content(items.into()))
+}
+
+/// The standalone `translate` property: `none`, or one to three lengths (the third, z, is ignored).
+fn parse_translate_prop(toks: &[Tok]) -> Option<Value> {
+    if single_kw(toks) == Some(Kw::None) {
+        return Some(Value::Translate(Len::Px(0.0), Len::Px(0.0)));
+    }
+    let mut c = Cur::new(toks);
+    let x = parse_len(&mut c, true)?;
+    let y = if c.at_end() { Len::Px(0.0) } else { parse_len(&mut c, true)? };
+    if !c.at_end() {
+        parse_len(&mut c, true)?;
+        if !c.at_end() {
+            return None;
+        }
+    }
+    Some(Value::Translate(x, y))
 }
 
 fn parse_transform(toks: &[Tok]) -> Option<Value> {
@@ -799,7 +853,8 @@ pub fn parse_longhand(prop: PropId, toks: &[Tok], resolve: UrlResolver) -> Optio
         BorderTopStyle | BorderRightStyle | BorderBottomStyle | BorderLeftStyle => kw_in(toks, BORDER_STYLES),
         OutlineStyle => kw_in(toks, BORDER_STYLES).or_else(|| kw_in(toks, &[Kw::Auto])),
         BorderTopColor | BorderRightColor | BorderBottomColor | BorderLeftColor | Color | BackgroundColor
-        | OutlineColor | TextDecorationColor => color_only(toks),
+        | OutlineColor | TextDecorationColor | TextFillColor => color_only(toks),
+        BackgroundClip => kw_in(toks, &[Kw::BorderBox, Kw::PaddingBox, Kw::ContentBox, Kw::Text]),
         BorderTopLeftRadius | BorderTopRightRadius | BorderBottomRightRadius | BorderBottomLeftRadius => {
             let mut c = Cur::new(toks);
             let l = parse_len(&mut c, false)?;
@@ -985,6 +1040,7 @@ pub fn parse_longhand(prop: PropId, toks: &[Tok], resolve: UrlResolver) -> Optio
             (a > 0.0 && b > 0.0).then_some(Value::Num(a / b))
         }
         Transform => parse_transform(toks),
+        Translate => parse_translate_prop(toks),
         Custom => None,
         _ => None,
     }
@@ -1115,6 +1171,7 @@ fn expand_background(toks: &[Tok], resolve: UrlResolver, out: &mut Vec<Declarati
     let mut sizes = Vec::new();
     let mut positions = Vec::new();
     let mut repeats = Vec::new();
+    let mut clip_text = false;
     let n = layers.len();
     for (li, layer) in layers.into_iter().enumerate() {
         let mut c = Cur::new(layer);
@@ -1184,7 +1241,8 @@ fn expand_background(toks: &[Tok], resolve: UrlResolver, out: &mut Vec<Declarati
                         repeat = (false, true);
                         continue;
                     }
-                    Some(Kw::Scroll | Kw::Fixed | Kw::Local | Kw::BorderBox | Kw::PaddingBox | Kw::ContentBox | Kw::Text) => {
+                    Some(k @ (Kw::Scroll | Kw::Fixed | Kw::Local | Kw::BorderBox | Kw::PaddingBox | Kw::ContentBox | Kw::Text)) => {
+                        clip_text |= k == Kw::Text;
                         continue;
                     }
                     _ => c.i = save,
@@ -1206,6 +1264,7 @@ fn expand_background(toks: &[Tok], resolve: UrlResolver, out: &mut Vec<Declarati
     push(out, PropId::BackgroundSize, Value::BgSizes(sizes.into()));
     push(out, PropId::BackgroundPosition, Value::Positions(positions.into()));
     push(out, PropId::BackgroundRepeat, Value::Repeats(repeats.into()));
+    push(out, PropId::BackgroundClip, Value::Kw(if clip_text { Kw::Text } else { Kw::BorderBox }));
     Some(())
 }
 

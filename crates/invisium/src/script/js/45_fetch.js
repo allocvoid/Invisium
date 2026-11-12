@@ -133,6 +133,7 @@ class Blob {
   text() { return Promise.resolve(n.decode(this._buf, 'utf-8')); }
   arrayBuffer() { return Promise.resolve(this._buf.slice(0)); }
   bytes() { return Promise.resolve(new Uint8Array(this._buf.slice(0))); }
+  stream() { var buf = this._buf; return bytesStream(function () { return new Uint8Array(buf.slice(0)); }); }
 }
 class File extends Blob {
   constructor(parts, name, opts) {
@@ -190,6 +191,7 @@ class FileReader extends EventTarget {
 function toBody(body) {
   if (body === null || body === undefined) return [null, null];
   if (typeof body === 'string') return [body, 'text/plain;charset=UTF-8'];
+  if (body instanceof ReadableStream) throw new TypeError('Streaming request bodies are not supported');
   if (body instanceof Blob) return [body._buf.slice(0), body.type || null];
   if (body instanceof ArrayBuffer) return [body.slice(0), null];
   if (ArrayBuffer.isView(body)) return [body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength), null];
@@ -219,15 +221,29 @@ class Response {
     this.redirected = false;
     this.type = 'default';
     this.bodyUsed = false;
-    var enc = toBody(body);
-    hide(this, '_data', enc[0]);   // string, ArrayBuffer or null
+    // the body is either data (string, ArrayBuffer or null) or a stream the caller supplied
+    var fromStream = body instanceof ReadableStream;
+    var enc = fromStream ? [null, null] : toBody(body);
+    hide(this, '_data', enc[0]);
+    hide(this, '_stream', fromStream ? body : null);
     if (enc[1] && !this.headers.has('content-type')) this.headers.set('content-type', enc[1]);
   }
   get ok() { return this.status >= 200 && this.status < 300; }
-  get body() { return null; }
+  get body() {
+    var self = this;
+    if (!this._stream && this._data !== null) {
+      this._stream = bytesStream(function () {
+        self.bodyUsed = true;
+        var d = self._data;
+        return new Uint8Array(typeof d === 'string' ? n.encode(d) : d.slice(0));
+      });
+    }
+    return this._stream;
+  }
   _take() {
-    if (this.bodyUsed) return Promise.reject(new TypeError('The body has already been read'));
+    if (this.bodyUsed || (this._stream && this._stream.locked)) return Promise.reject(new TypeError('The body has already been read'));
     this.bodyUsed = true;
+    if (this._data === null && this._stream) return drainStream(this._stream);
     return Promise.resolve(this._data);
   }
   // `text()` is always UTF-8, whatever the Content-Type says (the Fetch standard)
@@ -243,8 +259,12 @@ class Response {
   }
   formData() { return unsupportedBody('Response.formData'); }
   clone() {
-    if (this.bodyUsed) throw new TypeError('The body has already been read');
+    if (this.bodyUsed || (this._stream && this._stream.locked)) throw new TypeError('The body has already been read');
     var r = new Response(null, { status: this.status, statusText: this.statusText, headers: this.headers });
+    if (this._data === null && this._stream) {
+      var pair = this._stream.tee();
+      this._stream = pair[0]; r._stream = pair[1];
+    }
     r._data = this._data;   // shared: neither copy ever changes it
     r.url = this.url; r.redirected = this.redirected; r.type = this.type;
     return r;

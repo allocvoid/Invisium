@@ -218,6 +218,26 @@ class DocumentFragment extends Node {
 methods(DocumentFragment.prototype, parentNode);
 mixGetters(DocumentFragment.prototype, parentGetters);
 
+// A shadow root is a fragment that hangs off its host element. The layout engine does not
+// draw shadow trees yet: the root keeps its nodes for script (queries, events), nothing more.
+class ShadowRoot extends DocumentFragment {
+  get innerHTML() {
+    var s = '';
+    for (var c = this.firstChild; c; c = c.nextSibling) s += c.nodeType === 1 ? c.outerHTML : c.nodeType === 3 ? c.data : '';
+    return s;
+  }
+  set innerHTML(v) {
+    while (this.firstChild) this.removeChild(this.firstChild);
+    var tmp = n.createElement('div');
+    tmp.innerHTML = v;
+    while (tmp.firstChild) this.appendChild(tmp.firstChild);
+  }
+  get activeElement() { return null; }
+  get adoptedStyleSheets() { return []; }
+  set adoptedStyleSheets(v) {}
+  getRootNode() { return this; }
+}
+
 // ───────────────────────────── DOMTokenList ─────────────────────────────
 
 function splitTokens(s) {

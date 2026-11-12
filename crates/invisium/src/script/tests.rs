@@ -508,6 +508,88 @@ fn binary_bodies_travel_both_ways() {
 }
 
 #[test]
+fn current_script_is_still_set_in_the_scripts_microtasks() {
+    let mut t = T::new(
+        "<body><script id=one>
+        Promise.resolve().then(function () { console.log('microtask', document.currentScript && document.currentScript.id); });
+        (async function () { await null; console.log('after await', document.currentScript && document.currentScript.id); })();
+        setTimeout(function () { console.log('timer', document.currentScript); }, 0);
+        console.log('sync', document.currentScript.id);
+        </script>",
+    );
+    t.step(1.0);
+    assert_eq!(t.errors(), Vec::<&String>::new(), "console: {:?}", t.log);
+    assert_eq!(t.logs(), vec!["sync one", "microtask one", "after await one", "timer null"]);
+}
+
+#[test]
+fn streams_read_pipe_and_back_responses() {
+    let mut t = T::new(
+        "<body><script>
+        var log = function () { console.log(Array.prototype.join.call(arguments, ' ')); };
+        // a source that is pulled, read to the end
+        var i = 0;
+        var s = new ReadableStream({ pull: function (c) { i++; if (i > 3) c.close(); else c.enqueue('c' + i); } });
+        var r = s.getReader(), got = [];
+        (function next() {
+          r.read().then(function (x) { if (x.done) { log('read', got.join(','), s.locked); return; } got.push(x.value); next(); });
+        })();
+        r.closed.then(function () { log('closed'); });
+        // enqueue before anyone reads, async iteration, a second reader is refused
+        var q = new ReadableStream({ start: function (c) { c.enqueue(1); c.enqueue(2); c.close(); } });
+        (async function () {
+          var seen = [];
+          for await (var v of q) seen.push(v);
+          var threw = false;
+          try { s.getReader(); } catch (e) { threw = e instanceof TypeError; }
+          log('iter', seen.join(','), q.locked, threw);
+        })();
+        // errors reach the reader
+        new ReadableStream({ start: function (c) { c.error(new Error('boom')); } }).getReader().read().catch(function (e) { log('error', e.message); });
+        // a transform in the middle, then collected by a Response
+        var upper = new TransformStream({ transform: function (chunk, c) { c.enqueue(chunk.toUpperCase()); }, flush: function (c) { c.enqueue('!'); } });
+        var src = new ReadableStream({ start: function (c) { c.enqueue('ab'); c.enqueue('cd'); c.close(); } });
+        new Response(src.pipeThrough(upper)).text().then(function (text) { log('piped', text); });
+        // a response body as a stream of bytes; the body counts as used afterwards
+        var resp = new Response('h\\u00e9llo');
+        var br = resp.body.getReader();
+        br.read().then(function (x) {
+          log('body', x.value instanceof Uint8Array, x.value.length, resp.bodyUsed);
+          return Promise.all([br.read(), resp.text().then(function () { return 'read twice'; }, function (e) { return e instanceof TypeError; })]);
+        }).then(function (v) { log('body end', v[0].done, v[1]); });
+        // tee and Blob.stream
+        var pair = new Blob(['xyz']).stream().tee();
+        Promise.all([new Response(pair[0]).text(), new Response(pair[1]).arrayBuffer()]).then(function (v) { log('tee', v[0], v[1].byteLength); });
+        // a writable sink sees chunks in order and then close
+        var sunk = [];
+        var w = new WritableStream({ write: function (c) { sunk.push(c); }, close: function () { sunk.push('end'); } });
+        new ReadableStream({ start: function (c) { c.enqueue('p'); c.enqueue('q'); c.close(); } }).pipeTo(w).then(function () { log('sink', sunk.join(','), w.locked); });
+        log('types', typeof ReadableStreamDefaultReader, typeof WritableStreamDefaultWriter, new CountQueuingStrategy({ highWaterMark: 4 }).highWaterMark);
+        </script>",
+    );
+    t.step(1.0);
+    t.step(10.0);
+    assert_eq!(t.errors(), Vec::<&String>::new(), "console: {:?}", t.log);
+    let mut logs: Vec<String> = t.logs().iter().map(|s| s.to_string()).collect();
+    logs.sort();
+    assert_eq!(
+        logs,
+        vec![
+            "body end true true",
+            "body true 6 true",
+            "closed",
+            "error boom",
+            "iter 1,2 false true",
+            "piped ABCD!",
+            "read c1,c2,c3 true",
+            "sink p,q,end false",
+            "tee xyz 3",
+            "types function function 4",
+        ]
+    );
+}
+
+#[test]
 fn dom_objects_name_their_interface_and_storage_fails_politely() {
     let mut t = T::new(
         "<body><div id=d>x</div><script>

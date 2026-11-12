@@ -4,6 +4,7 @@ use super::properties::{self, Declaration, PropId, UrlResolver};
 use super::selector::{parse_selector_list, Selector};
 use super::tokenizer::{split_commas, tokenize, Cur, Tok};
 use super::values::{parse_len, LenCtx};
+use crate::atom::Atom;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -33,6 +34,9 @@ pub enum Rule {
     Media { query: MediaQueryList, rules: Vec<Rule> },
     Import { url: String, media: MediaQueryList },
     FontFace(FontFaceRule),
+    /// `@property --name { inherits: …; initial-value: … }`: a registered custom property.
+    /// The `syntax` descriptor is not checked; the initial value is kept as text.
+    Property { name: Atom, inherits: bool, initial: Option<Rc<str>> },
 }
 
 pub struct Stylesheet {
@@ -642,10 +646,60 @@ impl<'a> Parser<'a> {
                     out.push(Rule::FontFace(ff));
                 }
             }
-            // @keyframes, @page, @container, @property, @counter-style, ...: skipped
+            "property" => {
+                if let Some(rule) = self.property_rule(prelude, pos + 1, close) {
+                    out.push(rule);
+                }
+            }
+            // @keyframes, @page, @container, @counter-style, ...: skipped
             _ => {}
         }
         close + 1
+    }
+
+    /// `@property --name { syntax: …; inherits: …; initial-value: … }`. `inherits` is required,
+    /// as the specification says; a rule without it is dropped.
+    fn property_rule(&self, prelude: &[Tok], start: usize, end: usize) -> Option<Rule> {
+        let name = prelude.iter().find_map(|t| match t {
+            Tok::Ident(n) if n.starts_with("--") && n.len() > 2 => Some(Atom::new(n)),
+            _ => None,
+        })?;
+        let mut inherits = None;
+        let mut initial = None;
+        let mut i = start;
+        while i < end {
+            let (pos, _) = self.scan_prelude(i, end);
+            let decl_end = pos.min(end);
+            let from = i;
+            i = pos + 1;
+            let Some(colon) = (from..decl_end).find(|&k| matches!(self.toks[k], Tok::Colon)) else { continue };
+            let key: String = self.toks[from..colon]
+                .iter()
+                .filter_map(|t| if let Tok::Ident(n) = t { Some(n.to_ascii_lowercase()) } else { None })
+                .collect();
+            let (mut a, mut b) = (colon + 1, decl_end);
+            while a < b && matches!(self.toks[a], Tok::Whitespace) {
+                a += 1;
+            }
+            while b > a && matches!(self.toks[b - 1], Tok::Whitespace) {
+                b -= 1;
+            }
+            match key.as_str() {
+                "inherits" if a < b => {
+                    inherits = match &self.toks[a] {
+                        Tok::Ident(v) if v.eq_ignore_ascii_case("true") => Some(true),
+                        Tok::Ident(v) if v.eq_ignore_ascii_case("false") => Some(false),
+                        _ => None,
+                    }
+                }
+                "initial-value" if a < b => {
+                    let text = &self.src[self.spans[a].0 as usize..self.spans[b - 1].1 as usize];
+                    initial = Some(Rc::from(text.trim()));
+                }
+                _ => {}
+            }
+        }
+        Some(Rule::Property { name, inherits: inherits?, initial })
     }
 
     /// Body of a conditional group rule. Inside a style rule it may hold bare declarations.

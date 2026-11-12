@@ -322,7 +322,20 @@ impl<'a> Painter<'a> {
                     if st.visibility != Visibility::Visible {
                         continue;
                     }
-                    let color = rgba(st.color, alpha);
+                    let color = rgba(st.text_fill.unwrap_or(st.color), alpha);
+                    if color.a != 255 {
+                        if let Some(layers) = st.text_bg.clone() {
+                            // The gradient spans the block when the block is inside the clipped
+                            // element, otherwise (an inline owner) the run itself.
+                            let area = if self.styles.style(b.style).text_bg.is_some() {
+                                Rect::new(x, y, b.w, b.h)
+                            } else {
+                                Rect::new(x + f.x, y + f.y, f.w, f.h)
+                            };
+                            let ctx = self.ctx(st);
+                            self.clipped_text(&layers, area, x + f.x, y + f.baseline, st.font_size, (f.g0, f.g1), alpha, &ctx);
+                        }
+                    }
                     self.list.glyphs(x + f.x, y + f.baseline, f.w, st.font_size, color, (f.g0, f.g1));
                     if st.text_decoration != 0 {
                         let t = (st.font_size / 14.0).round().max(1.0);
@@ -436,6 +449,10 @@ impl<'a> Painter<'a> {
     }
 
     fn background(&mut self, st: &ComputedStyle, rect: Rect, radii: Radii, alpha: f32) {
+        // `background-clip: text`: nothing is painted behind the box; the text fragments show it
+        if st.bg_clip_text {
+            return;
+        }
         if !st.background_color.is_transparent() {
             self.list.rounded_rect(rect, rgba(st.background_color, alpha), radii);
         }
@@ -584,6 +601,65 @@ impl<'a> Painter<'a> {
                     repeat: layer.repeat.0 || layer.repeat.1,
                 });
             }
+        }
+    }
+
+    /// Text that shows a background through its glyphs (`background-clip: text`). The renderer
+    /// has one colour per glyph run, so each glyph is its own run, coloured with the gradient's
+    /// value at the glyph's centre. Linear gradients only; other images leave the text unpainted.
+    #[allow(clippy::too_many_arguments)]
+    fn clipped_text(&mut self, layers: &[BgLayer], area: Rect, x: f32, baseline: f32, size: f32, span: (u32, u32), alpha: f32, ctx: &LenCtx) {
+        let Some((dir, stops, repeating)) = layers.iter().find_map(|l| match &l.image {
+            Image::Linear { dir, stops, repeating } => Some((dir, stops, *repeating)),
+            _ => None,
+        }) else {
+            return;
+        };
+        let angle = match dir {
+            GradientDir::Angle(a) => *a,
+            GradientDir::Corner(h, v) => {
+                let t = area.h.atan2(area.w).to_degrees();
+                match (*h > 0, *v > 0) {
+                    (true, false) => t,
+                    (true, true) => 180.0 - t,
+                    (false, true) => 180.0 + t,
+                    (false, false) => 360.0 - t,
+                }
+            }
+        };
+        let rad = angle.to_radians();
+        let (sin, cos) = (rad.sin(), rad.cos());
+        let length = (area.w * sin).abs() + (area.h * cos).abs();
+        let mut resolved = Vec::with_capacity(stops.len());
+        resolve_stops(stops, length, ctx, alpha, &mut resolved);
+        if resolved.is_empty() || length <= 0.0 {
+            return;
+        }
+        let sample = |t: f32| -> Rgba {
+            let t = if repeating { t.rem_euclid(1.0) } else { t };
+            let first = resolved[0];
+            if t <= first.offset {
+                return first.color;
+            }
+            for pair in resolved.windows(2) {
+                let (a, b) = (pair[0], pair[1]);
+                if t <= b.offset {
+                    let k = if b.offset > a.offset { (t - a.offset) / (b.offset - a.offset) } else { 1.0 };
+                    let mix = |p: u8, q: u8| (p as f32 + (q as f32 - p as f32) * k).round() as u8;
+                    return Rgba { r: mix(a.color.r, b.color.r), g: mix(a.color.g, b.color.g), b: mix(a.color.b, b.color.b), a: mix(a.color.a, b.color.a) };
+                }
+            }
+            resolved[resolved.len() - 1].color
+        };
+        let (cx, cy) = (area.x + area.w / 2.0, area.y + area.h / 2.0);
+        let mid_y = baseline - size * 0.35;
+        let mut pen = x;
+        for k in span.0..span.1 {
+            let Some(g) = self.glyphs.get(k as usize) else { break };
+            let adv = g.adv;
+            let t = ((pen + adv / 2.0 - cx) * sin - (mid_y - cy) * cos) / length + 0.5;
+            self.list.glyphs(pen, baseline, adv, size, sample(t), (k, k + 1));
+            pen += adv;
         }
     }
 

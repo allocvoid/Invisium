@@ -33,6 +33,7 @@ const BOOTSTRAP: &str = concat!(
     include_str!("js/30_html.js"),
     include_str!("js/40_document.js"),
     include_str!("js/45_fetch.js"),
+    include_str!("js/46_streams.js"),
     include_str!("js/47_misc.js"),
     include_str!("js/50_window.js"),
 );
@@ -255,7 +256,6 @@ impl ScriptEngine {
         let Some(ex) = self.exports else { return };
         self.cx.st.borrow_mut().current_script = node;
         let r = self.rt.eval(source, url);
-        self.cx.st.borrow_mut().current_script = NO_NODE;
         if let Err(e) = r {
             self.report(url, &e);
             let msg = if e.name.is_empty() { e.message.clone() } else { format!("{}: {}", e.name, e.message) };
@@ -264,7 +264,10 @@ impl ScriptEngine {
             let _ = self.rt.call(ex.uncaught, Value::Undefined, &[m]);
             self.release();
         }
+        // The microtask checkpoint is part of running the script, so promise reactions queued
+        // by it still see `document.currentScript` (bundler runtimes read it after an `await`).
         self.drain_jobs();
+        self.cx.st.borrow_mut().current_script = NO_NODE;
     }
 
     /// Dispatch a user-input event at `target` (`NO_NODE` = the window). Returns false if a

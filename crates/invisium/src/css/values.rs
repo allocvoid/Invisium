@@ -163,15 +163,35 @@ fn oklab_to_srgb(l: f32, a: f32, b: f32) -> (f32, f32, f32) {
     let r = 4.076_741_7 * l3 - 3.307_711_6 * m3 + 0.230_969_94 * s3;
     let g = -1.268_438 * l3 + 2.609_757_4 * m3 - 0.341_319_38 * s3;
     let bl = -0.004_196_086_3 * l3 - 0.703_418_6 * m3 + 1.707_614_7 * s3;
-    let gamma = |x: f32| {
-        let x = x.clamp(0.0, 1.0);
-        if x <= 0.003_130_8 {
-            12.92 * x
-        } else {
-            1.055 * x.powf(1.0 / 2.4) - 0.055
-        }
-    };
-    (gamma(r), gamma(g), gamma(bl))
+    (srgb_gamma(r), srgb_gamma(g), srgb_gamma(bl))
+}
+
+/// Linear light to the sRGB transfer curve, clamped to the gamut.
+fn srgb_gamma(x: f32) -> f32 {
+    let x = x.clamp(0.0, 1.0);
+    if x <= 0.003_130_8 {
+        12.92 * x
+    } else {
+        1.055 * x.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// CIE Lab (D50 white, as CSS `lab()` defines it) to sRGB.
+fn lab_to_srgb(l: f32, a: f32, b: f32) -> (f32, f32, f32) {
+    const EPS: f32 = 216.0 / 24389.0;
+    const KAPPA: f32 = 24389.0 / 27.0;
+    let fy = (l + 16.0) / 116.0;
+    let fx = a / 500.0 + fy;
+    let fz = fy - b / 200.0;
+    let cube = |f: f32| if f * f * f > EPS { f * f * f } else { (116.0 * f - 16.0) / KAPPA };
+    let x = cube(fx) * 0.964_22;
+    let y = if l > KAPPA * EPS { fy * fy * fy } else { l / KAPPA };
+    let z = cube(fz) * 0.825_21;
+    // XYZ (D50) to linear sRGB, chromatic adaptation to D65 included (Bradford)
+    let r = 3.133_856_1 * x - 1.616_866_7 * y - 0.490_614_6 * z;
+    let g = -0.978_768_4 * x + 1.916_141_5 * y + 0.033_454 * z;
+    let bl = 0.071_945_3 * x - 0.228_991_4 * y + 1.405_242_7 * z;
+    (srgb_gamma(r), srgb_gamma(g), srgb_gamma(bl))
 }
 
 /// One numeric component of a colour function: number, percentage, or `none`.
@@ -259,6 +279,16 @@ fn parse_color_function(name: &str, args: &mut Cur) -> Option<Color> {
             let ch = if comps[1].1 { comps[1].0 / 100.0 * 0.4 } else { comps[1].0 };
             let h = comps[2].0.to_radians();
             oklab_to_srgb(l, ch * h.cos(), ch * h.sin())
+        }
+        // lightness 0..100 (a percentage is the same number); 100% of a/b is 125, of chroma 150
+        "lab" => {
+            let s = |(v, pct): (f32, bool)| if pct { v * 1.25 } else { v };
+            lab_to_srgb(comps[0].0.clamp(0.0, 100.0), s(comps[1]), s(comps[2]))
+        }
+        "lch" => {
+            let ch = if comps[1].1 { comps[1].0 * 1.5 } else { comps[1].0 }.max(0.0);
+            let h = comps[2].0.to_radians();
+            lab_to_srgb(comps[0].0.clamp(0.0, 100.0), ch * h.cos(), ch * h.sin())
         }
         _ => return None,
     };
@@ -1395,6 +1425,26 @@ mod tests {
         assert_eq!(color("RebeccaPurple"), Some(CssColor::Rgba(Color::hex(0x663399))));
         assert_eq!(color("currentColor"), Some(CssColor::Current));
         assert_eq!(color("notacolor"), None);
+    }
+
+    #[test]
+    fn lab_and_lch_colors() {
+        let near = |s: &str, want: (u8, u8, u8), tol: i32| {
+            let Some(CssColor::Rgba(c)) = color(s) else { panic!("{s} did not parse") };
+            let d = |a: u8, b: u8| (a as i32 - b as i32).abs();
+            assert!(d(c.r, want.0) <= tol && d(c.g, want.1) <= tol && d(c.b, want.2) <= tol && c.a == 255, "{s}: got {c:?}, want {want:?}");
+        };
+        near("lab(100% 0 0)", (255, 255, 255), 1);
+        near("lab(0 0 0)", (0, 0, 0), 1);
+        // reference values from the CSS Color specification (D50 white)
+        near("lab(54.2917% 80.8125 69.8851)", (255, 0, 0), 1);
+        near("lch(54.2917% 106.839 40.853)", (255, 0, 0), 1);
+        near("lab(46.2775% -47.5621 48.5837)", (0, 128, 0), 1);
+        // pairs a real stylesheet ships side by side: the hex is a gamut-mapped fallback for a
+        // colour slightly outside sRGB, so the clipped conversion is only close to it
+        near("lab(31.4218% 6.04931 -51.333)", (0x00, 0x4b, 0x97), 6);
+        near("lab(46.3624% 5.18757 -61.7046)", (0x02, 0x6f, 0xd7), 6);
+        assert_eq!(color("lab(50% 0 0 / 50%)").map(|c| matches!(c, CssColor::Rgba(c) if c.a == 128)), Some(true));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! HTML tokenizer: turns markup into start tags, end tags and decoded text.
-//! Comments are dropped at this level (nothing in the engine reads them), which also saves memory.
+//! Comments are dropped at this level unless scripting is on: nothing in the engine reads them,
+//! but scripts do (frameworks mark hydration boundaries with comments).
 
 use super::entities;
 use crate::atom::{a, Atom};
@@ -9,6 +10,8 @@ pub enum Token {
     Start { name: Atom, attrs: Vec<(Atom, String)>, self_closing: bool },
     End { name: Atom },
     Text(String),
+    /// Only produced when scripting is enabled.
+    Comment(String),
     Eof,
 }
 
@@ -139,12 +142,19 @@ impl<'a> Tokenizer<'a> {
                 let rest = &self.b[self.pos + 2..];
                 if rest.starts_with(b"--") {
                     let body = self.pos + 4;
-                    if self.b[body..].starts_with(b">") {
-                        self.pos = body + 1;
+                    let (end, next) = if self.b[body..].starts_with(b">") {
+                        (body, body + 1)
                     } else if self.b[body..].starts_with(b"->") {
-                        self.pos = body + 2;
+                        (body, body + 2)
                     } else {
-                        self.pos = self.find(body, b"-->").map_or(self.b.len(), |p| p + 3);
+                        match self.find(body, b"-->") {
+                            Some(p) => (p, p + 3),
+                            None => (self.b.len(), self.b.len()),
+                        }
+                    };
+                    self.pos = next;
+                    if self.scripting {
+                        return Token::Comment(self.src[body..end].to_owned());
                     }
                     continue;
                 }

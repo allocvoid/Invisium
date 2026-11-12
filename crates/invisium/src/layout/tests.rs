@@ -136,6 +136,22 @@ fn flex_row_and_column() {
 }
 
 #[test]
+fn flex_row_min_height_gives_align_items_room() {
+    // a full-height hero: auto height, min-height, content centred on the cross axis
+    let d = lay(
+        "<section id=hero><div id=c></div></section><section id=tall><div id=e></div></section>",
+        "section{display:flex;align-items:center} #hero{min-height:400px} #c{width:100px;height:100px}
+         #tall{min-height:50px;align-items:flex-end} #e{width:10px;height:80px}",
+        800.0,
+    );
+    assert_rect!(d, "hero", 0, 0, 800, 400);
+    assert_rect!(d, "c", 0, 150, 100, 100);
+    // content taller than the minimum: the minimum changes nothing
+    assert_rect!(d, "tall", 0, 400, 800, 80);
+    assert_rect!(d, "e", 0, 400, 10, 80);
+}
+
+#[test]
 fn flex_wrap_and_shrink() {
     let d = lay(
         "<div id=w><div id=a></div><div id=b></div><div id=c></div></div><div id=s><div id=s1></div><div id=s2></div></div>",

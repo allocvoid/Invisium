@@ -88,11 +88,8 @@ pub(crate) fn layout_flex(l: &mut Layout, id: BoxId, content_w: f32, definite_h:
 
     // A column container's main size is definite only if its height is; min-height can still
     // create free space to distribute.
-    let min_main_col = if row {
-        None
-    } else {
-        st.min_height.resolve_opt(cb_h).map(|m| if st.box_sizing == BoxSizing::BorderBox { (m - e.pb_h()).max(0.0) } else { m })
-    };
+    let min_h = st.min_height.resolve_opt(cb_h).map(|m| if st.box_sizing == BoxSizing::BorderBox { (m - e.pb_h()).max(0.0) } else { m });
+    let min_main_col = if row { None } else { min_h };
     let container_main: Option<f32> = if row { Some(content_w) } else { definite_h };
 
     let ids = in_flow_items(l, id);
@@ -332,6 +329,12 @@ pub(crate) fn layout_flex(l: &mut Layout, id: BoxId, content_w: f32, definite_h:
                     *v += add;
                 }
             }
+        }
+    } else if row && lines.len() == 1 {
+        // auto height: the single line is still at least as tall as `min-height`, so that
+        // `align-items` has that room to work with (a full-screen hero that centres its content)
+        if let Some(m) = min_h {
+            line_cross[0] = line_cross[0].max(m);
         }
     }
 

@@ -181,6 +181,12 @@ pub struct ComputedStyle {
     pub border_radius: [Size; 4],
     pub background_color: Color,
     pub background: Option<Rc<Vec<BgLayer>>>,
+    /// `background-clip: text`: the background shows only through this element's text.
+    pub bg_clip_text: bool,
+    /// Inherited: the background of the nearest ancestor-or-self with `background-clip: text`.
+    pub text_bg: Option<Rc<Vec<BgLayer>>>,
+    /// `-webkit-text-fill-color` (inherited); `None` paints text in `color`.
+    pub text_fill: Option<Color>,
     pub box_shadow: Option<Rc<[Shadow]>>,
     pub opacity: f32,
     pub z_index: Option<i32>,
@@ -309,6 +315,9 @@ impl ComputedStyle {
             grid_template_areas: None,
             grid_area: Atom::NONE,
             masked: false,
+            bg_clip_text: false,
+            text_bg: None,
+            text_fill: None,
             content: None,
             object_fit: ObjectFit::Fill,
             aspect_ratio: None,
@@ -332,6 +341,8 @@ impl ComputedStyle {
         let init = Self::initial();
         ComputedStyle {
             color: parent.color,
+            text_bg: parent.text_bg.clone(),
+            text_fill: parent.text_fill,
             font_size: parent.font_size,
             font_weight: parent.font_weight,
             italic: parent.italic,

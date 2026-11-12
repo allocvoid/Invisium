@@ -366,6 +366,14 @@ impl<'a> Builder<'a> {
         self.insert_text(t);
     }
 
+    /// A comment node, as the last child of the current node (of the document before `<html>`).
+    /// Comments never open elements and are never foster-parented.
+    fn comment(&mut self, text: String) {
+        let n = self.doc.create_comment(text);
+        let parent = if self.html == NO_NODE { DOCUMENT_NODE } else { self.top() };
+        self.doc.append_child(parent, n);
+    }
+
     fn start(&mut self, name: Atom, attrs: Vec<(Atom, String)>, self_closing: bool) {
         self.skip_newline = false;
         if self.body == NO_NODE {
@@ -762,6 +770,7 @@ impl<'a> Builder<'a> {
                     }
                 }
                 Token::Text(t) => self.text(&t),
+                Token::Comment(t) => self.comment(t),
                 Token::Start { name, attrs, self_closing } => self.start(name, attrs, self_closing),
                 Token::End { name } => self.end(name),
             }
