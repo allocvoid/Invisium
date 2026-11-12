@@ -21,10 +21,11 @@ security-sensitive browsing yet.
 |---|---|
 | Static sites (Wikipedia, Hacker News, documentation, blogs) | Render well |
 | JavaScript | Own engine: ES2022-level language, promises/async, generators, Proxy, RegExp, `Date`, typed arrays, `BigInt`, ES modules, a fixed-locale `Intl`. Off by default in the browser ("JavaScript (experimental)" setting). |
-| DOM | Events, selectors, forms, timers, `fetch`/XHR (CORS enforced in the network stack), custom elements, `URL`, storage (session only), `TextEncoder`, `crypto.getRandomValues` |
+| DOM | Events, selectors, forms, timers, `fetch`/XHR (CORS enforced in the network stack), custom elements, `URL`, storage (session only), `TextEncoder`, `crypto.getRandomValues`, `requestAnimationFrame`, `IntersectionObserver`, `ResizeObserver`, file inputs |
+| Animation and graphics | CSS transitions and `@keyframes` animations, `Element.animate`, 2D transforms, `position: sticky`, smooth scrolling, web fonts (WOFF2/TrueType/OpenType, kept separate per page), inline SVG with gradients and dashed strokes |
 | Script-heavy sites | Wikipedia and Hacker News run their scripts cleanly; DuckDuckGo's results page and YouTube's signed-out home page render; many others still fail |
 | Privacy | Tracker blocking, HTTPS-only mode, tracking-parameter stripping, partitioned in-memory cookies and cache, DNS-over-HTTPS, HTTP/SOCKS5 proxies, embedded Tor (optional feature), fixed generic user agent, `Intl`/`Date` always report `en-US`/UTC, public pages cannot reach local-network addresses |
-| Not there yet | Video and audio, canvas/WebGL, downloads, text selection, find-in-page, bookmarks/history, web fonts, HTTP/2, shadow DOM (pages that ship a polyfill work), incremental layout |
+| Not there yet | Video and audio, canvas/WebGL, embedded frames, downloads, text selection, find-in-page, bookmarks/history, HTTP/2, shadow DOM (pages that ship a polyfill work), incremental layout |
 
 | | |
 |---|---|
@@ -53,7 +54,8 @@ cargo run -p invisbrowser -- --screenshot <address> out.png --js --console
 ```
 
 `--dump` prints page statistics (nodes, boxes, memory, network), `--js` runs the page's scripts,
-`--console` prints what they log, `--eval "<javascript>"` runs one more script after load.
+`--console` prints what they log, `--eval "<javascript>"` runs one more script after load,
+`--scroll Y` looks further down the page (`--after MS` lets animations run that long first).
 
 ## Layout of the workspace
 
