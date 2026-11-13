@@ -7,12 +7,15 @@
 pub use invisium_draw as draw;
 pub use wgpu;
 
+mod gl;
 pub mod images;
 pub mod svg;
 mod xform;
 
 use draw::{GlyphSource, ImageId, Item, Layer, Rect, Rgba};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
+use std::rc::Rc;
 
 const SHADER: &str = include_str!("shader.wgsl");
 const INITIAL_ATLAS: u32 = 1024;
@@ -225,7 +228,10 @@ pub struct Renderer {
     atlas_glyphs: usize,
 
     images: HashMap<ImageId, ImageEntry>,
-    next_image: ImageId,
+    /// Shared with the WebGL device so context images never clash with `create_image` ids.
+    next_image: Rc<Cell<ImageId>>,
+    gl: OnceCell<Rc<RefCell<gl::Device>>>,
+    errors: std::sync::Arc<ErrorSink>,
 
     instances: Vec<Instance>,
     segments: Vec<Segment>,
@@ -247,6 +253,39 @@ pub struct Renderer {
     last_draws: u32,
 }
 
+/// Where wgpu errors outside any error scope go (wgpu's default handler panics).
+#[derive(Default)]
+pub(crate) struct ErrorSink {
+    /// Set while the WebGL device runs page commands.
+    pub gl_running: std::sync::atomic::AtomicBool,
+    /// Errors raised by page (WebGL) commands: quiet unless `INVIS_GL_DEBUG` is set.
+    pub gl_errors: std::sync::atomic::AtomicU64,
+    /// Errors raised by this crate's own work: a bug, always reported on stderr.
+    pub own_errors: std::sync::atomic::AtomicU64,
+}
+
+impl ErrorSink {
+    fn install(device: &wgpu::Device) -> std::sync::Arc<ErrorSink> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let sink = std::sync::Arc::new(ErrorSink::default());
+        let debug = std::env::var_os("INVIS_GL_DEBUG").is_some();
+        let s = sink.clone();
+        device.on_uncaptured_error(Box::new(move |e| {
+            let line = e.to_string().split_whitespace().collect::<Vec<_>>().join(" ");
+            if s.gl_running.load(Relaxed) {
+                s.gl_errors.fetch_add(1, Relaxed);
+                if debug {
+                    eprintln!("invisium-gl: uncaptured wgpu error: {line}");
+                }
+            } else {
+                s.own_errors.fetch_add(1, Relaxed);
+                eprintln!("[gfx] uncaptured wgpu error: {line}");
+            }
+        }));
+        sink
+    }
+}
+
 async fn pick_adapter(
     instance: &wgpu::Instance,
     opts: &GpuOptions,
@@ -265,12 +304,17 @@ async fn pick_adapter(
 }
 
 async fn open_device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu::Queue), String> {
-    let limits = wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits());
+    // The adapter's own limits: WebGL needs 8192 textures and 8 colour attachments where the
+    // hardware has them. Optional features are enabled when present, never required.
+    let limits = adapter.limits();
+    let optional = wgpu::Features::FLOAT32_FILTERABLE
+        | wgpu::Features::DEPTH32FLOAT_STENCIL8
+        | wgpu::Features::RG11B10UFLOAT_RENDERABLE;
     adapter
         .request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("invisium-gfx"),
-                required_features: wgpu::Features::empty(),
+                required_features: adapter.features() & optional,
                 required_limits: limits,
                 memory_hints: wgpu::MemoryHints::MemoryUsage,
             },
@@ -374,6 +418,7 @@ impl Renderer {
         opts: GpuOptions,
         info: &wgpu::AdapterInfo,
     ) -> Renderer {
+        let errors = ErrorSink::install(&device);
         let max_texture = device.limits().max_texture_dimension_2d;
         let max_atlas = opts.max_atlas_size.clamp(64, max_texture.max(64));
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -530,7 +575,9 @@ impl Renderer {
             glyph_cache: HashMap::new(),
             atlas_glyphs: 0,
             images: HashMap::new(),
-            next_image: 1,
+            next_image: Rc::new(Cell::new(1)),
+            gl: OnceCell::new(),
+            errors,
             instances: Vec::new(),
             segments: Vec::new(),
             stops: Vec::new(),
@@ -597,8 +644,8 @@ impl Renderer {
     /// Upload straight-alpha RGBA8 pixels (`rgba.len() == w*h*4`). The caller may drop its copy.
     /// Invalid input yields an id that draws nothing.
     pub fn create_image(&mut self, width: u32, height: u32, rgba: &[u8]) -> ImageId {
-        let id = self.next_image;
-        self.next_image = self.next_image.wrapping_add(1).max(1);
+        let id = self.next_image.get();
+        self.next_image.set(id.wrapping_add(1).max(1));
         let len = width as u64 * height as u64 * 4;
         if width == 0 || height == 0 || width > self.max_texture || height > self.max_texture || rgba.len() as u64 != len {
             return id;
@@ -647,6 +694,29 @@ impl Renderer {
 
     pub fn drop_image(&mut self, id: ImageId) {
         self.images.remove(&id);
+    }
+
+    /// The WebGL device sharing this renderer's GPU device and queue. Works for windowed and
+    /// headless renderers. Every call returns a handle to the same device.
+    pub fn gl_device(&self) -> Rc<RefCell<dyn draw::gl::GlDevice>> {
+        self.gl_inner().clone()
+    }
+
+    fn gl_inner(&self) -> &Rc<RefCell<gl::Device>> {
+        self.gl.get_or_init(|| {
+            Rc::new(RefCell::new(gl::Device::new(
+                self.device.clone(),
+                self.queue.clone(),
+                self.bgl1.clone(),
+                self.next_image.clone(),
+                self.errors.clone(),
+            )))
+        })
+    }
+
+    /// Whether `id` is a WebGL context image that has something to show.
+    fn gl_image_shown(&self, id: ImageId) -> bool {
+        self.gl.get().and_then(|g| g.try_borrow().ok()).is_some_and(|d| d.image_bind_group(id).is_some())
     }
 
     /// Draw one frame: clear to `clear`, then the layers in order.
@@ -936,7 +1006,7 @@ impl Renderer {
                 }
                 Item::Image { rect, image, radii, opacity, uv, repeat } => {
                     let op = if opacity.is_finite() { opacity.clamp(0.0, 1.0) } else { 0.0 };
-                    if op <= 0.0 || !self.images.contains_key(image) {
+                    if op <= 0.0 || !(self.images.contains_key(image) || self.gl_image_shown(*image)) {
                         continue;
                     }
                     let r = xf.rect(rect);
@@ -1258,11 +1328,18 @@ impl Renderer {
                 occlusion_query_set: None,
             });
             if n > 0 {
+                let gl = self.gl.get().cloned();
+                let gl = gl.as_ref().and_then(|g| g.try_borrow().ok());
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, bind0, &[]);
                 pass.set_vertex_buffer(0, ibuf.slice(..(n * INSTANCE_SIZE) as u64));
                 for seg in &self.segments {
-                    let bg = seg.image.and_then(|id| self.images.get(&id)).map(|e| &e.bind_group);
+                    let bg = seg.image.and_then(|id| {
+                        self.images
+                            .get(&id)
+                            .map(|e| &e.bind_group)
+                            .or_else(|| gl.as_ref().and_then(|g| g.image_bind_group(id)))
+                    });
                     pass.set_bind_group(1, bg.unwrap_or(&self.dummy_image), &[]);
                     pass.draw(0..4, seg.start..seg.end);
                     self.frame_draws += 1;
