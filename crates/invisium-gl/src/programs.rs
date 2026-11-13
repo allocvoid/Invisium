@@ -115,6 +115,7 @@ impl Context {
                 let webgl2 = self.is2();
                 let s = self.objs.shaders.get_mut(&h).ok_or(INVALID_VALUE)?;
                 let stage = if s.ty == VERTEX_SHADER { Stage::Vertex } else { Stage::Fragment };
+                let _t = invisium_draw::prof::span("glsl: compile");
                 match invisium_glsl::compile(stage, &s.source, webgl2) {
                     Ok(c) => {
                         s.compiled = Some(c);
@@ -242,6 +243,7 @@ impl Context {
         }
         let prog = &self.objs.programs[&h];
         let find = |ty: u32| prog.shaders.iter().filter_map(|s| self.objs.shaders.get(s)).find(|s| s.ty == ty);
+        let _t = invisium_draw::prof::span("glsl: link");
         let result = match (find(VERTEX_SHADER), find(FRAGMENT_SHADER)) {
             (Some(v), Some(f)) => match (&v.compiled, &f.compiled) {
                 (Some(vc), Some(fc)) => invisium_glsl::link(vc, fc, &prog.bindings),

@@ -391,6 +391,35 @@ pub enum Calc {
     Min(Vec<Calc>),
     Max(Vec<Calc>),
     Clamp(Box<Calc>, Box<Calc>, Box<Calc>),
+    /// `round(strategy, value, step)`.
+    Round(Rounding, Box<Calc>, Box<Calc>),
+}
+
+/// How `round()` picks a multiple of its step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rounding {
+    Nearest,
+    Up,
+    Down,
+    ToZero,
+}
+
+impl Rounding {
+    /// `value` as a multiple of `step` (a step of zero, or anything not finite, leaves the
+    /// value as it is: a page must not be able to make a length that is not a number).
+    pub fn apply(self, value: f32, step: f32) -> f32 {
+        let step = step.abs();
+        if !value.is_finite() || !step.is_finite() || step == 0.0 {
+            return value;
+        }
+        let q = value / step;
+        step * match self {
+            Rounding::Nearest => q.round(),
+            Rounding::Up => q.ceil(),
+            Rounding::Down => q.floor(),
+            Rounding::ToZero => q.trunc(),
+        }
+    }
 }
 
 impl Len {
@@ -543,6 +572,35 @@ fn parse_math_function(name: &str, inner: &mut Cur) -> Option<Calc> {
             let hi = vals[2].clone().unwrap_or(Calc::Leaf(Len::Px(1.0e9)));
             Some(Calc::Clamp(Box::new(lo), Box::new(mid), Box::new(hi)))
         }
+        "round" => {
+            // round( <strategy>? , value , step? ): the step is 1 when left out
+            let mut parts = split_commas(inner.rest());
+            let mut mode = Rounding::Nearest;
+            if let Some(id) = parts.first().and_then(|p| Cur::new(p).ident()) {
+                mode = match id.to_ascii_lowercase().as_str() {
+                    "nearest" => Rounding::Nearest,
+                    "up" => Rounding::Up,
+                    "down" => Rounding::Down,
+                    "to-zero" => Rounding::ToZero,
+                    _ => return None,
+                };
+                parts.remove(0);
+            }
+            if parts.is_empty() || parts.len() > 2 {
+                return None;
+            }
+            let mut vals = Vec::with_capacity(2);
+            for part in parts {
+                let mut pc = Cur::new(part);
+                let v = parse_calc_sum(&mut pc)?;
+                if !pc.at_end() {
+                    return None;
+                }
+                vals.push(v);
+            }
+            let step = if vals.len() == 2 { vals.pop()? } else { Calc::Num(1.0) };
+            Some(Calc::Round(mode, Box::new(vals.pop()?), Box::new(step)))
+        }
         _ => None,
     }
 }
@@ -550,7 +608,7 @@ fn parse_math_function(name: &str, inner: &mut Cur) -> Option<Calc> {
 fn is_math_fn(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "calc" | "-webkit-calc" | "-moz-calc" | "min" | "max" | "clamp"
+        "calc" | "-webkit-calc" | "-moz-calc" | "min" | "max" | "clamp" | "round"
     )
 }
 
@@ -611,6 +669,7 @@ fn eval_number(c: &Calc) -> Option<f32> {
         Calc::Min(v) => v.iter().map(eval_number).collect::<Option<Vec<_>>>()?.into_iter().fold(f32::INFINITY, f32::min),
         Calc::Max(v) => v.iter().map(eval_number).collect::<Option<Vec<_>>>()?.into_iter().fold(f32::NEG_INFINITY, f32::max),
         Calc::Clamp(lo, mid, hi) => eval_number(mid)?.max(eval_number(lo)?).min(eval_number(hi)?),
+        Calc::Round(mode, v, step) => mode.apply(eval_number(v)?, eval_number(step)?),
     })
 }
 
@@ -862,6 +921,7 @@ pub enum SizeCalc {
     Min(Vec<SizeCalc>),
     Max(Vec<SizeCalc>),
     Clamp(Box<SizeCalc>, Box<SizeCalc>, Box<SizeCalc>),
+    Round(Rounding, Box<SizeCalc>, Box<SizeCalc>),
 }
 
 impl SizeCalc {
@@ -875,6 +935,7 @@ impl SizeCalc {
             SizeCalc::Min(v) => v.iter().map(|x| x.eval(basis)).fold(f32::INFINITY, f32::min),
             SizeCalc::Max(v) => v.iter().map(|x| x.eval(basis)).fold(f32::NEG_INFINITY, f32::max),
             SizeCalc::Clamp(lo, mid, hi) => mid.eval(basis).max(lo.eval(basis)).min(hi.eval(basis)),
+            SizeCalc::Round(mode, v, step) => mode.apply(v.eval(basis), step.eval(basis)),
         }
     }
     fn has_pct(&self) -> bool {
@@ -885,6 +946,7 @@ impl SizeCalc {
             SizeCalc::Scale(a, _) => a.has_pct(),
             SizeCalc::Min(v) | SizeCalc::Max(v) => v.iter().any(|x| x.has_pct()),
             SizeCalc::Clamp(a, b, c) => a.has_pct() || b.has_pct() || c.has_pct(),
+            SizeCalc::Round(_, a, b) => a.has_pct() || b.has_pct(),
         }
     }
 }
@@ -1014,6 +1076,7 @@ fn calc_to_size(c: &Calc, ctx: &LenCtx) -> SizeCalc {
             Box::new(calc_to_size(mid, ctx)),
             Box::new(calc_to_size(hi, ctx)),
         ),
+        Calc::Round(mode, v, step) => SizeCalc::Round(*mode, Box::new(calc_to_size(v, ctx)), Box::new(calc_to_size(step, ctx))),
     }
 }
 
@@ -1377,6 +1440,8 @@ pub enum TrackItem {
     Repeat(u32, Vec<Track>),
     /// repeat(auto-fill | auto-fit, ...)
     AutoRepeat { fit: bool, tracks: Vec<Track> },
+    /// `[a b]`: names of the grid line at this place in the list (no track of its own).
+    Names(Vec<Atom>),
 }
 
 fn parse_breadth(c: &mut Cur) -> Option<TrackBreadth> {
@@ -1445,11 +1510,32 @@ fn skip_line_names(c: &mut Cur) {
     }
 }
 
+/// Line names in brackets at the cursor (`[a b] [c]`), if there are any.
+fn take_line_names(c: &mut Cur) -> Vec<Atom> {
+    let mut names = Vec::new();
+    loop {
+        c.skip_ws();
+        if !matches!(c.peek(), Some(Tok::LBracket)) {
+            return names;
+        }
+        while let Some(t) = c.next() {
+            match t {
+                Tok::RBracket => break,
+                Tok::Ident(i) if names.len() < 64 => names.push(Atom::new(i)),
+                _ => {}
+            }
+        }
+    }
+}
+
 pub fn parse_track_list(t: &[Tok]) -> Option<Vec<TrackItem>> {
     let mut c = Cur::new(t);
     let mut out = Vec::new();
     loop {
-        skip_line_names(&mut c);
+        let names = take_line_names(&mut c);
+        if !names.is_empty() {
+            out.push(TrackItem::Names(names));
+        }
         if c.at_end() {
             break;
         }
@@ -1487,7 +1573,8 @@ pub fn parse_track_list(t: &[Tok]) -> Option<Vec<TrackItem>> {
             _ => out.push(TrackItem::One(parse_track(&mut c)?)),
         }
     }
-    if out.is_empty() {
+    // names alone are not a track list
+    if out.iter().all(|i| matches!(i, TrackItem::Names(_))) {
         None
     } else {
         Some(out)
@@ -1499,12 +1586,15 @@ pub enum GridLine {
     Auto,
     Line(i32),
     Span(u32),
+    /// The `n`-th line with this name in the container's template (from the end if negative).
+    Named(Atom, i32),
 }
 
 pub fn parse_grid_line(c: &mut Cur) -> Option<GridLine> {
     c.skip_ws();
     let mut span = false;
     let mut num: Option<i32> = None;
+    let mut name: Option<Atom> = None;
     let mut any = false;
     loop {
         c.skip_ws();
@@ -1521,8 +1611,9 @@ pub fn parse_grid_line(c: &mut Cur) -> Option<GridLine> {
                 num = Some(*n as i32);
                 c.next();
             }
-            Some(Tok::Ident(_)) => {
-                c.next(); // named line: not supported, treated as auto
+            Some(Tok::Ident(i)) => {
+                name = Some(Atom::new(i));
+                c.next();
             }
             _ => break,
         }
@@ -1531,9 +1622,11 @@ pub fn parse_grid_line(c: &mut Cur) -> Option<GridLine> {
     if !any {
         return None;
     }
-    Some(match (span, num) {
-        (true, n) => GridLine::Span(n.unwrap_or(1).max(1) as u32),
-        (false, Some(n)) if n != 0 => GridLine::Line(n),
+    Some(match (span, num, name) {
+        // (a span counted in named lines is taken as a span in plain lines)
+        (true, n, _) => GridLine::Span(n.unwrap_or(1).max(1) as u32),
+        (false, n, Some(name)) => GridLine::Named(name, n.filter(|n| *n != 0).unwrap_or(1)),
+        (false, Some(n), None) if n != 0 => GridLine::Line(n),
         _ => GridLine::Auto,
     })
 }

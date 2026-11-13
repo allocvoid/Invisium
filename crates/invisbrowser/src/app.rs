@@ -37,6 +37,10 @@ pub struct Tab {
     pub blocked: u32,
     pub zoom: f32,
     handles: Vec<RequestHandle>,
+    /// The fetch of the document this tab is navigating to, until its answer is in.
+    doc_handle: Option<RequestHandle>,
+    /// That navigation added an entry to `history` (a reload, back or forward does not).
+    nav_pushed: bool,
     doc_pending: bool,
     outstanding: u32,
     /// When this tab's scripts last ran while it was in the background.
@@ -46,6 +50,56 @@ pub struct Tab {
 impl Tab {
     pub fn loading(&self) -> bool {
         self.doc_pending || self.incoming.is_some() || self.outstanding > 0
+    }
+}
+
+/// A file being saved, or one that was.
+pub struct Download {
+    pub id: u64,
+    pub name: String,
+    pub path: std::path::PathBuf,
+    pub received: u64,
+    /// The size the server announced, if it did.
+    pub total: Option<u64>,
+    pub state: DownloadState,
+    /// The request, while it runs. It is taken out of the tab that started it, so nothing
+    /// the tab does next cancels the transfer; nothing cancels it from here yet either.
+    #[allow(dead_code)]
+    handle: Option<RequestHandle>,
+}
+
+/// How long the word that a download finished stays in the status line.
+const NOTICE_STAYS: std::time::Duration = std::time::Duration::from_secs(8);
+
+pub enum DownloadState {
+    Running,
+    Done,
+    Failed(String),
+}
+
+fn megabytes(n: u64) -> String {
+    if n < 1024 * 1024 {
+        format!("{} KB", n.div_ceil(1024))
+    } else {
+        format!("{:.1} MB", n as f64 / (1024.0 * 1024.0))
+    }
+}
+
+impl Download {
+    /// "3.2 MB of 10.0 MB", or just what has arrived when the size is not known.
+    fn progress(&self) -> String {
+        match self.total.filter(|t| *t >= self.received) {
+            Some(t) => format!("{} of {}", megabytes(self.received), megabytes(t)),
+            None => megabytes(self.received),
+        }
+    }
+
+    fn describe(&self) -> String {
+        match &self.state {
+            DownloadState::Running => format!("downloading: {}", self.progress()),
+            DownloadState::Done => format!("saved ({}) as {}", megabytes(self.received), self.path.display()),
+            DownloadState::Failed(why) => format!("failed: {why}"),
+        }
     }
 }
 
@@ -66,6 +120,11 @@ pub struct Browser {
     pub dropped_images: Vec<ImageId>,
     pub gpu_info: String,
     pub status: Option<String>,
+    /// The latest word on a download, shown where the status is when nothing is hovered,
+    /// and until when (`None`: until there is other news).
+    pub notice: Option<(String, Option<Instant>)>,
+    /// The files downloaded since the browser started.
+    pub downloads: Vec<Download>,
     next_tab: u64,
     next_nav: u64,
     started: Instant,
@@ -115,6 +174,8 @@ impl Browser {
             gl_device: None,
             gpu_info: String::new(),
             status: None,
+            notice: None,
+            downloads: Vec::new(),
             next_tab: 1,
             next_nav: 1,
             started: Instant::now(),
@@ -145,6 +206,8 @@ impl Browser {
             blocked: 0,
             zoom: 1.0,
             handles: Vec::new(),
+            doc_handle: None,
+            nav_pushed: false,
             doc_pending: false,
             outstanding: 0,
             last_script_run: 0.0,
@@ -158,7 +221,7 @@ impl Browser {
     pub fn close_tab(&mut self, id: u64) -> bool {
         let Some(idx) = self.index_of(id) else { return true };
         let tab = self.tabs.remove(idx);
-        for h in &tab.handles {
+        for h in tab.handles.iter().chain(tab.doc_handle.iter()) {
             h.cancel();
         }
         for lp in tab.page.iter().chain(tab.incoming.iter().map(|i| &i.0)) {
@@ -190,7 +253,7 @@ impl Browser {
 
     fn cancel_loads(&mut self, idx: usize) {
         let tab = &mut self.tabs[idx];
-        for h in tab.handles.drain(..) {
+        for h in tab.handles.drain(..).chain(tab.doc_handle.take()) {
             h.cancel();
         }
         tab.outstanding = 0;
@@ -234,10 +297,12 @@ impl Browser {
         }
 
         let tab = &mut self.tabs[idx];
+        tab.nav_pushed = false;
         if push {
             // settings actions replace the current entry instead of piling up history
             let replace = settings_changed && tab.history.get(tab.pos).map_or(false, |h| h == &url);
             if !replace {
+                tab.nav_pushed = true;
                 tab.history.truncate(tab.pos + if tab.history.is_empty() { 0 } else { 1 });
                 tab.history.push(url.clone());
                 tab.pos = tab.history.len() - 1;
@@ -252,9 +317,9 @@ impl Browser {
         match Url::parse(&url) {
             Ok(parsed) => {
                 let referrer = None; // typed and link navigations start clean; the policy layer adds what is allowed
-                let h = loader::fetch_document(&self.net, &self.sink, self.tabs[idx].id, nav, parsed, body, referrer);
+                let h = loader::fetch_document(&self.net, &self.sink, self.tabs[idx].id, nav, parsed, body, referrer, true);
                 let tab = &mut self.tabs[idx];
-                tab.handles.push(h);
+                tab.doc_handle = Some(h);
                 tab.doc_pending = true;
             }
             Err(e) => {
@@ -396,6 +461,58 @@ impl Browser {
     }
 
     /// Apply one network result. `upload` turns decoded pixels into a GPU image.
+    /// News about a download (see `loader::fetch_document`).
+    fn on_download(&mut self, tab: u64, nav: u64, id: u64, update: loader::DownloadUpdate) {
+        use loader::DownloadUpdate as U;
+        match update {
+            U::Started { name, path, total } => {
+                // The navigation ends here: the tab stays on the page it shows, and the
+                // transfer goes on by itself, whatever the tab does next.
+                let mut handle = None;
+                if let Some(idx) = self.index_of(tab).filter(|&i| self.tabs[i].nav == nav) {
+                    let t = &mut self.tabs[idx];
+                    handle = t.doc_handle.take();
+                    t.doc_pending = false;
+                    // the address of the file is not a page of this tab's history: the entry
+                    // this navigation added goes again (a reload, back or forward added none)
+                    if std::mem::take(&mut t.nav_pushed) && t.history.len() > 1 && t.pos + 1 == t.history.len() {
+                        t.history.pop();
+                        t.pos -= 1;
+                    }
+                    match t.page.as_ref().map(|lp| lp.page.url.clone()) {
+                        Some(shown) => t.url = shown,
+                        // a tab opened just for this file shows the list instead of nothing
+                        None => self.navigate(idx, "invis://downloads", false, None),
+                    }
+                }
+                self.notice = Some((format!("Downloading {name}"), None));
+                self.downloads.push(Download { id, name, path, received: 0, total, state: DownloadState::Running, handle });
+            }
+            U::Progress(n) => {
+                if let Some(d) = self.downloads.iter_mut().find(|d| d.id == id) {
+                    d.received = n;
+                    self.notice = Some((format!("Downloading {} - {}", d.name, d.progress()), None));
+                }
+            }
+            U::Finished(result) => {
+                if let Some(d) = self.downloads.iter_mut().find(|d| d.id == id) {
+                    d.handle = None;
+                    match result {
+                        Ok(()) => {
+                            d.state = DownloadState::Done;
+                            let folder = d.path.parent().map_or_else(String::new, |p| p.display().to_string());
+                            self.notice = Some((format!("Downloaded {} to {folder}", d.name), Some(Instant::now() + NOTICE_STAYS)));
+                        }
+                        Err(e) => {
+                            self.notice = Some((format!("Download of {} failed", d.name), Some(Instant::now() + NOTICE_STAYS)));
+                            d.state = DownloadState::Failed(format!("{e:?}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub fn on_net(&mut self, ev: NetEvent, upload: &mut dyn FnMut(u32, u32, &[u8]) -> ImageId) {
         match ev {
             NetEvent::Document { tab, nav, result } => {
@@ -404,6 +521,7 @@ impl Browser {
                     return;
                 }
                 self.tabs[idx].doc_pending = false;
+                self.tabs[idx].doc_handle = None;
                 match result {
                     Ok(resp) => {
                         let url = resp.url.as_str().to_string();
@@ -467,6 +585,18 @@ impl Browser {
                 }
                 let now = self.now_ms();
                 self.run_scripts(idx, now, true);
+            }
+            NetEvent::Download { tab, nav, id, update } => self.on_download(tab, nav, id, update),
+            NetEvent::Socket { tab, nav, page: pid, id, event } => {
+                let Some(idx) = self.index_of(tab) else { return };
+                if let Some(page) = self.page_in(idx, nav, pid) {
+                    page.socket_event(id, loader::socket_event(event));
+                }
+                let now = self.now_ms();
+                self.run_scripts(idx, now, true);
+                // a handler may have opened another socket (a reconnect): start it now, not
+                // whenever something else next makes the page ask for resources
+                self.pump(idx);
             }
             NetEvent::Font { tab, nav, page: pid, req, result } => {
                 let Some(idx) = self.index_of(tab) else { return };
@@ -680,7 +810,7 @@ impl Browser {
             can_forward: active.map_or(false, |t| t.pos + 1 < t.history.len()),
             tor,
             toggles: self.settings.toggles(),
-            status: self.status.clone(),
+            status: self.status.clone().or_else(|| self.notice.as_ref().filter(|n| n.1.map_or(true, |until| Instant::now() < until)).map(|n| n.0.clone())),
             progress: active.filter(|t| t.loading()).map(|t| if t.doc_pending { 0.2 } else if t.incoming.is_some() { 0.6 } else { 0.85 }),
             zoom_percent: active.map_or(100, |t| (t.zoom * 100.0).round() as u32),
         }
@@ -722,6 +852,7 @@ impl Browser {
             ("Requests sent".to_string(), n.requests.to_string()),
             ("Open tabs".to_string(), self.tabs.len().to_string()),
         ];
-        Info { rows, stats }
+        let downloads = self.downloads.iter().rev().map(|d| (d.name.clone(), d.describe())).collect();
+        Info { rows, stats, downloads }
     }
 }

@@ -152,6 +152,22 @@ pub fn about(rows: &[(String, String)]) -> String {
     document("About", "about", &b)
 }
 
+/// The files downloaded since the browser started: (file name, what became of it).
+pub fn downloads(rows: &[(String, String)], folder: &str) -> String {
+    let mut b = String::from("<h1>Downloads</h1>");
+    if rows.is_empty() {
+        b.push_str("<div class=\"card\"><p>Nothing has been downloaded since the browser started.</p></div>");
+    } else {
+        b.push_str("<div class=\"card\"><table class=\"about\">");
+        for (k, v) in rows {
+            let _ = write!(b, "<tr><td>{}</td><td>{}</td></tr>", esc(k), esc(v));
+        }
+        b.push_str("</table></div>");
+    }
+    let _ = write!(b, "<p>Files are saved in {}. Reload this page to see progress.</p>", esc(folder));
+    document("Downloads", "downloads", &b)
+}
+
 /// `retry_url` becomes an `invis://retry?url=` link, so the page itself never links off-device.
 pub fn error(title: &str, detail: &str, url: &str, retry_url: Option<&str>) -> String {
     let mut b = format!("<div class=\"error\"><h1>{}</h1><p>{}</p><p><span class=\"error-url\">{}</span></p>", esc(title), esc(detail), esc(url));

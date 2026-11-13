@@ -57,6 +57,111 @@ fn n_rect(rt: &mut Runtime, cx: &Cx, args: &[Value]) -> NRes {
     Ok(nums(rt, &r))
 }
 
+const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Forgiving base64 decoding, as `atob` wants it: ASCII whitespace is skipped, padding is
+/// optional, anything else that is not in the alphabet is an error.
+pub(crate) fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    let mut vals: Vec<u8> = Vec::with_capacity(text.len());
+    for b in text.bytes() {
+        match b {
+            b' ' | 0x09 | 0x0A | 0x0C | 0x0D => {}
+            b'A'..=b'Z' => vals.push(b - b'A'),
+            b'a'..=b'z' => vals.push(b - b'a' + 26),
+            b'0'..=b'9' => vals.push(b - b'0' + 52),
+            b'+' => vals.push(62),
+            b'/' => vals.push(63),
+            b'=' => vals.push(64),
+            _ => return None,
+        }
+    }
+    // one or two `=` may end a text whose length is a multiple of four; nowhere else
+    if vals.len() % 4 == 0 {
+        for _ in 0..2 {
+            if vals.last() == Some(&64) {
+                vals.pop();
+            }
+        }
+    }
+    if vals.len() % 4 == 1 || vals.contains(&64) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(vals.len() / 4 * 3 + 2);
+    for chunk in vals.chunks(4) {
+        let mut acc = 0u32;
+        for (i, &v) in chunk.iter().enumerate() {
+            acc |= (v as u32) << (18 - 6 * i);
+        }
+        out.push((acc >> 16) as u8);
+        if chunk.len() > 2 {
+            out.push((acc >> 8) as u8);
+        }
+        if chunk.len() > 3 {
+            out.push(acc as u8);
+        }
+    }
+    Some(out)
+}
+
+pub(crate) fn base64_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let acc = (chunk[0] as u32) << 16 | (*chunk.get(1).unwrap_or(&0) as u32) << 8 | *chunk.get(2).unwrap_or(&0) as u32;
+        out.push(BASE64[(acc >> 18) as usize & 63] as char);
+        out.push(BASE64[(acc >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { BASE64[(acc >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { BASE64[acc as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+/// atob(text) -> the decoded bytes as a string of code units 0..255, or null if the text is
+/// not base64. (In script this took a second for a few megabytes; pages embed whole models.)
+fn n_atob(rt: &mut Runtime, _cx: &Cx, args: &[Value]) -> NRes {
+    let text = rt.to_string_lossy(arg(args, 0));
+    Ok(match base64_decode(&text) {
+        Some(bytes) => {
+            let s: String = bytes.iter().map(|&b| b as char).collect();
+            rt.string(&s)
+        }
+        None => Value::Null,
+    })
+}
+
+/// btoa(text) -> base64 of a string of code units 0..255, or null if a unit is larger.
+fn n_btoa(rt: &mut Runtime, _cx: &Cx, args: &[Value]) -> NRes {
+    let text = rt.to_string_lossy(arg(args, 0));
+    let mut bytes = Vec::with_capacity(text.len());
+    for c in text.chars() {
+        match u8::try_from(c as u32) {
+            Ok(b) => bytes.push(b),
+            Err(_) => return Ok(Value::Null),
+        }
+    }
+    Ok(rt.string(&base64_encode(&bytes)))
+}
+
+/// elementAt(x, y) -> the element drawn at a point of the viewport, or null
+fn n_element_at(rt: &mut Runtime, cx: &Cx, args: &[Value]) -> NRes {
+    let x = rt.to_number(arg(args, 0)) as f32;
+    let y = rt.to_number(arg(args, 1)) as f32;
+    let n = {
+        let mut st = cx.st.borrow_mut();
+        ensure_layout(&mut st);
+        let (vw, vh) = st.page.viewport;
+        if x.is_finite() && y.is_finite() && x >= 0.0 && y >= 0.0 && x < vw && y < vh {
+            // inside the viewport there is always something: the root element at least
+            match st.page.element_at(x, y) {
+                NO_NODE | DOCUMENT_NODE => st.page.doc.document_element(),
+                e => e,
+            }
+        } else {
+            NO_NODE
+        }
+    };
+    Ok(wrap(rt, cx, n))
+}
+
 /// The node whose box is the offset parent of `n` (nearest positioned ancestor, else `<body>`).
 fn offset_parent(st: &mut HostState, n: NodeId) -> NodeId {
     let mut p = st.page.doc.parent(n);
@@ -116,6 +221,17 @@ fn n_viewport(rt: &mut Runtime, cx: &Cx, _args: &[Value]) -> NRes {
         let mut st = cx.st.borrow_mut();
         ensure_layout(&mut st);
         [st.page.viewport.0, st.page.viewport.1, st.page.scroll.0, st.page.scroll.1, st.page.tree.width, st.page.tree.height]
+    };
+    Ok(nums(rt, &v))
+}
+
+/// viewNow() -> [width, height, scrollX, scrollY] as they are, without bringing layout up to
+/// date first: the size of the viewport never depends on layout, and an input event carries
+/// the scroll position of the moment it happened.
+fn n_view_now(rt: &mut Runtime, cx: &Cx, _args: &[Value]) -> NRes {
+    let v = {
+        let st = cx.st.borrow();
+        [st.page.viewport.0, st.page.viewport.1, st.page.scroll.0, st.page.scroll.1]
     };
     Ok(nums(rt, &v))
 }
@@ -690,9 +806,13 @@ pub(crate) fn install(rt: &mut Runtime, n: Value, cx: &Rc<Cx>) {
         ("decode", 2, n_decode),
         ("random", 1, n_random),
         ("rect", 1, n_rect),
+        ("elementAt", 2, n_element_at),
+        ("atob", 1, n_atob),
+        ("btoa", 1, n_btoa),
         ("offsetParent", 1, n_offset_parent),
         ("metrics", 1, n_metrics),
         ("viewport", 0, n_viewport),
+        ("viewNow", 0, n_view_now),
         ("scrollTo", 2, n_scroll_to),
         ("computed", 2, n_computed),
         ("focus", 1, n_focus),

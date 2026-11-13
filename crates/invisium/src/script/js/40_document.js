@@ -174,8 +174,12 @@ class Document extends Node {
     for (var i = 0; i < all.length; i++) if (n.getAttr(all[i], 'name') === name) out.push(all[i]);
     return nodeList(out);
   }
-  elementFromPoint() { return null; }
-  elementsFromPoint() { return []; }
+  elementFromPoint(x, y) { return n.elementAt(+x || 0, +y || 0); }
+  elementsFromPoint(x, y) {
+    var out = [];
+    for (var e = n.elementAt(+x || 0, +y || 0); e && e.nodeType === 1; e = e.parentNode) out.push(e);
+    return out;
+  }
   getSelection() { return SELECTION; }
   hasFocus() { return true; }
   execCommand() { return false; }

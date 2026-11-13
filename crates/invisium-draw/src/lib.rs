@@ -15,6 +15,7 @@
 
 /// The WebGL command contract between the GL state machine and the GPU side.
 pub mod gl;
+pub mod prof;
 
 /// Axis-aligned rectangle: origin at the top-left, y grows downward.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]

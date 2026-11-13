@@ -120,7 +120,10 @@ impl Ctx {
                     self.bind_groups.clear();
                 }
             }
-            Cmd::ProgramCreate { id, desc } => self.program_create(g, id, *desc),
+            Cmd::ProgramCreate { id, desc } => {
+                let _t = invisium_draw::prof::span("gpu: shader modules");
+                self.program_create(g, id, *desc)
+            }
             Cmd::ProgramDelete { id } => {
                 self.programs.remove(&id);
             }
@@ -241,6 +244,7 @@ impl GlDevice for Device {
     fn run(&mut self, ctx: u32, cmds: &mut Vec<Cmd>) {
         let list = std::mem::take(cmds);
         let Some(c) = self.ctxs.get_mut(&ctx) else { return };
+        let _t = invisium_draw::prof::span("gpu: run commands");
         let g = &mut self.gpu;
         g.errors.gl_running.store(true, Ordering::Relaxed);
         g.dev.push_error_scope(wgpu::ErrorFilter::OutOfMemory);

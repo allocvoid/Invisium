@@ -33,7 +33,7 @@ fn arg_value<T: std::str::FromStr>(args: &[String], name: &str, default: T) -> T
 /// Which navigation a network result belongs to.
 fn event_nav(e: &NetEvent) -> u64 {
     match e {
-        NetEvent::Document { nav, .. } | NetEvent::Sheet { nav, .. } | NetEvent::Script { nav, .. } | NetEvent::Fetch { nav, .. } | NetEvent::Image { nav, .. } | NetEvent::Font { nav, .. } | NetEvent::Frame { nav, .. } => *nav,
+        NetEvent::Document { nav, .. } | NetEvent::Sheet { nav, .. } | NetEvent::Script { nav, .. } | NetEvent::Fetch { nav, .. } | NetEvent::Image { nav, .. } | NetEvent::Font { nav, .. } | NetEvent::Frame { nav, .. } | NetEvent::Socket { nav, .. } | NetEvent::Download { nav, .. } => *nav,
     }
 }
 
@@ -75,7 +75,7 @@ fn load_document(
                 return Err(1);
             }
         };
-        let _h = loader::fetch_document(net, sink, 1, nav, parsed, body.take(), None);
+        let _h = loader::fetch_document(net, sink, 1, nav, parsed, body.take(), None, false);
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             match rx.recv_timeout(left) {
@@ -252,6 +252,12 @@ pub fn run(args: &[String]) -> i32 {
                         std::thread::sleep(d);
                         continue;
                     }
+                    // an open socket may still bring news: listen for it while settle time is left
+                    _ if page.sockets() > 0 && !settle_left.is_zero() && !wait.is_zero() => {
+                        let step = settle_left.min(Duration::from_millis(50)).min(wait);
+                        settle_left -= step;
+                        wait = step;
+                    }
                     _ => break,
                 }
             }
@@ -333,6 +339,10 @@ pub fn run(args: &[String]) -> i32 {
                 }
                 page.fetch_done(id, loader::fetch_result(result));
             }
+            Ok(NetEvent::Socket { page: pid, id, event, .. }) => {
+                let Some(page) = page.page_by_id(pid) else { continue };
+                page.socket_event(id, loader::socket_event(event));
+            }
             Ok(NetEvent::Image { page: pid, url, result, .. }) => {
                 let Some(page) = page.page_by_id(pid) else { continue };
                 outstanding = outstanding.saturating_sub(1);
@@ -378,7 +388,8 @@ pub fn run(args: &[String]) -> i32 {
                     }
                 }
             }
-            Ok(NetEvent::Document { .. }) => {}
+            // not asked for here (see `load_document`): nothing is ever saved in screenshot mode
+            Ok(NetEvent::Document { .. }) | Ok(NetEvent::Download { .. }) => {}
             Err(mpsc::RecvTimeoutError::Timeout) => {} // a timer is due, or the deadline passed (checked above)
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
@@ -415,6 +426,34 @@ pub fn run(args: &[String]) -> i32 {
             page.update(&mut fonts.borrow_mut());
         }
     }
+    // `--pointer "x,y x,y d x,y u w300"`: move the pointer along these points of the viewport,
+    // with `d`/`u` for the primary button going down and up and `wN` for a pause of N ms.
+    // Frames run for 50 ms after every step, as they would while a user moves the mouse.
+    if let Some(path) = args.iter().position(|a| a == "--pointer").and_then(|i| args.get(i + 1)) {
+        let mut at = (0.0f32, 0.0f32);
+        for step in path.split_whitespace() {
+            let mut pause = 50;
+            if step == "d" {
+                page.press(at.0, at.1, invisium::page::PointerButton::Primary);
+            } else if step == "u" {
+                page.release(at.0, at.1, invisium::page::PointerButton::Primary, false);
+            } else if let Some(ms) = step.strip_prefix('w').and_then(|n| n.parse::<u64>().ok()) {
+                pause = ms;
+            } else if let Some((x, y)) = step.split_once(',') {
+                at = (x.parse().unwrap_or(0.0), y.parse().unwrap_or(0.0));
+                page.mouse_move(at.0, at.1);
+            }
+            let until = Instant::now() + Duration::from_millis(pause);
+            while Instant::now() < until {
+                page.pump(now_ms(Instant::now()));
+                page.frame(now_ms(Instant::now()));
+                page.update(&mut fonts.borrow_mut());
+                std::thread::sleep(Duration::from_millis(16));
+            }
+        }
+        console.extend(page.take_console());
+        page.update(&mut fonts.borrow_mut());
+    }
     // the diagnostic script sees the page as it will be drawn (after any scrolling)
     if let (true, Some(code)) = (scripting, eval.as_ref()) {
         page.update(&mut fonts.borrow_mut());
@@ -448,6 +487,16 @@ pub fn run(args: &[String]) -> i32 {
     if let Err(e) = renderer.save_png(std::path::Path::new(out)) {
         eprintln!("could not write {out}: {e}");
         return 1;
+    }
+    if invisium::draw::prof::enabled() {
+        eprintln!("profile (main thread, whole run):
+{}", invisium::draw::prof::report());
+        let rows = page.take_script_profile();
+        let total: f64 = rows.iter().map(|r| r.1).sum();
+        eprintln!("script functions by their own time ({total:.0} ms sampled):");
+        for (what, ms) in rows.iter().take(60) {
+            eprintln!("  {ms:>8.1} ms  {what}");
+        }
     }
     if dump {
         let m = page.memory();

@@ -635,6 +635,7 @@ fn calc_number(c: &Calc) -> Option<f32> {
         Calc::Min(list) => list.iter().map(calc_number).collect::<Option<Vec<f32>>>()?.into_iter().fold(f32::INFINITY, f32::min),
         Calc::Max(list) => list.iter().map(calc_number).collect::<Option<Vec<f32>>>()?.into_iter().fold(f32::NEG_INFINITY, f32::max),
         Calc::Clamp(lo, v, hi) => calc_number(v)?.max(calc_number(lo)?).min(calc_number(hi)?),
+        Calc::Round(mode, v, step) => mode.apply(calc_number(v)?, calc_number(step)?),
     })
 }
 

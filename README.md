@@ -37,13 +37,13 @@ This is work in progress. It is not a finished browser.
 |---|---|
 | Static sites (Wikipedia, Hacker News, documentation, blogs) | Render well |
 | JavaScript | Own engine: ES2022-level language, promises/async, generators, Proxy, RegExp, `Date`, typed arrays, `BigInt`, ES modules, a fixed-locale `Intl`. Off by default in the browser ("JavaScript (experimental)" setting). |
-| DOM | Events, selectors, forms, timers, `fetch`/XHR (CORS enforced in the network stack), custom elements, `URL`, storage (session only), `TextEncoder`, `crypto.getRandomValues`, `requestAnimationFrame`, `IntersectionObserver`, `ResizeObserver`, file inputs |
+| DOM | Events (pointer and mouse input with capture, presses and releases, keyboard), selectors, forms, timers, `fetch`/XHR (CORS enforced in the network stack), `WebSocket`, custom elements, `URL`, storage (session only), `TextEncoder`, `crypto.getRandomValues`, `requestAnimationFrame`, `IntersectionObserver`, `ResizeObserver`, file inputs |
 | Animation and graphics | CSS transitions and `@keyframes` animations, `Element.animate`, 2D transforms, `position: sticky`, smooth scrolling, web fonts (WOFF2/TrueType/OpenType, kept separate per page), inline SVG with gradients and dashed strokes |
 | Canvas | 2D canvas (software rasteriser: paths, strokes, gradients, patterns, text, compositing, shadows); WebGL 1 and 2 (own GLSL ES 1.00/3.00 translator; three.js scenes run). Limits and identification strings are fixed values, not the machine's. Not yet: `<img>` as a texture or canvas source, `toDataURL`, named uniform blocks, shadow samplers |
 | Frames | `<iframe>` documents load, paint inside the page, take input, and talk to the embedding page with `postMessage`; each document has its own script engine, so there is no direct access between documents |
 | Script-heavy sites | Wikipedia and Hacker News run their scripts cleanly; DuckDuckGo's results page and YouTube's signed-out home page render; many others still fail |
 | Privacy | Tracker blocking, HTTPS-only mode, tracking-parameter stripping, partitioned in-memory cookies and cache, DNS-over-HTTPS, HTTP/SOCKS5 proxies, embedded Tor (optional feature), fixed generic user agent, `Intl`/`Date` always report `en-US`/UTC, public pages cannot reach local-network addresses |
-| Not there yet | Video and audio, downloads, WebSocket for pages (the network stack has a client; it is not wired to scripts yet), text selection, find-in-page, bookmarks/history, HTTP/2, shadow DOM (pages that ship a polyfill work), incremental layout |
+| Not there yet | WebAssembly, web workers, video and audio, downloads started by scripts (`blob:` addresses; files a server sends are saved to the Downloads folder), text selection, find-in-page, bookmarks/history, HTTP/2, shadow DOM (pages that ship a polyfill work), incremental layout |
 
 | | |
 |---|---|

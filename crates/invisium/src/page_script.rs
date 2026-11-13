@@ -252,7 +252,10 @@ impl Page {
             std::mem::swap(self, &mut st.page);
         }
         eng.boot();
-        let r = if eng.usable() { Some(f(&mut eng)) } else { None };
+        let r = {
+            let _t = crate::draw::prof::span("script (all of it)");
+            if eng.usable() { Some(f(&mut eng)) } else { None }
+        };
         let fx = {
             let mut st = eng.state().borrow_mut();
             std::mem::swap(self, &mut st.page);
@@ -275,6 +278,7 @@ impl Page {
         if self.script.is_none() {
             return true;
         }
+        let init = EventInit { mods: self.pointer.mods, ..init };
         self.script(|e| e.event(target, kind, init)).unwrap_or(true)
     }
 

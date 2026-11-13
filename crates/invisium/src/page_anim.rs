@@ -359,7 +359,7 @@ impl Page {
     /// True if the page needs frames without any input: an animation is running, or a script
     /// asked to be called before the next frame.
     pub fn wants_frame(&self) -> bool {
-        self.animations_need_frames() || self.script_frame_due() || self.frames_want_frame()
+        self.animations_need_frames() || self.script_frame_due() || self.frames_want_frame() || (self.pointer.moved && self.script.is_some())
     }
 
     /// True if a running animation needs frames: one on an element that is shown, or one that
@@ -384,6 +384,9 @@ impl Page {
         // then scripts' frame callbacks run, then the observers. (A script that reacts to an
         // animation ending expects its frame callback to follow in the same frame.)
         self.tick_animations(now);
+        // where the pointer went since the last frame, before the frame callbacks use it
+        // (what its listeners change shows up as an update that is needed, like any change)
+        self.flush_pointer();
         let mut ran = false;
         if self.script_frame_due() {
             self.geom_changed = false;

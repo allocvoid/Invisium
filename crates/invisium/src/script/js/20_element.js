@@ -342,9 +342,18 @@ class Element extends Node {
   scrollTo(x, y) { if (isRootScroller(this)) g.scrollTo(x, y); }
   scrollBy(x, y) { if (isRootScroller(this)) g.scrollBy(x, y); }
   scroll(x, y) { this.scrollTo(x, y); }
-  setPointerCapture() {}
-  releasePointerCapture() {}
-  hasPointerCapture() { return false; }
+  // pointer events go to this element until the buttons are up (only while one is down)
+  setPointerCapture() {
+    if (!PTR.buttons || !this.isConnected || PTR.capture === this) return;
+    PTR.capture = this;
+    trusted(this, 'gotpointercapture', { clientX: PTR.x, clientY: PTR.y, buttons: PTR.buttons });
+  }
+  releasePointerCapture() {
+    if (PTR.capture !== this) return;
+    PTR.capture = null;
+    trusted(this, 'lostpointercapture', { clientX: PTR.x, clientY: PTR.y, buttons: PTR.buttons });
+  }
+  hasPointerCapture() { return PTR.capture === this; }
   requestFullscreen() {}
 }
 methods(Element.prototype, childNode);

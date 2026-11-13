@@ -175,30 +175,15 @@ function cssEscape(value) {
   return out;
 }
 
-var B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+// base64 is done natively: pages embed megabytes of it (models, fonts)
 function btoa(s) {
-  s = String(s);
-  var out = '', i, a, b, c;
-  for (i = 0; i < s.length; i += 3) {
-    a = s.charCodeAt(i); b = s.charCodeAt(i + 1); c = s.charCodeAt(i + 2);
-    if (a > 255 || b > 255 || c > 255) throw new DOMException('The string contains characters outside of the Latin1 range', 'InvalidCharacterError');
-    out += B64[a >> 2] + B64[((a & 3) << 4) | ((b || 0) >> 4)];
-    out += i + 1 < s.length ? B64[((b & 15) << 2) | ((c || 0) >> 6)] : '=';
-    out += i + 2 < s.length ? B64[c & 63] : '=';
-  }
+  var out = n.btoa(String(s));
+  if (out === null) throw new DOMException('The string contains characters outside of the Latin1 range', 'InvalidCharacterError');
   return out;
 }
 function atob(s) {
-  s = String(s);
-  var out = '', bits = 0, acc = 0, i, v;
-  for (i = 0; i < s.length; i++) {
-    var ch = s[i];
-    if (ch === '=' || ch === ' ' || ch === '\n' || ch === '\r' || ch === '\t') continue;
-    v = B64.indexOf(ch);
-    if (v < 0) throw new DOMException('The string is not correctly encoded', 'InvalidCharacterError');
-    acc = (acc << 6) | v; bits += 6;
-    if (bits >= 8) { bits -= 8; out += String.fromCharCode((acc >> bits) & 255); }
-  }
+  var out = n.atob(String(s));
+  if (out === null) throw new DOMException('The string is not correctly encoded', 'InvalidCharacterError');
   return out;
 }
 
@@ -213,7 +198,8 @@ function atob(s) {
   });
   Object.setPrototypeOf(g, Window.prototype);
 
-  var view = function (i) { return function () { return n.viewport()[i]; }; };
+  // the scroll position needs layout (a document that shrank scrolls back); the size does not
+  var view = function (i) { return function () { return i < 2 ? n.viewNow()[i] : n.viewport()[i]; }; };
   getter(g, 'innerWidth', view(0)); getter(g, 'innerHeight', view(1));
   getter(g, 'outerWidth', view(0)); getter(g, 'outerHeight', view(1));
   getter(g, 'scrollX', view(2)); getter(g, 'scrollY', view(3));
@@ -305,6 +291,7 @@ function atob(s) {
     PerformanceObserver: PerformanceObserver, AbortController: AbortController, AbortSignal: AbortSignal,
     XMLHttpRequest: XMLHttpRequest, Headers: Headers, Request: Request, Response: Response, FormData: FormData,
     DOMParser: DOMParser, XMLSerializer: XMLSerializer, MessageChannel: MessageChannel, MessagePort: MessagePort,
+    WebSocket: WebSocket, CloseEvent: CloseEvent,
     CDATASection: CDATASection, ProcessingInstruction: ProcessingInstruction, Window: Window,
     Attr: Attr, NamedNodeMap: NamedNodeMap, Navigator: Navigator, Location: Location, History: History,
     Screen: Screen, DOMImplementation: DOMImplementation, Selection: Selection, MediaQueryList: MediaQueryList,
@@ -347,7 +334,14 @@ if (n.frameDepth() > 0) {
 
 return {
   // an input event raised by the user; returns false if a listener cancelled it
-  event: function (target, type, init) { return trusted(target === null ? g : target, type, init); },
+  event: function (target, type, init) {
+    if (type === 'click' || type === 'auxclick') init.detail = 1;
+    return trusted(target === null ? g : target, type, init);
+  },
+  // the pointer moved, a button changed, or it left the page (see pointerInput)
+  pointer: pointerInput,
+  // something happened on a WebSocket (see socketEvent)
+  socket: socketEvent,
   timer: fireTimer,
   // a frame is about to be drawn: animation-frame callbacks, then the observers
   frame: runFrame,

@@ -1442,3 +1442,286 @@ fn throwaway_webgl_canvases_do_not_use_up_the_contexts() {
     assert!(!dev.borrow().destroyed.contains(&1));
     assert!(dev.borrow().cmds.iter().any(|c| matches!(c, invisium_draw::gl::Cmd::Clear { .. })));
 }
+
+#[test]
+fn scripts_hear_the_pointer_move_cross_elements_press_and_release() {
+    let mut t = T::new(
+        "<style>body{margin:0} div{height:100px}</style>
+        <div id=a><p id=in style='margin:0;height:40px'>text</p></div><div id=b></div><a id=l href='/go' style='display:block;height:40px'>go</a>
+        <script>
+        var log = [];
+        function tell(e) {
+            var who = e.currentTarget === window ? 'win' : e.currentTarget.id;
+            log.push(e.type + '@' + who + (e.target.id ? '>' + e.target.id : '') + ' ' + e.clientX + ',' + e.clientY + ' b' + e.buttons);
+        }
+        ['pointermove', 'mousemove', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function (k) { window.addEventListener(k, tell); });
+        var a = document.getElementById('a'), b = document.getElementById('b');
+        ['mouseenter', 'mouseleave', 'pointerenter', 'mouseover', 'mouseout'].forEach(function (k) { a.addEventListener(k, tell); });
+        b.addEventListener('pointerdown', function (e) { b.setPointerCapture(e.pointerId); });
+        b.addEventListener('pointermove', function (e) { log.push('captured ' + b.hasPointerCapture(1) + ' ' + e.movementX + ',' + e.movementY + ' off ' + e.offsetX + ',' + e.offsetY); });
+        function flush() { console.log(log.join(' | ')); log = []; }
+        </script>",
+    );
+    assert_eq!(t.errors(), Vec::<&String>::new(), "console: {:?}", t.log);
+    let say = |t: &mut T, now: f64| {
+        t.p.frame(now);
+        t.p.eval("flush()");
+        t.step(now);
+        t.log.pop().unwrap_or_default()
+    };
+    // three reports from the mouse before a frame are one move for scripts, and the page asks
+    // for that frame
+    t.p.mouse_move(5.0, 5.0);
+    t.p.mouse_move(8.0, 8.0);
+    t.p.mouse_move(10.0, 10.0);
+    assert!(t.p.wants_frame());
+    assert_eq!(
+        say(&mut t, 1.0),
+        "log: pointerenter@a>a 10,10 b0 | mouseover@a>in 10,10 b0 | mouseenter@a>a 10,10 b0 | pointermove@win>in 10,10 b0 | mousemove@win>in 10,10 b0"
+    );
+    assert!(!t.p.wants_frame());
+    // inside the same element nothing is crossed; out of it, the element hears it leave
+    t.p.mouse_move(10.0, 60.0);
+    assert_eq!(say(&mut t, 2.0), "log: mouseout@a>in 10,60 b0 | mouseover@a>a 10,60 b0 | pointermove@win>a 10,60 b0 | mousemove@win>a 10,60 b0");
+    t.p.mouse_move(10.0, 150.0);
+    assert_eq!(say(&mut t, 3.0), "log: mouseout@a>a 10,150 b0 | mouseleave@a>a 10,150 b0 | captured false 0,90 off 10,50 | pointermove@win>b 10,150 b0 | mousemove@win>b 10,150 b0");
+    // a press, a drag with the pointer captured, and a release over another element: while
+    // captured, the pointer counts as being over the element that holds it; the click is at
+    // what holds both elements (here the body)
+    t.p.press(10.0, 150.0, crate::page::PointerButton::Primary);
+    t.p.mouse_move(30.0, 20.0);
+    assert_ne!(t.p.release(30.0, 20.0, crate::page::PointerButton::Primary, false), PageAction::Navigate { url: "https://example.test/go".into(), new_tab: false });
+    assert_eq!(
+        say(&mut t, 4.0),
+        "log: pointerdown@win>b 10,150 b1 | mousedown@win>b 10,150 b1 | captured true 20,-130 off 30,-80 | pointermove@win>b 30,20 b1 | mousemove@win>b 30,20 b1 | pointerup@win>b 30,20 b0 | mouseup@win>b 30,20 b0 | pointerenter@a>a 30,20 b0 | mouseover@a>in 30,20 b0 | mouseenter@a>a 30,20 b0 | click@win 30,20 b0"
+    );
+    // down and up on the link is a click that follows it
+    assert_eq!(t.p.click(10.0, 210.0, false), PageAction::Navigate { url: "https://example.test/go".into(), new_tab: false });
+    let said = say(&mut t, 5.0);
+    assert!(said.ends_with("pointerdown@win>l 10,210 b1 | mousedown@win>l 10,210 b1 | pointerup@win>l 10,210 b0 | mouseup@win>l 10,210 b0 | click@win>l 10,210 b0"), "{said}");
+    // the pointer leaves the page
+    t.p.mouse_move(10.0, 10.0);
+    say(&mut t, 6.0);
+    t.p.mouse_leave();
+    assert_eq!(say(&mut t, 7.0), "log: mouseout@a>in 10,10 b0 | mouseleave@a>a 10,10 b0");
+    // what is drawn at a point
+    t.p.eval("console.log(document.elementFromPoint(10, 10).id, document.elementFromPoint(10, 150).id, document.elementFromPoint(-5, 10), document.elementsFromPoint(10, 10).length)");
+    t.step(8.0);
+    assert_eq!(t.log.pop().unwrap(), "log: in b null 4");
+}
+
+#[test]
+fn base64_round_trips_and_rejects_what_is_not_base64() {
+    let mut t = T::new(
+        "<script>
+        var all = ''; for (var i = 0; i < 256; i++) all += String.fromCharCode(i);
+        var enc = btoa(all), dec = atob(enc), same = dec.length === 256;
+        for (var i = 0; i < 256; i++) if (dec.charCodeAt(i) !== i) same = false;
+        function tries(f) { try { return f(); } catch (e) { return e.name; } }
+        console.log(btoa('hi'), btoa('hey'), btoa(''), atob('aGk='), atob('aGk'), atob(' aG V5 '), same, enc.length);
+        console.log(tries(function () { return atob('a'); }), tries(function () { return atob('a=bc'); }), tries(function () { return atob('ab!c'); }),
+            tries(function () { return btoa(String.fromCharCode(256)); }), tries(function () { return atob('ab=='); }).charCodeAt(0), tries(function () { return atob('ab='); }));
+        </script>",
+    );
+    assert_eq!(t.errors(), Vec::<&String>::new(), "console: {:?}", t.log);
+    assert_eq!(t.logs(), vec!["aGk= aGV5  hi hi hey true 344", "InvalidCharacterError InvalidCharacterError InvalidCharacterError InvalidCharacterError 105 InvalidCharacterError"]);
+}
+
+#[test]
+fn focus_follows_the_press_and_a_press_can_end_without_its_release() {
+    use crate::page::PointerButton::{Middle, Primary};
+    let mut t = T::new(
+        "<style>body{margin:0} input{display:block;height:30px;width:200px;margin:0;padding:0;border:0} div{height:100px} a{display:block;height:40px}</style>
+        <input id=i><div id=d></div><a id=l href='/go'>go</a><a id=m href='/other'>other</a>
+        <script>
+        var log = [];
+        window.addEventListener('pointermove', function (e) { log.push('move b' + e.buttons); });
+        window.addEventListener('pointerup', function (e) { log.push('up b' + e.buttons); });
+        window.addEventListener('auxclick', function (e) { log.push('aux ' + e.target.id + ' ' + e.button); });
+        function flush() { console.log(document.activeElement.id + ' | ' + log.join(' ')); log = []; }
+        </script>",
+    );
+    assert_eq!(t.errors(), Vec::<&String>::new(), "console: {:?}", t.log);
+    let say = |t: &mut T, now: f64| {
+        t.p.frame(now);
+        t.p.eval("flush()");
+        t.step(now);
+        t.log.pop().unwrap_or_default()
+    };
+    // a text control has the focus as soon as the button is down on it, and keeps it when the
+    // button comes up somewhere else
+    t.p.press(10.0, 10.0, Primary);
+    assert_eq!(say(&mut t, 1.0), "log: i | ");
+    t.p.mouse_move(10.0, 80.0);
+    t.p.release(10.0, 80.0, Primary, false);
+    assert_eq!(say(&mut t, 2.0), "log: i | move b1 up b0");
+    // a press on plain content takes the focus away
+    t.p.press(10.0, 80.0, Primary);
+    assert_eq!(say(&mut t, 3.0), "log:  | ");
+    // the pointer is taken away in the middle of a press (another tab came to the front): the
+    // button counts as up, and later moves say so
+    t.p.release_all();
+    t.p.mouse_move(10.0, 90.0);
+    assert_eq!(say(&mut t, 4.0), "log:  | up b0 move b0");
+    assert!(!t.p.release_all());
+    // the middle button opens a link in a new tab only if it went down and came up on it
+    t.p.press(10.0, 140.0, Middle);
+    assert_ne!(t.p.release(10.0, 180.0, Middle, false), PageAction::Navigate { url: "https://example.test/other".into(), new_tab: true });
+    t.p.press(10.0, 140.0, Middle);
+    assert_eq!(t.p.release(10.0, 150.0, Middle, false), PageAction::Navigate { url: "https://example.test/go".into(), new_tab: true });
+    let said = say(&mut t, 5.0);
+    assert!(said.contains("aux  1") && said.ends_with("aux l 1"), "{said}");
+    // below the content there is still the root element
+    t.p.eval("console.log(document.elementFromPoint(10, 500).tagName, document.elementFromPoint(10, 700))");
+    t.step(6.0);
+    assert_eq!(t.log.pop().unwrap(), "log: HTML null");
+}
+
+#[test]
+fn a_script_talks_through_a_websocket_the_embedder_opened() {
+    use crate::page::{PageSocket, SocketEvent};
+    struct Wire(Rc<RefCell<Vec<String>>>);
+    impl PageSocket for Wire {
+        fn send_text(&self, t: String) {
+            self.0.borrow_mut().push(format!("text {t}"));
+        }
+        fn send_binary(&self, d: Vec<u8>) {
+            self.0.borrow_mut().push(format!("binary {d:?}"));
+        }
+        fn close(&self, code: Option<u16>, reason: &str) {
+            self.0.borrow_mut().push(format!("close {code:?} {reason}"));
+        }
+        fn buffered(&self) -> u64 {
+            7
+        }
+    }
+    let mut t = T::new(
+        "<script>
+        var log = [];
+        var ws = new WebSocket('wss://chat.example.test/room?x=1', ['a', 'b']);
+        ws.binaryType = 'arraybuffer';
+        ws.onopen = function () {
+            log.push('open ' + ws.protocol + ' ' + ws.readyState + ' ' + ws.bufferedAmount);
+            ws.send('hi'); ws.send(new Uint8Array([1, 2, 3]).subarray(1));
+        };
+        ws.addEventListener('message', function (e) {
+            log.push('message ' + (typeof e.data === 'string' ? e.data : 'bytes ' + new Uint8Array(e.data).join(',')) + ' from ' + e.origin);
+            if (e.data === 'bye') ws.close(3000, 'done');
+        });
+        ws.onerror = function () { log.push('error'); };
+        ws.onclose = function (e) { log.push('close ' + e.code + ' ' + e.reason + ' ' + e.wasClean + ' ' + ws.readyState); };
+        function tries(f) { try { f(); return 'ok'; } catch (e) { return e.name; } }
+        var bad = [tries(function () { new WebSocket('ftp://x.test/'); }), tries(function () { new WebSocket('wss://x.test/#frag'); }),
+            tries(function () { new WebSocket('wss://x.test/', ['a', 'a']); }), tries(function () { ws.close(1001); }),
+            tries(function () { ws.send('too early'); })].join(' ');
+        var refused = new WebSocket('/relative');
+        refused.onerror = function () { log.push('refused error'); };
+        refused.onclose = function (e) { log.push('refused close ' + e.code + ' ' + e.wasClean); };
+        var dropped = new WebSocket('wss://later.example.test/');
+        dropped.close();
+        function flush() { console.log(log.join(' | ')); log = []; }
+        console.log(bad, ws.url, refused.url, ws.readyState, WebSocket.OPEN, dropped.readyState);
+        </script>",
+    );
+    assert_eq!(t.errors(), Vec::<&String>::new(), "console: {:?}", t.log);
+    assert_eq!(
+        t.logs(),
+        vec!["SyntaxError SyntaxError SyntaxError InvalidAccessError InvalidStateError wss://chat.example.test/room?x=1 wss://example.test/relative 0 1 2"]
+    );
+    let reqs = t.p.take_socket_requests();
+    assert_eq!(reqs.len(), 3);
+    assert_eq!((reqs[0].url.as_str(), reqs[0].protocols.join("+")), ("wss://chat.example.test/room?x=1", "a+b".to_string()));
+    assert_eq!(reqs[1].url, "wss://example.test/relative");
+    assert!(t.p.take_socket_requests().is_empty());
+    let wire = Rc::new(RefCell::new(Vec::new()));
+    t.p.socket_opened(reqs[0].id, Box::new(Wire(wire.clone())));
+    t.p.socket_event(reqs[0].id, SocketEvent::Open { protocol: "b".into() });
+    t.p.socket_event(reqs[0].id, SocketEvent::Text("hello".into()));
+    t.p.socket_event(reqs[0].id, SocketEvent::Binary(vec![9, 8]));
+    t.p.socket_event(reqs[0].id, SocketEvent::Text("bye".into()));
+    // the network stack refuses the second one
+    t.p.socket_event(reqs[1].id, SocketEvent::Closed { code: 1006, reason: String::new(), clean: false });
+    t.p.socket_event(reqs[0].id, SocketEvent::Closed { code: 3000, reason: "done".into(), clean: true });
+    // an event for a socket that is gone is nobody's
+    t.p.socket_event(reqs[0].id, SocketEvent::Text("late".into()));
+    t.p.eval("flush()");
+    t.step(1.0);
+    assert_eq!(
+        t.log.pop().unwrap(),
+        "log: open b 1 7 | message hello from wss://chat.example.test | message bytes 9,8 from wss://chat.example.test | message bye from wss://chat.example.test \
+         | refused error | refused close 1006 false | close 3000 done true 3"
+            .replace("          ", "")
+    );
+    assert_eq!(wire.borrow().as_slice(), ["text hi", "binary [2, 3]", "close Some(3000) done"]);
+    // the third was closed by the script before the connection existed: it is closed as soon
+    // as there is one, and closed again when the document goes away
+    let late = Rc::new(RefCell::new(Vec::new()));
+    t.p.socket_opened(reqs[2].id, Box::new(Wire(late.clone())));
+    assert_eq!(late.borrow().as_slice(), ["close None "]);
+    assert_eq!(t.p.sockets(), 1);
+    drop(t);
+    assert_eq!(late.borrow().as_slice(), ["close None ", "close None "]);
+}
+
+#[test]
+fn a_closing_websocket_still_hears_the_server_and_text_coding_is_native() {
+    use crate::page::{PageSocket, SocketEvent};
+    struct Quiet;
+    impl PageSocket for Quiet {
+        fn send_text(&self, _: String) {}
+        fn send_binary(&self, _: Vec<u8>) {}
+        fn close(&self, _: Option<u16>, _: &str) {}
+        fn buffered(&self) -> u64 {
+            0
+        }
+    }
+    let mut t = T::new(
+        "<script>
+        var log = [];
+        var ws = new WebSocket('wss://live.example.test/');
+        ws.onopen = function () { ws.send('last question'); ws.close(); };
+        ws.onmessage = function (e) { log.push('answer ' + e.data + ' in state ' + ws.readyState); };
+        ws.onclose = function (e) { log.push('closed ' + e.wasClean); console.log(log.join(' | ')); };
+        var bytes = new TextEncoder().encode('h\\u00e9 \\u20ac \\ud83d\\ude00');
+        var odd = new Uint8Array([0xEF, 0xBB, 0xBF, 0x68, 0xC3, 0xA9, 0xFF, 0x21]);
+        console.log(Array.prototype.join.call(bytes, ','), new TextDecoder().decode(bytes) === 'h\\u00e9 \\u20ac \\ud83d\\ude00',
+            new TextDecoder().decode(odd).length, new TextDecoder().decode(odd).charCodeAt(2), new TextDecoder().decode(new Uint8Array(0)) === '');
+        </script>",
+    );
+    assert_eq!(t.errors(), Vec::<&String>::new(), "console: {:?}", t.log);
+    assert_eq!(t.logs(), vec!["104,195,169,32,226,130,172,32,240,159,152,128 true 4 65533 true"]);
+    let reqs = t.p.take_socket_requests();
+    t.p.socket_opened(reqs[0].id, Box::new(Quiet));
+    t.p.socket_event(reqs[0].id, SocketEvent::Open { protocol: String::new() });
+    t.p.socket_event(reqs[0].id, SocketEvent::Text("42".into()));
+    t.p.socket_event(reqs[0].id, SocketEvent::Closed { code: 1000, reason: String::new(), clean: true });
+    t.step(1.0);
+    assert_eq!(t.log.pop().unwrap(), "log: answer 42 in state 2 | closed true");
+}
+
+#[test]
+fn grid_lines_can_be_named_and_lengths_rounded_to_a_step() {
+    let mut t = T::new(
+        "<style>
+        body { margin: 0 }
+        #g { display: grid; width: 420px; grid-template-columns: [gutter] 20px [main start] 300px [side] 100px [end]; grid-template-rows: [top] 50px [bottom] 30px }
+        #a { grid-area: top / main; height: 10px }
+        #b { grid-area: top / side }
+        #c { grid-area: bottom / 1 / bottom / -1 }
+        #e { grid-row: top; grid-column: nowhere }
+        #r { width: round(down, 107px, 8px); height: round(up, 101px, 10px); margin-left: round(to-zero, 19.9px, 5px) }
+        #v { --w: round(down, max(26rem, min(600px, 507px)), .8rem); width: var(--w); height: calc(var(--w) * 1) }
+        #n { width: round(nearest, 104px, 0px); height: 5px }
+        </style>
+        <div id=g><div id=a></div><div id=b></div><div id=c></div><div id=e></div></div><div id=r></div><div id=v></div><div id=n></div>
+        <script>
+        function r(id) { var q = document.getElementById(id).getBoundingClientRect(), f = function (x) { return Math.round(x * 10) / 10; }; return id + ' ' + f(q.left) + ',' + f(q.top) + ' ' + f(q.width) + 'x' + f(q.height); }
+        console.log(['a', 'b', 'c', 'e', 'r', 'v', 'n'].map(r).join(' | '));
+        </script>",
+    );
+    assert_eq!(t.errors(), Vec::<&String>::new(), "console: {:?}", t.log);
+    // `a` and `b` sit in the columns their names give, `c` spans the named bottom row from the
+    // first line to the last, and a name the grid does not have places like `auto` (`e` takes
+    // the first free cell of the top row); lengths snap to their steps, a step of 0 changes nothing
+    assert_eq!(t.logs(), vec!["a 20,0 300x10 | b 320,0 100x50 | c 0,50 420x30 | e 0,0 20x50 | r 15,80 104x110 | v 0,190 499.2x499.2 | n 0,689.2 104x5"]);
+}

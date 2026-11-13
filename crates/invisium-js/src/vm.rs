@@ -96,8 +96,15 @@ impl Runtime {
         if self.steps > self.limits.step_budget {
             return Err(Exc::Abort(ErrorKind::StepBudget));
         }
+        if self.prof.is_some() && self.steps & 1023 == 0 {
+            self.profile_sample();
+        }
         if self.gc_due() {
+            let started = self.prof.is_some().then(std::time::Instant::now);
             self.collect_garbage();
+            if let Some(t) = started {
+                self.profile_gc(t);
+            }
             if self.total_heap() > self.limits.max_heap_bytes {
                 return Err(Exc::Abort(ErrorKind::OutOfMemory));
             }

@@ -14,7 +14,7 @@ use crate::draw::{DrawList, Glyph, Rgba};
 use crate::html;
 use crate::layout::{layout_document, BoxId, LayoutInput, LayoutTree, NO_BOX};
 use crate::paint::{paint, PaintImage, PaintInput};
-use crate::script::{ConsoleMessage, EventInit, ScriptEngine};
+use crate::script::{ConsoleMessage, EventInit, PointerInput, ScriptEngine};
 use crate::style::{Cursor, SheetEntry, StyleInput, StyleStore, Stylist};
 use crate::text::FontSystem;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -30,6 +30,9 @@ pub(crate) mod canvas;
 #[path = "page_frames.rs"]
 pub(crate) mod frames;
 pub use frames::FrameRequest;
+#[path = "page_sockets.rs"]
+pub(crate) mod sockets;
+pub use sockets::{PageSocket, SocketEvent, SocketRequest};
 
 /// Resolves a reference against a base URL: `(base, reference) -> absolute`.
 pub type UrlJoin = Rc<dyn Fn(&str, &str) -> Option<String>>;
@@ -139,6 +142,51 @@ pub enum PointerKind {
     Default,
     Pointer,
     Text,
+}
+
+/// A button of the pointer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PointerButton {
+    Primary,
+    Middle,
+    Secondary,
+}
+
+impl PointerButton {
+    /// `MouseEvent.button`.
+    fn index(self) -> i32 {
+        match self {
+            PointerButton::Primary => 0,
+            PointerButton::Middle => 1,
+            PointerButton::Secondary => 2,
+        }
+    }
+
+    /// Its bit in `MouseEvent.buttons`.
+    fn mask(self) -> u8 {
+        match self {
+            PointerButton::Primary => 1,
+            PointerButton::Secondary => 2,
+            PointerButton::Middle => 4,
+        }
+    }
+}
+
+/// What the page knows about the pointer and the modifier keys.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PointerState {
+    /// Where it is, in viewport coordinates.
+    pub pos: (f32, f32),
+    /// It is over this page.
+    pub inside: bool,
+    /// It moved or left since scripts were last told (see `Page::flush_pointer`).
+    pub moved: bool,
+    /// The buttons that are down, as in `MouseEvent.buttons`.
+    pub buttons: u8,
+    /// The node each button went down on, while it is down (indexed by `MouseEvent.button`).
+    pub pressed: [Option<NodeId>; 3],
+    /// The modifier keys that are down (`script::MOD_*`).
+    pub mods: u8,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -284,6 +332,13 @@ pub struct Page {
     /// The frame that has the keyboard, and the one under the pointer (`NO_NODE` = none).
     pub(crate) focus_frame: NodeId,
     pub(crate) hover_frame: NodeId,
+    /// The frame a button went down in (`NO_NODE`: on this document), while it is down.
+    pub(crate) press_frame: NodeId,
+    /// The WebSockets of this document's scripts (see `page_sockets.rs`).
+    pub(crate) sockets: sockets::Sockets,
+    pub(crate) socket_requests: Vec<SocketRequest>,
+    pub(crate) next_socket: u32,
+    pub(crate) pointer: PointerState,
     /// This page's glyphs followed by its frames' (what the spliced display list indexes).
     pub(crate) glyph_buf: Vec<Glyph>,
     /// The document came over a direct connection to a local address: the embedder copies
@@ -442,6 +497,7 @@ fn collect_font_rules(rules: &[Rule], out: &mut Vec<WebFontRule>) {
 
 impl Drop for Page {
     fn drop(&mut self) {
+        self.close_sockets();
         self.drop_canvases();
         // the fonts this page loaded go with it
         if self.font_scope != 0 && !self.fonts_requested.is_empty() {
@@ -484,7 +540,10 @@ fn srcset_pick(srcset: &str) -> Option<&str> {
 impl Page {
     /// Parse `html` and discover its subresources. Call `take_requests` afterwards.
     pub fn new(url: &str, html_src: &str, join: UrlJoin, viewport: (f32, f32), cfg: PageConfig) -> Page {
-        let doc = html::parse(html_src, cfg.scripting);
+        let doc = {
+            let _t = crate::draw::prof::span("html: parse");
+            html::parse(html_src, cfg.scripting)
+        };
         let mut p = Page::blank(url, join, viewport, cfg, doc);
         p.discover();
         p
@@ -552,6 +611,11 @@ impl Page {
             outbox: Vec::new(),
             focus_frame: NO_NODE,
             hover_frame: NO_NODE,
+            press_frame: NO_NODE,
+            sockets: sockets::Sockets::new(),
+            socket_requests: Vec::new(),
+            next_socket: 0,
+            pointer: PointerState::default(),
             glyph_buf: Vec::new(),
             served_local: false,
             seen_scripts: HashSet::new(),
@@ -603,6 +667,11 @@ impl Page {
     }
 
     /// How many times scripts forced layout on this page.
+    /// Where script time went since the last call (see `ScriptEngine::take_profile`).
+    pub fn take_script_profile(&mut self) -> Vec<(String, f64)> {
+        self.script.as_mut().map_or(Vec::new(), |e| e.take_profile())
+    }
+
     pub fn forced_layouts(&self) -> u32 {
         self.forced_layouts
     }
@@ -959,6 +1028,7 @@ impl Page {
             fonts.set_scope(self.font_scope);
         }
         if self.dirty_paint {
+            let _t = crate::draw::prof::span("paint");
             let t0 = std::time::Instant::now();
             let out = paint(
                 &mut self.tree,
@@ -1001,6 +1071,7 @@ impl Page {
     pub(crate) fn update_style_layout(&mut self, fonts: &mut FontSystem) {
         fonts.set_scope(self.font_scope);
         if self.dirty_style {
+            let _t = crate::draw::prof::span("style");
             let t0 = std::time::Instant::now();
             if self.sheets_dirty {
                 self.stylist.sheets.clear();
@@ -1059,6 +1130,7 @@ impl Page {
             self.pass_ms[0] = t0.elapsed().as_secs_f32() * 1000.0;
         }
         if self.dirty_layout {
+            let _t = crate::draw::prof::span("layout");
             let t0 = std::time::Instant::now();
             self.tree = layout_document(LayoutInput {
                 doc: &self.doc,
@@ -1295,6 +1367,58 @@ impl Page {
         self.tree.hit_test(&self.styles, x + self.scroll.0, y + self.scroll.1, self.scroll.0, self.scroll.1).unwrap_or(NO_BOX)
     }
 
+    /// The node drawn at a point of the viewport (`NO_NODE` if there is none).
+    fn node_at(&self, x: f32, y: f32) -> NodeId {
+        match self.hit(x, y) {
+            NO_BOX => NO_NODE,
+            b => self.tree.boxes[b as usize].node,
+        }
+    }
+
+    /// The element drawn at a point of the viewport (`NO_NODE` if there is none).
+    pub(crate) fn element_at(&self, x: f32, y: f32) -> NodeId {
+        self.element_of(self.node_at(x, y))
+    }
+
+    /// The element pointer events at `node` go to: its element, or the root element where the
+    /// pointer is over nothing.
+    fn pointer_target(&self, node: NodeId) -> NodeId {
+        match self.element_of(node) {
+            NO_NODE | DOCUMENT_NODE => self.doc.document_element(),
+            e => e,
+        }
+    }
+
+    /// The innermost node that holds both (`NO_NODE` if there is none).
+    fn common_ancestor(&self, a: NodeId, b: NodeId) -> NodeId {
+        if a == b {
+            return a;
+        }
+        let mut chain = Vec::new();
+        let mut n = a;
+        while n != NO_NODE && n != DOCUMENT_NODE {
+            chain.push(n);
+            n = self.doc.parent(n);
+        }
+        let mut m = b;
+        while m != NO_NODE && m != DOCUMENT_NODE {
+            if chain.contains(&m) {
+                return m;
+            }
+            m = self.doc.parent(m);
+        }
+        NO_NODE
+    }
+
+    /// The modifier keys that are down, for the events that follow (`ctrlKey` and the like).
+    pub fn set_modifiers(&mut self, ctrl: bool, shift: bool, alt: bool) {
+        let mods = (ctrl as u8) * crate::script::MOD_CTRL | (shift as u8) * crate::script::MOD_SHIFT | (alt as u8) * crate::script::MOD_ALT;
+        self.pointer.mods = mods;
+        for f in self.frames.values_mut() {
+            f.page.set_modifiers(ctrl, shift, alt);
+        }
+    }
+
     fn link_at(&self, node: NodeId) -> Option<(NodeId, String)> {
         let anchor = self.doc.closest(node, a::A);
         if anchor == NO_NODE {
@@ -1330,39 +1454,183 @@ impl Page {
             }
         }
         if chain != self.hover {
-            let old = self.hover.first().copied().unwrap_or(NO_NODE);
-            let new = chain.first().copied().unwrap_or(NO_NODE);
             self.hover = chain;
             if self.stylist.has_dynamic_rules() {
                 self.dirty_style = true;
                 out.changed = true;
             }
-            if self.script.is_some() && old != new {
-                let init = EventInit { x, y, ..EventInit::default() };
-                if old != NO_NODE {
-                    self.fire(old, "mouseout", init);
-                }
-                if new != NO_NODE {
-                    self.fire(new, "mouseover", init);
-                }
-                if self.needs_update() {
-                    out.changed = true;
-                }
-            }
+        }
+        if self.script.is_some() {
+            // scripts hear where it went once per frame, however often the mouse reports
+            self.pointer.pos = (x, y);
+            self.pointer.inside = true;
+            self.pointer.moved = true;
         }
         out
     }
 
+    /// The pointer is no longer over the page.
     pub fn mouse_leave(&mut self) -> bool {
+        let mut changed = false;
+        if self.hover_frame != NO_NODE {
+            let n = std::mem::replace(&mut self.hover_frame, NO_NODE);
+            changed = self.frames.get_mut(&n).map_or(false, |f| f.page.mouse_leave());
+        }
+        if self.script.is_some() && self.pointer.inside {
+            self.pointer.inside = false;
+            self.pointer.moved = true;
+        }
         if self.hover.is_empty() {
-            return false;
+            return changed;
         }
         self.hover.clear();
         if self.stylist.has_dynamic_rules() {
             self.dirty_style = true;
             return true;
         }
+        changed
+    }
+
+    /// Tell scripts where the pointer went since they last heard (called once per frame, and
+    /// before a button changes). Returns true if scripts ran.
+    pub(crate) fn flush_pointer(&mut self) -> bool {
+        if !std::mem::take(&mut self.pointer.moved) || self.script.is_none() {
+            return false;
+        }
+        let p = self.pointer;
+        let (kind, target) = if p.inside {
+            // the element under it when it last moved, if that is still part of the document
+            let over = self.hover.first().copied().filter(|&n| self.doc.is_valid(n) && self.in_document(n));
+            (PointerInput::Move, self.pointer_target(over.unwrap_or(NO_NODE)))
+        } else {
+            (PointerInput::Leave, NO_NODE)
+        };
+        self.script(|e| e.pointer(kind, target, p.pos, 0, p.buttons, p.mods));
+        true
+    }
+
+    fn in_document(&self, node: NodeId) -> bool {
+        let mut n = node;
+        while n != NO_NODE {
+            if n == DOCUMENT_NODE {
+                return true;
+            }
+            n = self.doc.parent(n);
+        }
         false
+    }
+
+    /// A button of the pointer went down at a point of the viewport.
+    pub(crate) fn press_own(&mut self, x: f32, y: f32, button: PointerButton) {
+        let node = self.node_at(x, y);
+        // a move that is still waiting happened before the button went down
+        self.flush_pointer();
+        self.pointer.pressed[button.index() as usize] = Some(node);
+        self.pointer.buttons |= button.mask();
+        let mut proceed = true;
+        if self.script.is_some() {
+            self.pointer.pos = (x, y);
+            self.pointer.inside = true;
+            let target = self.pointer_target(node);
+            let p = self.pointer;
+            proceed = self.script(|e| e.pointer(PointerInput::Down, target, (x, y), button.index(), p.buttons, p.mods)).unwrap_or(true);
+        }
+        // Focus follows the press, not the click (unless the page cancelled the press): a text
+        // control takes it, plain content gives it up, other controls leave it where it is.
+        if proceed && button == PointerButton::Primary {
+            let control = self.control_at(node);
+            if control == NO_NODE {
+                self.set_focus(NO_NODE);
+            } else if self.doc.attr(control, a::DISABLED).is_none() && (self.is_text_control(control) || self.doc.tag(control) == a::SELECT) {
+                self.set_focus(control);
+            }
+        }
+    }
+
+    /// Every button that is down comes up without a click: the pointer was taken away in the
+    /// middle of a press (another tab, another window). Returns true if the page has to be
+    /// drawn again.
+    pub fn release_all(&mut self) -> bool {
+        let mut changed = false;
+        let n = std::mem::replace(&mut self.press_frame, NO_NODE);
+        if n != NO_NODE {
+            changed |= self.frames.get_mut(&n).map_or(false, |f| f.page.release_all());
+        }
+        for b in [PointerButton::Primary, PointerButton::Middle, PointerButton::Secondary] {
+            if self.pointer.buttons & b.mask() != 0 {
+                changed |= self.release_outside_own(b);
+            }
+        }
+        changed
+    }
+
+    /// The button came up again at a point of the viewport. A primary button that went down
+    /// and came up over the same part of the document is a click there; `new_tab` asks for a
+    /// link to open in a new tab (ctrl held). The middle button opens links in a new tab.
+    pub(crate) fn release_own(&mut self, x: f32, y: f32, button: PointerButton, new_tab: bool) -> PageAction {
+        let node = self.node_at(x, y);
+        // a move that is still waiting happened while the button was down
+        self.flush_pointer();
+        self.pointer.buttons &= !button.mask();
+        if self.script.is_some() {
+            self.pointer.pos = (x, y);
+            self.pointer.inside = true;
+            let target = self.pointer_target(node);
+            let p = self.pointer;
+            self.script(|e| e.pointer(PointerInput::Up, target, (x, y), button.index(), p.buttons, p.mods));
+            if let Some(action) = self.pending_action.take() {
+                return action;
+            }
+        }
+        let redraw = |p: &Page| if p.needs_update() { PageAction::Redraw } else { PageAction::None };
+        // a click is where the button went down and came up: what holds both nodes
+        let down = self.pointer.pressed[button.index() as usize].take();
+        let at = match down {
+            Some(down) if node != NO_NODE && down != NO_NODE => self.common_ancestor(down, node),
+            _ => NO_NODE,
+        };
+        match button {
+            PointerButton::Primary => match at {
+                NO_NODE => redraw(self),
+                at => self.click_node(at, x, y, new_tab),
+            },
+            PointerButton::Middle => {
+                if at == NO_NODE {
+                    return redraw(self);
+                }
+                let init = EventInit { x, y, button: 1, ..EventInit::default() };
+                let target = self.pointer_target(at);
+                let proceed = self.fire(target, "auxclick", init);
+                if let Some(action) = self.pending_action.take() {
+                    return action;
+                }
+                match self.link_at(at) {
+                    Some((_, url)) if proceed => PageAction::Navigate { url, new_tab: true },
+                    _ => redraw(self),
+                }
+            }
+            PointerButton::Secondary => {
+                let init = EventInit { x, y, button: 2, ..EventInit::default() };
+                let target = self.pointer_target(node);
+                self.fire(target, "contextmenu", init);
+                redraw(self)
+            }
+        }
+    }
+
+    /// The button came up where this document is not (over a frame, outside the page): the
+    /// press ends without a click.
+    pub(crate) fn release_outside_own(&mut self, button: PointerButton) -> bool {
+        self.flush_pointer();
+        self.pointer.buttons &= !button.mask();
+        let down = self.pointer.pressed[button.index() as usize].take();
+        if self.script.is_none() {
+            return false;
+        }
+        let target = self.pointer_target(down.unwrap_or(NO_NODE));
+        let p = self.pointer;
+        self.script(|e| e.pointer(PointerInput::Up, target, p.pos, button.index(), p.buttons, p.mods));
+        self.needs_update()
     }
 
     fn control_at(&self, node: NodeId) -> NodeId {
@@ -1424,18 +1692,11 @@ impl Page {
     }
 
     /// A primary-button click at viewport coordinates. `new_tab` = ctrl/middle click.
-    fn click_own(&mut self, x: f32, y: f32, new_tab: bool) -> PageAction {
-        let b = self.hit(x, y);
-        if b == NO_BOX {
-            self.set_focus(NO_NODE);
-            return PageAction::None;
-        }
-        let node = self.tree.boxes[b as usize].node;
+    /// A click on `node`, at a point of the viewport: the event, then what the click does.
+    fn click_node(&mut self, node: NodeId, x: f32, y: f32, new_tab: bool) -> PageAction {
         if self.script.is_some() {
             let target = self.element_of(node);
             let init = EventInit { x, y, ..EventInit::default() };
-            self.fire(target, "mousedown", init);
-            self.fire(target, "mouseup", init);
             let proceed = self.fire(target, "click", init);
             if let Some(action) = self.pending_action.take() {
                 return action;
@@ -1454,7 +1715,6 @@ impl Page {
             }
             return self.pending_action.take().unwrap_or(action);
         }
-        self.set_focus(NO_NODE);
         if let Some((anchor, url)) = self.link_at(node) {
             // same-document fragment links scroll instead of navigating
             let strip = |u: &str| u.split('#').next().unwrap_or("").to_string();

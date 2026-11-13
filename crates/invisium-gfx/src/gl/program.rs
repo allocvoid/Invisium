@@ -379,6 +379,7 @@ impl Ctx {
                 })
             })
             .collect();
+        let _t = invisium_draw::prof::span("gpu: pipeline");
         let made = g
             .scoped(|| {
                 g.dev.create_render_pipeline(&wgpu::RenderPipelineDescriptor {

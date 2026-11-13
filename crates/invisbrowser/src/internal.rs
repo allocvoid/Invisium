@@ -16,6 +16,8 @@ pub enum Internal {
 pub struct Info {
     pub rows: Vec<(String, String)>,
     pub stats: Vec<(String, String)>,
+    /// This session's downloads, newest first: (file name, what became of it).
+    pub downloads: Vec<(String, String)>,
 }
 
 pub fn handle(url: &str, settings: &mut Settings, info: &Info) -> Internal {
@@ -47,6 +49,10 @@ pub fn handle(url: &str, settings: &mut Settings, info: &Info) -> Internal {
             Internal::Redirect { url: "invis://settings".into(), settings_changed: true }
         }
         "about" => Internal::Html(pages::about(&info.rows)),
+        "downloads" => {
+            let folder = crate::loader::downloads_dir().map_or_else(|| "your Downloads folder".to_string(), |d| d.display().to_string());
+            Internal::Html(pages::downloads(&info.downloads, &folder))
+        }
         "retry" => match query_param(url, "url") {
             Some(u) if !u.starts_with("invis://retry") => Internal::Redirect { url: u, settings_changed: false },
             _ => Internal::Redirect { url: "invis://newtab".into(), settings_changed: false },

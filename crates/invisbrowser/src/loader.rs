@@ -2,8 +2,10 @@
 //! fetches, and turning responses (or failures) into documents.
 
 use invis_chrome::pages;
-use invisium::page::{decode_text, CookieAccess, FetchResult, Page, ResKind, UrlJoin};
-use invisium_net::{BlockReason, Credentials, FetchMode, Method, NetError, NetService, Request, RequestHandle, ResourceKind, Response, Url};
+use invisium::page::{decode_text, CookieAccess, FetchResult, Page, PageSocket, ResKind, SocketEvent, UrlJoin};
+use invisium_net::{BlockReason, BodyTarget, Credentials, FetchMode, Method, NetError, NetService, Request, RequestHandle, ResourceKind, Response, ResponseHead, Url, WsEvent, WsHandle, WsRequest};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -33,6 +35,90 @@ pub enum NetEvent {
     Font { tab: u64, nav: u64, page: u32, req: u32, result: Result<Response, NetError> },
     /// The document of the `<iframe>` element `node` of page `page`.
     Frame { tab: u64, nav: u64, page: u32, node: u32, result: Result<Response, NetError> },
+    /// Something happened on WebSocket `id` of page `page`.
+    Socket { tab: u64, nav: u64, page: u32, id: u32, event: WsEvent },
+    /// The navigation `nav` of a tab turned out to be a file to keep: download `id`.
+    Download { tab: u64, nav: u64, id: u64, update: DownloadUpdate },
+}
+
+/// News about a download.
+pub enum DownloadUpdate {
+    /// The response is being written to `path`; `total` is its size if the server said.
+    Started { name: String, path: PathBuf, total: Option<u64> },
+    /// Bytes written so far.
+    Progress(u64),
+    /// The file is complete, or the transfer failed (the partial file is gone then).
+    Finished(Result<(), NetError>),
+}
+
+/// Where downloads go: the user's Downloads folder, if there is one. `INVIS_DOWNLOADS` names
+/// another folder (for trying things out without touching the real one).
+pub fn downloads_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("INVIS_DOWNLOADS").map(PathBuf::from) {
+        return dir.is_dir().then_some(dir);
+    }
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+    let dir = PathBuf::from(home).join("Downloads");
+    dir.is_dir().then_some(dir)
+}
+
+/// A path in `dir` for a file called `name` that does not exist yet: `name`, else
+/// `stem (1).ext`, `stem (2).ext`, ... A name handed out once is not handed out again by this
+/// process, so two downloads that start together do not pick the same one before either file
+/// exists. (The network stack never overwrites; a name another program takes in the meantime
+/// fails the download instead.)
+fn unique_path(dir: &Path, name: &str) -> PathBuf {
+    static GIVEN: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+    let mut given = GIVEN.lock().unwrap_or_else(|e| e.into_inner());
+    let free = |p: &PathBuf| !given.contains(p) && !p.exists();
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => (&name[..i], &name[i..]),
+        _ => (name, ""),
+    };
+    let first = dir.join(name);
+    let path = if free(&first) { first } else { (1..1000).map(|n| dir.join(format!("{stem} ({n}){ext}"))).find(|p| free(p)).unwrap_or(first) };
+    given.push(path.clone());
+    path
+}
+
+/// Types a tab shows itself (see `document_html`); anything else is a file to keep.
+fn shown_in_tab(mime: &str) -> bool {
+    mime.is_empty()
+        || mime == "text/html"
+        || mime == "application/xhtml+xml"
+        || mime.starts_with("image/")
+        || mime.starts_with("text/")
+        || mime.ends_with("json")
+        || mime.ends_with("xml")
+        || mime.ends_with("javascript")
+}
+
+/// A page's end of a WebSocket: the network stack's handle.
+struct Wire(WsHandle);
+
+impl PageSocket for Wire {
+    fn send_text(&self, text: String) {
+        self.0.send_text(text);
+    }
+    fn send_binary(&self, data: Vec<u8>) {
+        self.0.send_binary(data);
+    }
+    fn close(&self, code: Option<u16>, reason: &str) {
+        self.0.close(code, reason);
+    }
+    fn buffered(&self) -> u64 {
+        self.0.buffered()
+    }
+}
+
+/// What a page hears about a WebSocket event of the network stack.
+pub fn socket_event(event: WsEvent) -> SocketEvent {
+    match event {
+        WsEvent::Open { protocol } => SocketEvent::Open { protocol },
+        WsEvent::Text(t) => SocketEvent::Text(t),
+        WsEvent::Binary(b) => SocketEvent::Binary(b),
+        WsEvent::Closed { code, reason, clean } => SocketEvent::Closed { code, reason, clean },
+    }
 }
 
 /// Where network results are delivered (the UI thread's event queue, or a channel when headless).
@@ -111,7 +197,11 @@ pub fn query_param(url: &str, key: &str) -> Option<String> {
 /// A form submission's body with its content type (`None` = `application/x-www-form-urlencoded`).
 pub type FormBody = (Vec<u8>, Option<String>);
 
-pub fn fetch_document(net: &NetService, sink: &Sink, tab: u64, nav: u64, url: Url, body: Option<FormBody>, referrer: Option<Url>) -> RequestHandle {
+/// Fetch the document of a navigation. With `downloads` on, a response that is not something
+/// a tab shows (an attachment, an archive, a PDF, ...) is written to the Downloads folder
+/// instead and reported as `NetEvent::Download`; the tab then never gets a `Document`.
+pub fn fetch_document(net: &NetService, sink: &Sink, tab: u64, nav: u64, url: Url, body: Option<FormBody>, referrer: Option<Url>, downloads: bool) -> RequestHandle {
+    static NEXT_DOWNLOAD: AtomicU64 = AtomicU64::new(1);
     let mut req = Request::get(url, ResourceKind::Document);
     if let Some((b, content_type)) = body {
         req.method = Method::Post;
@@ -119,8 +209,26 @@ pub fn fetch_document(net: &NetService, sink: &Sink, tab: u64, nav: u64, url: Ur
         req.body = Some(b);
     }
     req.referrer = referrer;
-    let sink = sink.clone();
-    net.fetch(req, move |result| sink(NetEvent::Document { tab, nav, result }))
+    // 0 until the response has become a download, then that download's id
+    let became = Arc::new(AtomicU64::new(0));
+    let (on_start, on_progress, on_done, became_done) = (sink.clone(), sink.clone(), sink.clone(), became.clone());
+    net.fetch_with(
+        req,
+        move |head: &ResponseHead| {
+            let keep = downloads && (200..300).contains(&head.status) && (head.attachment || !shown_in_tab(&head.mime));
+            let Some(dir) = downloads_dir().filter(|_| keep) else { return BodyTarget::Memory };
+            let path = unique_path(&dir, &head.filename);
+            let name = path.file_name().map_or_else(|| head.filename.clone(), |n| n.to_string_lossy().into_owned());
+            let id = NEXT_DOWNLOAD.fetch_add(1, Ordering::SeqCst);
+            became.store(id, Ordering::SeqCst);
+            on_start(NetEvent::Download { tab, nav, id, update: DownloadUpdate::Started { name, path: path.clone(), total: head.length } });
+            BodyTarget::File { path, progress: Box::new(move |n| on_progress(NetEvent::Download { tab, nav, id, update: DownloadUpdate::Progress(n) })) }
+        },
+        move |result| match became_done.load(Ordering::SeqCst) {
+            0 => on_done(NetEvent::Document { tab, nav, result }),
+            id => on_done(NetEvent::Download { tab, nav, id, update: DownloadUpdate::Finished(result.map(|_| ())) }),
+        },
+    )
 }
 
 #[cfg(feature = "images")]
@@ -312,6 +420,34 @@ fn fetch_for(net: &NetService, sink: &Sink, tab: u64, nav: u64, page: &mut Page,
         let id = f.id;
         handles.push(net.fetch(req, move |result| sink(NetEvent::Fetch { tab, nav, page: pid, id, result })));
     }
+    // the WebSockets the page's scripts opened: the network stack decides whether each may
+    // connect (it applies the same rules as to requests) and says so through its events
+    // (refusing one runs the page's handlers, which may ask for another: a few rounds, so a
+    // handler that reconnects at once is served now and one that never stops cannot hold us)
+    for _ in 0..3 {
+        let asked = page.take_socket_requests();
+        if asked.is_empty() {
+            break;
+        }
+        for s in asked {
+            let (Ok(url), Some(d)) = (Url::parse(&s.url), doc.as_ref()) else {
+                page.socket_event(s.id, SocketEvent::Closed { code: 1006, reason: String::new(), clean: false });
+                continue;
+            };
+            let req = WsRequest {
+                url,
+                protocols: s.protocols,
+                top_level: top.cloned().unwrap_or_else(|| d.clone()),
+                initiator: framed.then(|| d.clone()),
+                top_local,
+                initiator_local: framed && doc_local,
+            };
+            let sink = sink.clone();
+            let id = s.id;
+            let handle = net.websocket(req, move |event| sink(NetEvent::Socket { tab, nav, page: pid, id, event }));
+            page.socket_opened(id, Box::new(Wire(handle)));
+        }
+    }
 }
 
 /// What script gets to see of a response: nothing at all if the request failed or was refused.
@@ -385,7 +521,7 @@ pub fn document_html(resp: &Response) -> String {
     }
     pages::error(
         "This file can't be shown",
-        &format!("The server sent a file of type \"{}\" ({} bytes). InvisBrowser does not download files yet.", mime, resp.body.len()),
+        &format!("The server sent a file of type \"{}\" ({} bytes), and there is no Downloads folder to save it in.", mime, resp.body.len()),
         resp.url.as_str(),
         None,
     )
@@ -464,5 +600,37 @@ mod tests {
         assert_eq!(query_param("invis://search?q=a+b%26c&x=1", "q").as_deref(), Some("a b&c"));
         assert_eq!(query_param("invis://settings/toggle?id=https_only", "id").as_deref(), Some("https_only"));
         assert_eq!(query_param("invis://settings", "id"), None);
+    }
+}
+
+#[cfg(test)]
+mod download_tests {
+    use super::*;
+
+    #[test]
+    fn a_download_never_takes_the_name_of_a_file_that_is_there() {
+        let dir = std::env::temp_dir().join(format!("invis-dl-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(unique_path(&dir, "report.pdf"), dir.join("report.pdf"));
+        std::fs::write(dir.join("report.pdf"), b"x").unwrap();
+        assert_eq!(unique_path(&dir, "report.pdf"), dir.join("report (1).pdf"));
+        std::fs::write(dir.join("report (1).pdf"), b"x").unwrap();
+        assert_eq!(unique_path(&dir, "report.pdf"), dir.join("report (2).pdf"));
+        // no extension, and a name that is only an extension
+        std::fs::write(dir.join("LICENSE"), b"x").unwrap();
+        assert_eq!(unique_path(&dir, "LICENSE"), dir.join("LICENSE (1)"));
+        std::fs::write(dir.join(".profile"), b"x").unwrap();
+        assert_eq!(unique_path(&dir, ".profile"), dir.join(".profile (1)"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn only_what_a_tab_cannot_show_is_kept_as_a_file() {
+        for shown in ["", "text/html", "application/xhtml+xml", "image/png", "text/plain", "application/json", "image/svg+xml", "text/javascript"] {
+            assert!(shown_in_tab(shown), "{shown}");
+        }
+        for kept in ["application/pdf", "application/zip", "application/octet-stream", "video/mp4", "audio/mpeg", "application/x-msdownload"] {
+            assert!(!shown_in_tab(kept), "{kept}");
+        }
     }
 }

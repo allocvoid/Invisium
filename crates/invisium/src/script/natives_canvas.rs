@@ -615,6 +615,12 @@ fn run_call(rt: &mut Runtime, cx: &Cx, canvas: NodeId, op: u16, first: Option<A>
         })
         .collect();
     dump_shader(kind, op, &args);
+    // with profiling on, every WebGL method is timed under its own name
+    let _t = crate::draw::prof::enabled().then(|| {
+        let version = if kind == 3 { gl::Version::WebGl2 } else { gl::Version::WebGl1 };
+        let name = gl::methods(version).iter().find(|m| m.1 == op).map_or("gl: ?", |m| m.0);
+        crate::draw::prof::span(name)
+    });
     let ret = {
         let mut st = cx.st.borrow_mut();
         let Some(dev) = st.page.gl_device.clone() else { return Ok(Value::Undefined) };

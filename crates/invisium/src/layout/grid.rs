@@ -1,8 +1,9 @@
 //! CSS Grid layout: explicit column tracks (lengths, percentages, `fr`, `auto`, `minmax()`,
 //! `repeat()` including auto-fill/auto-fit), row-major auto-placement with spans and explicit
-//! lines, content-sized rows. Named areas and subgrid are not supported.
+//! lines, named lines, content-sized rows. Subgrid is not supported.
 
 use super::*;
+use crate::atom::Atom;
 use crate::css::values::{GridAreas, GridLine, LenCtx, Track, TrackBreadth, TrackItem};
 use crate::style::Align;
 
@@ -47,6 +48,7 @@ fn expand_tracks(template: Option<&[TrackItem]>, ctx: &LenCtx, avail: Option<f32
     for item in template {
         match item {
             TrackItem::One(t) => out.push(t.clone()),
+            TrackItem::Names(_) => {}
             TrackItem::Repeat(n, ts) => {
                 for _ in 0..(*n).min(200) {
                     out.extend(ts.iter().cloned());
@@ -70,6 +72,31 @@ fn expand_tracks(template: Option<&[TrackItem]>, ctx: &LenCtx, avail: Option<f32
         }
     }
     out
+}
+
+/// The named lines of a template: (name, index of the line, counting from 0). Names after a
+/// `repeat(auto-fill, ...)` are left out: how many tracks that makes is not known here.
+fn line_names(template: Option<&[TrackItem]>) -> Vec<(Atom, usize)> {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    for item in template.unwrap_or(&[]) {
+        match item {
+            TrackItem::One(_) => at += 1,
+            TrackItem::Repeat(n, ts) => at += (*n).min(200) as usize * ts.len(),
+            TrackItem::AutoRepeat { .. } => break,
+            TrackItem::Names(names) => out.extend(names.iter().map(|&n| (n, at))),
+        }
+    }
+    out
+}
+
+/// A line given by name becomes the number of that line (or `auto` if the template has no
+/// such line); anything else stays as it is.
+fn numbered(g: GridLine, names: &[(Atom, usize)]) -> GridLine {
+    let GridLine::Named(name, nth) = g else { return g };
+    let mut hits = names.iter().filter(|n| n.0 == name).map(|n| n.1);
+    let found = if nth > 0 { hits.nth(nth as usize - 1) } else { hits.rev().nth((-nth) as usize - 1) };
+    found.map_or(GridLine::Auto, |i| GridLine::Line(i as i32 + 1))
 }
 
 fn line_index(g: GridLine, ntracks: usize) -> Option<usize> {
@@ -102,7 +129,7 @@ fn span_of(start: GridLine, end: GridLine, ntracks: usize) -> usize {
     }
 }
 
-fn place(l: &Layout, items: &[BoxId], ncols: usize, nrows_explicit: usize, areas: Option<&GridAreas>) -> Vec<Placed> {
+fn place(l: &Layout, items: &[BoxId], ncols: usize, nrows_explicit: usize, areas: Option<&GridAreas>, names: (&[(Atom, usize)], &[(Atom, usize)])) -> Vec<Placed> {
     let ncols = ncols.max(1);
     let mut occ: Vec<Vec<bool>> = Vec::new();
     let mut out = Vec::with_capacity(items.len());
@@ -140,14 +167,13 @@ fn place(l: &Layout, items: &[BoxId], ncols: usize, nrows_explicit: usize, areas
                     return (cs, rs, Some(c.min(ncols - cs)), Some(r));
                 }
             }
-            let cs = span_of(st.grid_column.0, st.grid_column.1, ncols).min(ncols);
-            let rs = span_of(st.grid_row.0, st.grid_row.1, nrows_explicit).min(1000);
-            let col = line_index(st.grid_column.0, ncols)
-                .or_else(|| line_index(st.grid_column.1, ncols).map(|e| e.saturating_sub(cs)))
-                .map(|c| c.min(ncols - cs));
-            let row = line_index(st.grid_row.0, nrows_explicit)
-                .or_else(|| line_index(st.grid_row.1, nrows_explicit).map(|e| e.saturating_sub(rs)))
-                .map(|r| r.min(10_000));
+            // lines given by name are looked up in the container's templates first
+            let gc = (numbered(st.grid_column.0, names.0), numbered(st.grid_column.1, names.0));
+            let gr = (numbered(st.grid_row.0, names.1), numbered(st.grid_row.1, names.1));
+            let cs = span_of(gc.0, gc.1, ncols).min(ncols);
+            let rs = span_of(gr.0, gr.1, nrows_explicit).min(1000);
+            let col = line_index(gc.0, ncols).or_else(|| line_index(gc.1, ncols).map(|e| e.saturating_sub(cs))).map(|c| c.min(ncols - cs));
+            let row = line_index(gr.0, nrows_explicit).or_else(|| line_index(gr.1, nrows_explicit).map(|e| e.saturating_sub(rs))).map(|r| r.min(10_000));
             (cs, rs, col, row)
         })
         .collect();
@@ -334,7 +360,8 @@ pub(crate) fn intrinsic(l: &mut Layout, id: BoxId) -> (f32, f32) {
         tracks.push(auto_track());
     }
     let items = items_of(l, id);
-    let placed = place(l, &items, tracks.len(), 0, areas.as_deref());
+    let (col_names, row_names) = (line_names(st.grid_template_columns.as_deref()), line_names(st.grid_template_rows.as_deref()));
+    let placed = place(l, &items, tracks.len(), 0, areas.as_deref(), (&col_names, &row_names));
     let (mins, maxs) = size_columns(l, &tracks, &placed, &ctx, None, gap);
     let gaps = gap * tracks.len().saturating_sub(1) as f32;
     let auto_repeat = st.grid_template_columns.as_deref().map_or(false, |t| t.iter().any(|i| matches!(i, TrackItem::AutoRepeat { .. })));
@@ -373,7 +400,8 @@ pub(crate) fn layout_grid(l: &mut Layout, id: BoxId, content_w: f32, definite_h:
     }
     let row_tracks = expand_tracks(st.grid_template_rows.as_deref(), &ctx, definite_h, row_gap);
     let items = items_of(l, id);
-    let placed = place(l, &items, tracks.len(), row_tracks.len(), areas.as_deref());
+    let (col_names, row_names) = (line_names(st.grid_template_columns.as_deref()), line_names(st.grid_template_rows.as_deref()));
+    let placed = place(l, &items, tracks.len(), row_tracks.len(), areas.as_deref(), (&col_names, &row_names));
     let (_, widths) = size_columns(l, &tracks, &placed, &ctx, Some(content_w), col_gap);
     let ncols = widths.len();
     let mut col_x = vec![0.0f32; ncols];

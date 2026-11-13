@@ -224,6 +224,8 @@ pub struct Runtime {
     pub(crate) frames: Vec<Frame>,
     pub(crate) handlers: Vec<Handler>,
     pub(crate) steps: u64,
+    /// Where script time goes, while that is being measured (see `profile.rs`).
+    pub(crate) prof: Option<Box<crate::profile::Profile>>,
     pub(crate) entry_depth: u32,
     pub(crate) native_depth: u32,
     pub(crate) stack_base: usize,
@@ -326,6 +328,7 @@ impl Runtime {
             frames: Vec::new(),
             handlers: Vec::new(),
             steps: 0,
+            prof: None,
             entry_depth: 0,
             native_depth: 0,
             stack_base: 0,

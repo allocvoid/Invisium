@@ -8,7 +8,7 @@
 //! with this page's. A frame's scripts run in an engine of their own, so documents can only
 //! talk to each other with messages, whatever their origins.
 
-use super::{Page, PageAction, PageConfig};
+use super::{Page, PageAction, PageConfig, PointerButton};
 use crate::atom::{a, Atom};
 use crate::dom::{NodeId, NO_NODE};
 use crate::draw::{Affine, ImageId, Item, Rect, NO_RADII};
@@ -371,24 +371,70 @@ impl Page {
         out
     }
 
-    /// A primary-button click at viewport coordinates. `new_tab` = ctrl/middle click.
+    /// A primary-button click at viewport coordinates: the button goes down and comes up
+    /// again. `new_tab` = ctrl was held.
     pub fn click(&mut self, x: f32, y: f32, new_tab: bool) -> PageAction {
-        if let Some((n, fx, fy)) = self.frame_at(x, y) {
-            self.blur_own();
-            if self.focus_frame != n {
+        self.press(x, y, PointerButton::Primary);
+        self.release(x, y, PointerButton::Primary, new_tab)
+    }
+
+    /// A button of the pointer went down at viewport coordinates.
+    pub fn press(&mut self, x: f32, y: f32, button: PointerButton) {
+        // focus goes to the document that takes the press
+        match self.frame_at(x, y) {
+            Some((n, fx, fy)) => {
+                self.blur_own();
+                if self.focus_frame != n {
+                    if let Some(f) = self.focused_frame() {
+                        f.blur();
+                    }
+                }
+                self.focus_frame = n;
+                self.press_frame = n;
+                if let Some(f) = self.frames.get_mut(&n) {
+                    f.page.press(fx, fy, button);
+                }
+            }
+            None => {
                 if let Some(f) = self.focused_frame() {
                     f.blur();
                 }
+                self.focus_frame = NO_NODE;
+                self.press_frame = NO_NODE;
+                self.press_own(x, y, button);
             }
-            self.focus_frame = n;
-            let action = self.frames.get_mut(&n).map_or(PageAction::None, |f| f.page.click(fx, fy, new_tab));
-            return self.frame_action(n, action);
         }
-        if let Some(f) = self.focused_frame() {
-            f.blur();
+    }
+
+    /// The button came up again at viewport coordinates. The document the press went to hears
+    /// about it wherever the pointer is by now; it is a click only if both happened over the
+    /// same document (see `release_own`).
+    pub fn release(&mut self, x: f32, y: f32, button: PointerButton, new_tab: bool) -> PageAction {
+        let over = self.frame_at(x, y);
+        let pressed_in = std::mem::replace(&mut self.press_frame, NO_NODE);
+        let redraw = |changed: bool| if changed { PageAction::Redraw } else { PageAction::None };
+        if pressed_in != NO_NODE {
+            return match over {
+                Some((n, fx, fy)) if n == pressed_in => {
+                    let action = self.frames.get_mut(&n).map_or(PageAction::None, |f| f.page.release(fx, fy, button, new_tab));
+                    self.frame_action(n, action)
+                }
+                _ => redraw(self.frames.get_mut(&pressed_in).map_or(false, |f| f.page.release_outside(button))),
+            };
         }
-        self.focus_frame = NO_NODE;
-        self.click_own(x, y, new_tab)
+        if over.is_some() {
+            return redraw(self.release_outside_own(button));
+        }
+        self.release_own(x, y, button, new_tab)
+    }
+
+    /// The button came up outside the page: the press ends without a click. Returns true if
+    /// the page has to be drawn again.
+    pub fn release_outside(&mut self, button: PointerButton) -> bool {
+        match std::mem::replace(&mut self.press_frame, NO_NODE) {
+            NO_NODE => self.release_outside_own(button),
+            n => self.frames.get_mut(&n).map_or(false, |f| f.page.release_outside(button)),
+        }
     }
 
     /// Scroll the frame under a point of the viewport, if there is one and it can still move

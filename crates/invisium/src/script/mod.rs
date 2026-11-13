@@ -9,6 +9,7 @@ mod natives;
 mod natives_anim;
 mod natives_canvas;
 mod natives_frames;
+mod natives_sockets;
 mod natives_env;
 mod serialize;
 #[cfg(test)]
@@ -41,6 +42,7 @@ const BOOTSTRAP: &str = concat!(
     include_str!("js/48_animation.js"),
     include_str!("js/49_canvas.js"),
     include_str!("js/49_frames.js"),
+    include_str!("js/49_sockets.js"),
     include_str!("js/50_window.js"),
 );
 
@@ -53,12 +55,45 @@ pub(crate) struct EventInit<'a> {
     pub key: Option<&'a str>,
     pub data: Option<&'a str>,
     pub submitter: NodeId,
+    /// Modifier keys that are down: `MOD_CTRL`, `MOD_SHIFT`, `MOD_ALT`.
+    pub mods: u8,
 }
+
+/// With profiling on (`INVIS_PROFILE`), say which piece of script work held the main thread
+/// for long: `what` ran from `start` to `called`, and its promise jobs from then until now.
+fn long_task(what: &str, start: Option<std::time::Instant>, called: Option<std::time::Instant>) {
+    let (Some(start), Some(called)) = (start, called) else { return };
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    let (run, jobs) = (ms(called - start), ms(called.elapsed()));
+    if run + jobs >= 30.0 {
+        let tail: String = what.chars().rev().take(70).collect::<Vec<_>>().into_iter().rev().collect();
+        eprintln!("long task: {run:.0} ms + {jobs:.0} ms of promise jobs in {tail}");
+    }
+}
+
+/// The time now, if profiling is on (the clock is not read otherwise).
+fn stopwatch() -> Option<std::time::Instant> {
+    crate::draw::prof::enabled().then(std::time::Instant::now)
+}
+
+pub(crate) const MOD_CTRL: u8 = 1;
+pub(crate) const MOD_SHIFT: u8 = 2;
+pub(crate) const MOD_ALT: u8 = 4;
 
 impl Default for EventInit<'_> {
     fn default() -> Self {
-        EventInit { x: 0.0, y: 0.0, button: 0, key: None, data: None, submitter: NO_NODE }
+        EventInit { x: 0.0, y: 0.0, button: 0, key: None, data: None, submitter: NO_NODE, mods: 0 }
     }
+}
+
+/// What the pointer did (see `ScriptEngine::pointer`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PointerInput {
+    Move = 0,
+    Down = 1,
+    Up = 2,
+    /// It is no longer over the page.
+    Leave = 3,
 }
 
 /// Entry points of the bootstrap script, kept alive for the page's lifetime.
@@ -76,6 +111,8 @@ struct Exports {
     anim: Value,
     anim_done: Value,
     message: Value,
+    pointer: Value,
+    socket: Value,
 }
 
 pub(crate) struct ScriptEngine {
@@ -101,6 +138,9 @@ impl ScriptEngine {
         }
         // Debugging aid: collect garbage at every n-th point where the engine may collect, so
         // a value this glue forgot to root fails at once instead of once in a thousand loads.
+        if crate::draw::prof::enabled() {
+            rt.set_profile(true);
+        }
         if let Some(n) = std::env::var("INVIS_GC_STRESS").ok().and_then(|v| v.parse::<u32>().ok()) {
             rt.set_gc_stress(n);
         }
@@ -132,6 +172,7 @@ impl ScriptEngine {
         natives_anim::install(&mut rt, n, &cx);
         natives_canvas::install(&mut rt, n, &cx);
         natives_frames::install(&mut rt, n, &cx);
+        natives_sockets::install(&mut rt, n, &cx);
         ScriptEngine { rt, cx, natives: n, exports: None, broken: false, tmp: Vec::new() }
     }
 
@@ -205,6 +246,8 @@ impl ScriptEngine {
                     anim: grab("anim"),
                     anim_done: grab("animDone"),
                     message: grab("message"),
+                    pointer: grab("pointer"),
+                    socket: grab("socket"),
                 });
             }
             Err(e) => {
@@ -264,6 +307,7 @@ impl ScriptEngine {
     }
 
     fn call_export(&mut self, f: Value, args: &[Value], context: &str) -> Option<Value> {
+        let t0 = stopwatch();
         let r = self.rt.call(f, Value::Undefined, args);
         let out = match r {
             Ok(v) => Some(v),
@@ -272,7 +316,9 @@ impl ScriptEngine {
                 None
             }
         };
+        let t1 = stopwatch();
         self.drain_jobs();
+        long_task(context, t0, t1);
         out
     }
 
@@ -280,6 +326,7 @@ impl ScriptEngine {
     pub fn run_script(&mut self, source: &str, url: &str, node: NodeId) {
         let Some(ex) = self.exports else { return };
         self.cx.st.borrow_mut().current_script = node;
+        let t0 = stopwatch();
         let r = self.rt.eval(source, url);
         if let Err(e) = r {
             self.report(url, &e);
@@ -289,9 +336,11 @@ impl ScriptEngine {
             let _ = self.rt.call(ex.uncaught, Value::Undefined, &[m]);
             self.release();
         }
+        let t1 = stopwatch();
         // The microtask checkpoint is part of running the script, so promise reactions queued
         // by it still see `document.currentScript` (bundler runtimes read it after an `await`).
         self.drain_jobs();
+        long_task(url, t0, t1);
         self.cx.st.borrow_mut().current_script = NO_NODE;
     }
 
@@ -307,6 +356,11 @@ impl ScriptEngine {
         let _ = self.rt.set(o, "clientX", Value::Number(init.x as f64));
         let _ = self.rt.set(o, "clientY", Value::Number(init.y as f64));
         let _ = self.rt.set(o, "button", Value::Number(init.button as f64));
+        for (bit, name) in [(MOD_CTRL, "ctrlKey"), (MOD_SHIFT, "shiftKey"), (MOD_ALT, "altKey")] {
+            if init.mods & bit != 0 {
+                let _ = self.rt.set(o, name, Value::Bool(true));
+            }
+        }
         if let Some(k) = init.key {
             let v = self.rt.string(k);
             self.keep(v);
@@ -326,6 +380,35 @@ impl ScriptEngine {
         let gesture = matches!(kind, "click" | "mousedown" | "mouseup" | "keydown" | "keyup" | "pointerdown" | "pointerup");
         self.cx.st.borrow_mut().user_gesture = gesture;
         let r = self.call_export(ex.event, &[t, ty, o], "event listener");
+        self.cx.st.borrow_mut().user_gesture = false;
+        self.release();
+        match r {
+            Some(v) => self.rt.to_boolean(v),
+            None => true,
+        }
+    }
+
+    /// The pointer moved, a button went down or came up, or it left the page. `target` is the
+    /// element under it, `button` the one that changed, `buttons` those that are down
+    /// afterwards (the bits of `MouseEvent.buttons`). Script hears it as pointer and mouse
+    /// events, with the events for crossing element borders in front. Returns false if a
+    /// listener cancelled the mouse event of a press or a release.
+    pub fn pointer(&mut self, kind: PointerInput, target: NodeId, pos: (f32, f32), button: i32, buttons: u8, mods: u8) -> bool {
+        let Some(ex) = self.exports else { return true };
+        let t = wrap(&mut self.rt, &self.cx, target);
+        let args = [
+            Value::Number(kind as u8 as f64),
+            t,
+            Value::Number(pos.0 as f64),
+            Value::Number(pos.1 as f64),
+            Value::Number(button as f64),
+            Value::Number(buttons as f64),
+            Value::Number(mods as f64),
+        ];
+        // a press or a release is the user asking for something (see `event`)
+        let gesture = matches!(kind, PointerInput::Down | PointerInput::Up);
+        self.cx.st.borrow_mut().user_gesture = gesture;
+        let r = self.call_export(ex.pointer, &args, "event listener");
         self.cx.st.borrow_mut().user_gesture = false;
         self.release();
         match r {
@@ -431,6 +514,33 @@ impl ScriptEngine {
         self.release();
     }
 
+    /// Something happened on one of the page's WebSockets.
+    pub fn socket_event(&mut self, id: u32, event: &crate::page::SocketEvent) {
+        use crate::page::SocketEvent as E;
+        let Some(ex) = self.exports else { return };
+        let mut args = vec![Value::Number(id as f64)];
+        match event {
+            E::Open { protocol } => {
+                let p = self.rt.string(protocol);
+                args.extend([Value::Number(0.0), self.keep(p)]);
+            }
+            E::Text(text) => {
+                let t = self.rt.string(text);
+                args.extend([Value::Number(1.0), self.keep(t)]);
+            }
+            E::Binary(data) => {
+                let b = self.rt.array_buffer(data);
+                args.extend([Value::Number(2.0), self.keep(b)]);
+            }
+            E::Closed { code, reason, clean } => {
+                let r = self.rt.string(reason);
+                args.extend([Value::Number(3.0), self.keep(r), Value::Number(*code as f64), Value::Bool(*clean)]);
+            }
+        }
+        self.call_export(ex.socket, &args, "socket listener");
+        self.release();
+    }
+
     /// Script animations (`Element.animate`) that reached their end.
     pub fn animations_finished(&mut self, ids: &[u32]) {
         let Some(ex) = self.exports else { return };
@@ -525,5 +635,11 @@ impl ScriptEngine {
 
     pub fn heap_bytes(&self) -> usize {
         self.rt.heap_bytes()
+    }
+
+    /// Where script time went since the last call: (function, milliseconds), most expensive
+    /// first. Empty unless profiling is on (`INVIS_PROFILE`).
+    pub fn take_profile(&mut self) -> Vec<(String, f64)> {
+        self.rt.take_profile().into_iter().map(|r| (r.what, r.ms)).collect()
     }
 }

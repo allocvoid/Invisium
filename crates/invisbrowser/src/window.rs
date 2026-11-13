@@ -4,7 +4,7 @@ use crate::app::Browser;
 use crate::loader::{NetEvent, Sink};
 use invis_chrome::{Action, Chrome, ChromeState, CursorKind, Input, Key, Mods, MouseButton, Theme};
 use invisium::draw::{DrawList, Glyph, Layer, Rect, Rgba, NO_RADII};
-use invisium::page::{PageAction, PointerKind};
+use invisium::page::{PageAction, PointerButton, PointerKind};
 use invisium_gfx::{GpuOptions, Renderer};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -88,6 +88,12 @@ impl LoopStats {
             self.timer_ms,
             extra
         );
+        if invisium::draw::prof::enabled() {
+            // where the main thread's time went in this second (see `INVIS_PROFILE`)
+            let lines: Vec<String> = invisium::draw::prof::report().lines().take(14).map(str::to_string).collect();
+            eprintln!("{}", lines.join("
+"));
+        }
         *self = LoopStats { on: true, since: Some(now), ..LoopStats::default() };
     }
 }
@@ -106,9 +112,15 @@ struct App {
     clip: Clip,
     mods: Mods,
     cursor: (f32, f32),
+    /// The buttons that went down on the page and are still held (see `press_bit`), and the
+    /// page they went down on.
+    page_press: u8,
+    page_press_id: u32,
     /// Where the page is drawn, in logical pixels.
     page_rect: Rect,
     last_click: (Instant, f32, f32, u8),
+    /// Debugging aid (`INVIS_TEST_INPUT`): pointer input still to be played back.
+    test_input: Vec<TestStep>,
     last_tick: Instant,
     /// When the last frame was started (frames are never started less than `FRAME_GAP` apart).
     last_frame: Instant,
@@ -304,19 +316,89 @@ impl App {
         self.redraw_soon();
     }
 
+    /// Play back the steps of `INVIS_TEST_INPUT` that are due, through the same code a real
+    /// mouse goes through. Returns when the next one is due.
+    fn play_test_input(&mut self) -> Option<Instant> {
+        while let Some(step) = self.test_input.first().copied() {
+            if Instant::now() < step.at {
+                return Some(step.at);
+            }
+            self.test_input.remove(0);
+            let z = self.zoom();
+            let (x, y) = (self.page_rect.x + step.x * z, self.page_rect.y + step.y * z);
+            match step.what {
+                'm' => self.mouse_move(x, y),
+                'd' => self.mouse_down(WButton::Left),
+                'w' => self.wheel(step.x),
+                _ => self.mouse_up(MouseButton::Left),
+            }
+            if std::env::var_os("INVIS_TEST_QUIET").is_none() {
+                let title = self.browser.tabs.get(self.browser.active).map_or(String::new(), |t| t.title.clone());
+                let scroll = self.browser.active_page().map(|p| p.scroll());
+                eprintln!("[test] {} at page {},{} (viewport {:?}, scroll {scroll:?}, title {title:?})", step.what, step.x, step.y, self.browser.viewport);
+            }
+        }
+        None
+    }
+
+    /// A press on the page ends without its release: the page it went to is no longer the one
+    /// in front (another tab), or the window lost the pointer (another window took over).
+    fn cancel_page_press(&mut self) {
+        if std::mem::take(&mut self.page_press) == 0 {
+            return;
+        }
+        let id = self.page_press_id;
+        let page = self.browser.tabs.iter_mut().filter_map(|t| t.page.as_mut()).map(|lp| &mut lp.page).find(|p| p.id() == id);
+        if page.map_or(false, |p| p.release_all()) {
+            self.redraw_soon();
+        }
+    }
+
+    /// True while a press on the page is going on and that page is still the one in front.
+    fn page_pressed(&mut self) -> bool {
+        if self.page_press == 0 {
+            return false;
+        }
+        let id = self.page_press_id;
+        if self.browser.active_page().map(|p| p.id()) != Some(id) {
+            self.cancel_page_press();
+        }
+        self.page_press != 0
+    }
+
+    /// The pointer is over the window but not over the page.
+    fn page_left(&mut self) {
+        if self.browser.active_page().map_or(false, |p| p.mouse_leave()) {
+            self.redraw_soon();
+        }
+    }
+
     fn mouse_move(&mut self, x: f32, y: f32) {
         self.cursor = (x, y);
-        if self.chrome_input(Input::MouseMove { x, y }) {
+        // while a button that went down on the page is held, the page keeps the pointer
+        let dragging = self.page_pressed();
+        if !dragging && self.chrome_input(Input::MouseMove { x, y }) {
             if self.browser.status.take().is_some() {
                 self.sync();
             }
+            self.page_left();
             return;
         }
-        let Some((px, py)) = self.page_point(x, y) else {
+        let point = match self.page_point(x, y) {
+            None if dragging => {
+                let z = self.zoom();
+                Some(((x - self.page_rect.x) / z, (y - self.page_rect.y) / z))
+            }
+            p => p,
+        };
+        let Some((px, py)) = point else {
             self.set_cursor(CursorKind::Default);
+            self.page_left();
             return;
         };
+        let mods = self.mods;
         let Some(page) = self.browser.active_page() else { return };
+        page.set_modifiers(mods.ctrl, mods.shift, mods.alt);
         let h = page.mouse_move(px, py);
         self.set_cursor(match h.pointer {
             Some(PointerKind::Pointer) => CursorKind::Pointer,
@@ -363,16 +445,43 @@ impl App {
             }
             return;
         }
-        if b == MouseButton::Right {
+        // the page hears the button go down now; what a click does happens when it comes up
+        let Some((px, py)) = self.page_point(x, y) else { return };
+        let pb = page_button(b);
+        let mods = self.mods;
+        self.page_pressed();
+        let Some(page) = self.browser.active_page() else { return };
+        page.set_modifiers(mods.ctrl, mods.shift, mods.alt);
+        page.press(px, py, pb);
+        let id = page.id();
+        self.page_press |= press_bit(pb);
+        self.page_press_id = id;
+        self.redraw_soon();
+    }
+
+    fn mouse_up(&mut self, b: MouseButton) {
+        let (x, y) = self.cursor;
+        self.chrome_input(Input::MouseUp { x, y, button: b });
+        let pb = page_button(b);
+        if !self.page_pressed() || self.page_press & press_bit(pb) == 0 {
             return;
         }
-        let Some((px, py)) = self.page_point(x, y) else { return };
-        let new_tab = b == MouseButton::Middle || self.mods.ctrl;
+        self.page_press &= !press_bit(pb);
+        let point = self.page_point(x, y);
+        let mods = self.mods;
         let Some(page) = self.browser.active_page() else { return };
-        let a = page.click(px, py, new_tab);
-        self.caret_on = true;
-        self.caret_elapsed = 0;
-        self.page_action(a);
+        page.set_modifiers(mods.ctrl, mods.shift, mods.alt);
+        match point {
+            Some((px, py)) => {
+                let a = page.release(px, py, pb, mods.ctrl);
+                self.caret_on = true;
+                self.caret_elapsed = 0;
+                self.page_action(a);
+            }
+            None => {
+                page.release_outside(pb);
+            }
+        }
         self.redraw_soon();
     }
 
@@ -803,6 +912,10 @@ impl ApplicationHandler<UserEvent> for App {
                 self.stats.frame_us += t.elapsed().as_micros() as u64;
             }
             WindowEvent::Focused(f) => {
+                if !f {
+                    // another window took over: a press on the page ends here
+                    self.cancel_page_press();
+                }
                 self.chrome_input(Input::WindowFocus(f));
                 self.redraw_soon();
             }
@@ -815,6 +928,10 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::ModifiersChanged(m) => {
                 let s = m.state();
                 self.mods = Mods { ctrl: s.control_key(), shift: s.shift_key(), alt: s.alt_key() };
+                let m = self.mods;
+                if let Some(p) = self.browser.active_page() {
+                    p.set_modifiers(m.ctrl, m.shift, m.alt);
+                }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let scale = self.window.as_ref().map_or(1.0, |w| w.scale_factor() as f32);
@@ -822,7 +939,8 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::CursorLeft { .. } => {
                 self.chrome_input(Input::MouseLeave);
-                let changed = self.browser.active_page().map_or(false, |p| p.mouse_leave());
+                // a page that holds the pointer for a press keeps it beyond the window's edge
+                let changed = !self.page_pressed() && self.browser.active_page().map_or(false, |p| p.mouse_leave());
                 if self.browser.status.take().is_some() {
                     self.sync();
                 } else if changed {
@@ -832,7 +950,6 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::MouseInput { state, button, .. } => match state {
                 ElementState::Pressed => self.mouse_down(button),
                 ElementState::Released => {
-                    let (x, y) = self.cursor;
                     let b = match button {
                         WButton::Left => Some(MouseButton::Left),
                         WButton::Middle => Some(MouseButton::Middle),
@@ -840,7 +957,7 @@ impl ApplicationHandler<UserEvent> for App {
                         _ => None,
                     };
                     if let Some(b) = b {
-                        self.chrome_input(Input::MouseUp { x, y, button: b });
+                        self.mouse_up(b);
                     }
                 }
             },
@@ -897,6 +1014,13 @@ impl ApplicationHandler<UserEvent> for App {
             let extra = format!("out-of-sight {} page-wants-frame {}", self.out_of_sight(), self.browser.active_wants_frame());
             self.stats.report(&extra);
         }
+        if let Some(due) = self.play_test_input() {
+            // a step of the test input is waiting: come back for it even if nothing else happens
+            el.set_control_flow(ControlFlow::WaitUntil(due.min(Instant::now() + Duration::from_millis(50))));
+            if !self.wants_frames() {
+                return;
+            }
+        }
         if self.wants_frames() {
             // something on the page is moving: the next frame follows as soon as the gap allows
             // (a frame that drew waited for the display; one that did not is paced here)
@@ -921,6 +1045,58 @@ impl ApplicationHandler<UserEvent> for App {
             self.last_tick = Instant::now();
             el.set_control_flow(ControlFlow::Wait);
         }
+    }
+}
+
+/// One step of scripted pointer input: at a time, move to a point of the page (`m`), or press
+/// (`d`) or release (`u`) the primary button there.
+#[derive(Clone, Copy)]
+struct TestStep {
+    at: Instant,
+    what: char,
+    x: f32,
+    y: f32,
+}
+
+/// Debugging aid: `INVIS_TEST_INPUT="2000 m 100 40; 2100 d; 2200 u; 3000 w 600"` plays pointer input back
+/// through the window's own handlers, each step that many milliseconds after start. Lets the
+/// path from the mouse to the page be checked without a hand on the mouse.
+fn test_steps(start: Instant) -> Vec<TestStep> {
+    let Ok(text) = std::env::var("INVIS_TEST_INPUT") else { return Vec::new() };
+    let mut out = Vec::new();
+    let (mut x, mut y) = (0.0, 0.0);
+    for step in text.split(';') {
+        let mut parts = step.split_whitespace();
+        let (Some(ms), Some(what)) = (parts.next().and_then(|v| v.parse::<u64>().ok()), parts.next().and_then(|v| v.chars().next())) else { continue };
+        if what == 'w' {
+            // the wheel: scroll by that many pixels
+            let dy = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+            out.push(TestStep { at: start + Duration::from_millis(ms), what, x: dy, y: 0.0 });
+            continue;
+        }
+        if what == 'm' {
+            x = parts.next().and_then(|v| v.parse().ok()).unwrap_or(x);
+            y = parts.next().and_then(|v| v.parse().ok()).unwrap_or(y);
+        }
+        out.push(TestStep { at: start + Duration::from_millis(ms), what, x, y });
+    }
+    out
+}
+
+fn page_button(b: MouseButton) -> PointerButton {
+    match b {
+        MouseButton::Left => PointerButton::Primary,
+        MouseButton::Middle => PointerButton::Middle,
+        MouseButton::Right => PointerButton::Secondary,
+    }
+}
+
+/// The bit of a button in `App::page_press`.
+fn press_bit(b: PointerButton) -> u8 {
+    match b {
+        PointerButton::Primary => 1,
+        PointerButton::Middle => 2,
+        PointerButton::Secondary => 4,
     }
 }
 
@@ -951,8 +1127,11 @@ pub fn run(start_url: Option<String>) -> i32 {
         clip: Clip(arboard::Clipboard::new().ok()),
         mods: Mods::default(),
         cursor: (0.0, 0.0),
+        page_press: 0,
+        page_press_id: 0,
         page_rect: Rect::ZERO,
         last_click: (now, 0.0, 0.0, 0),
+        test_input: test_steps(now),
         last_tick: now,
         last_frame: now,
         redraw_wanted: std::cell::Cell::new(true),

@@ -118,18 +118,26 @@ class MouseEvent extends UIEvent {
     super(type, init);
     copyInit(this, init, MODS);
     copyInit(this, init, { clientX: 0, clientY: 0, screenX: 0, screenY: 0, button: 0, buttons: 0, relatedTarget: null, movementX: 0, movementY: 0 });
-    var v = n.viewport();
+    var v = n.viewNow();
     this.pageX = this.clientX + v[2]; this.pageY = this.clientY + v[3];
     this.x = this.clientX; this.y = this.clientY;
-    this.offsetX = 0; this.offsetY = 0; this.which = this.button + 1;
+    this.which = this.button + 1;
   }
-  getModifierState() { return false; }
+  // where the pointer is inside the element the event is at
+  get offsetX() { var t = this.target; return t && t.nodeType === 1 ? this.clientX - n.rect(t)[0] : this.clientX; }
+  get offsetY() { var t = this.target; return t && t.nodeType === 1 ? this.clientY - n.rect(t)[1] : this.clientY; }
+  get layerX() { return this.pageX; }
+  get layerY() { return this.pageY; }
+  getModifierState(k) { return k === 'Control' ? this.ctrlKey : k === 'Shift' ? this.shiftKey : k === 'Alt' ? this.altKey : false; }
 }
 class PointerEvent extends MouseEvent {
   constructor(type, init) {
     super(type, init);
-    copyInit(this, init, { pointerId: 1, pointerType: 'mouse', isPrimary: true, width: 1, height: 1, pressure: 0 });
+    copyInit(this, init, { pointerId: 1, pointerType: 'mouse', isPrimary: true, width: 1, height: 1, pressure: 0,
+      tangentialPressure: 0, tiltX: 0, tiltY: 0, twist: 0 });
   }
+  getCoalescedEvents() { return [this]; }
+  getPredictedEvents() { return []; }
 }
 class WheelEvent extends MouseEvent {
   constructor(type, init) { super(type, init); copyInit(this, init, { deltaX: 0, deltaY: 0, deltaZ: 0, deltaMode: 0 }); }
@@ -141,7 +149,7 @@ class KeyboardEvent extends UIEvent {
     copyInit(this, init, { key: '', code: '', keyCode: 0, which: 0, charCode: 0, repeat: false, location: 0, isComposing: false });
     if (!this.which) this.which = this.keyCode;
   }
-  getModifierState() { return false; }
+  getModifierState(k) { return k === 'Control' ? this.ctrlKey : k === 'Shift' ? this.shiftKey : k === 'Alt' ? this.altKey : false; }
 }
 class FocusEvent extends UIEvent {
   constructor(type, init) { super(type, init); this.relatedTarget = (init && init.relatedTarget) || null; }
@@ -270,7 +278,8 @@ var EVENT_CLASSES = {
   mouseover: MouseEvent, mouseout: MouseEvent, mouseenter: MouseEvent, mouseleave: MouseEvent,
   contextmenu: MouseEvent, auxclick: MouseEvent, wheel: WheelEvent,
   pointerdown: PointerEvent, pointerup: PointerEvent, pointermove: PointerEvent, pointerover: PointerEvent,
-  pointerout: PointerEvent, pointerenter: PointerEvent, pointerleave: PointerEvent,
+  pointerout: PointerEvent, pointerenter: PointerEvent, pointerleave: PointerEvent, pointercancel: PointerEvent,
+  gotpointercapture: PointerEvent, lostpointercapture: PointerEvent,
   keydown: KeyboardEvent, keyup: KeyboardEvent, keypress: KeyboardEvent,
   focus: FocusEvent, blur: FocusEvent, focusin: FocusEvent, focusout: FocusEvent,
   input: InputEvent, beforeinput: InputEvent, submit: SubmitEvent,
@@ -289,4 +298,99 @@ function trusted(target, type, init) {
   var ev = new C(type, init);
   ev.isTrusted = true;
   return dispatch(target, ev);
+}
+
+// ───────────────────────────── the pointer ─────────────────────────────
+
+// What scripts were last told about the pointer: the element under it, where it is, which
+// buttons are down, the element that captured it, and whether the page cancelled the mouse
+// events of the press that is going on.
+var PTR = { over: null, x: 0, y: 0, known: false, buttons: 0, capture: null, noMouse: false };
+
+function pointerEvent(target, type, s, related) {
+  return trusted(target, type, {
+    clientX: s.x, clientY: s.y, screenX: s.x, screenY: s.y, button: s.button, buttons: s.buttons,
+    ctrlKey: s.ctrl, shiftKey: s.shift, altKey: s.alt, movementX: s.mx, movementY: s.my,
+    relatedTarget: related || null, pressure: s.buttons ? 0.5 : 0, detail: s.detail || 0
+  });
+}
+
+function elementChain(el) {
+  var out = [];
+  for (var p = el; p && p.nodeType === 1; p = p.parentNode) out.push(p);
+  return out;
+}
+
+// The pointer went from over `from` to over `to` (null = not over the page): `out` and `over`
+// at the two elements, `leave` and `enter` at every element it left or came into. All the
+// pointer events of the crossing come first, then the mouse events.
+function pointerCrossed(from, to, s) {
+  var a = from ? elementChain(from) : [], b = to ? elementChain(to) : [], i;
+  var kinds = PTR.noMouse ? ['pointer'] : ['pointer', 'mouse'];
+  for (var k = 0; k < kinds.length; k++) {
+    var p = kinds[k];
+    if (from) {
+      pointerEvent(from, p + 'out', s, to);
+      for (i = 0; i < a.length; i++) if (b.indexOf(a[i]) < 0) pointerEvent(a[i], p + 'leave', s, to);
+    }
+    if (to) {
+      pointerEvent(to, p + 'over', s, from);
+      for (i = b.length - 1; i >= 0; i--) if (a.indexOf(b[i]) < 0) pointerEvent(b[i], p + 'enter', s, from);
+    }
+  }
+}
+
+// Scripts hear that the pointer is over `over` now (null = not over the page), if that is news.
+function pointerOver(over, s) {
+  if (over === PTR.over) return;
+  var from = PTR.over, button = s.button;
+  PTR.over = over;
+  s.button = 0;
+  pointerCrossed(from && from.isConnected ? from : null, over, s);
+  s.button = button;
+}
+
+// Pointer input, as the engine tells it: `kind` 0 = it moved, 1 = a button went down, 2 = a
+// button came up, 3 = it left the page. `target` is the element under it. Returns false if
+// the page cancelled the mouse event of a press or a release.
+function pointerInput(kind, target, x, y, button, buttons, mods) {
+  var s = {
+    x: x, y: y, button: button, buttons: buttons, ctrl: !!(mods & 1), shift: !!(mods & 2), alt: !!(mods & 4),
+    mx: PTR.known ? x - PTR.x : 0, my: PTR.known ? y - PTR.y : 0
+  };
+  PTR.x = x; PTR.y = y; PTR.known = kind !== 3; PTR.buttons = buttons;
+  if (kind === 3) target = null;
+  // an element that captured the pointer gets its events, and counts as what the pointer is
+  // over, until the buttons are up (or the element is gone)
+  if (PTR.capture && !PTR.capture.isConnected) PTR.capture = null;
+  var dest = target && PTR.capture ? PTR.capture : target;
+  pointerOver(dest, s);
+  if (kind === 3 || !target) return true;
+  if (kind === 0) {
+    s.button = -1;
+    pointerEvent(dest, 'pointermove', s);
+    s.button = 0;
+    if (!PTR.noMouse) pointerEvent(dest, 'mousemove', s);
+    return true;
+  }
+  s.detail = 1;
+  if (kind === 1) {
+    // a page that cancels `pointerdown` gets no mouse events until the buttons are up again
+    PTR.noMouse = !pointerEvent(dest, 'pointerdown', s);
+    return PTR.noMouse ? true : pointerEvent(dest, 'mousedown', s);
+  }
+  var ok = true;
+  pointerEvent(dest, 'pointerup', s);
+  if (!PTR.noMouse) ok = pointerEvent(dest, 'mouseup', s);
+  if (!buttons) {
+    PTR.noMouse = false;
+    if (PTR.capture) {
+      var c = PTR.capture;
+      PTR.capture = null;
+      pointerEvent(c, 'lostpointercapture', s);
+      // the pointer is over what is really under it again
+      pointerOver(target, s);
+    }
+  }
+  return ok;
 }

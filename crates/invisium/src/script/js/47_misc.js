@@ -5,22 +5,7 @@ var HAS_BYTES = typeof Uint8Array === 'function';
 
 class TextEncoder {
   get encoding() { return 'utf-8'; }
-  encode(input) {
-    var s = input === undefined ? '' : String(input), out = [], i, c;
-    for (i = 0; i < s.length; i++) {
-      c = s.charCodeAt(i);
-      if (c >= 0xD800 && c <= 0xDBFF && i + 1 < s.length) {
-        var d = s.charCodeAt(i + 1);
-        if (d >= 0xDC00 && d <= 0xDFFF) { c = 0x10000 + ((c - 0xD800) << 10) + (d - 0xDC00); i++; }
-      }
-      if (c >= 0xD800 && c <= 0xDFFF) c = 0xFFFD; // a lone surrogate
-      if (c < 0x80) out.push(c);
-      else if (c < 0x800) out.push(0xC0 | (c >> 6), 0x80 | (c & 63));
-      else if (c < 0x10000) out.push(0xE0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
-      else out.push(0xF0 | (c >> 18), 0x80 | ((c >> 12) & 63), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
-    }
-    return new Uint8Array(out);
-  }
+  encode(input) { return new Uint8Array(n.encode(input === undefined ? '' : String(input))); }
 }
 function bytesOf(v) {
   if (v === undefined || v === null) return new Uint8Array(0);
@@ -34,25 +19,8 @@ class TextDecoder {
     if (l !== 'utf-8' && l !== 'utf8' && l !== 'unicode-1-1-utf-8') throw new RangeError("The encoding '" + label + "' is not supported");
   }
   get encoding() { return 'utf-8'; }
-  decode(input) {
-    var b = bytesOf(input), out = '', i = 0, n1 = b.length, c, need, min;
-    if (n1 >= 3 && b[0] === 0xEF && b[1] === 0xBB && b[2] === 0xBF) i = 3;
-    while (i < n1) {
-      c = b[i++];
-      if (c < 0x80) { out += String.fromCharCode(c); continue; }
-      if (c >= 0xC2 && c < 0xE0) { need = 1; c &= 31; min = 0x80; }
-      else if (c >= 0xE0 && c < 0xF0) { need = 2; c &= 15; min = 0x800; }
-      else if (c >= 0xF0 && c < 0xF5) { need = 3; c &= 7; min = 0x10000; }
-      else { out += '�'; continue; }
-      var ok = i + need <= n1, j;
-      for (j = 0; ok && j < need; j++) { var t = b[i + j]; if ((t & 0xC0) !== 0x80) ok = false; else c = (c << 6) | (t & 63); }
-      if (!ok || c < min || c > 0x10FFFF || (c >= 0xD800 && c <= 0xDFFF)) { out += '�'; continue; }
-      i += need;
-      if (c > 0xFFFF) { c -= 0x10000; out += String.fromCharCode(0xD800 + (c >> 10), 0xDC00 + (c & 0x3FF)); }
-      else out += String.fromCharCode(c);
-    }
-    return out;
-  }
+  // malformed bytes become U+FFFD and a leading byte-order mark is dropped, natively
+  decode(input) { var b = bytesOf(input); return b.length ? n.decode(b, 'utf-8') : ''; }
 }
 
 var crypto = {

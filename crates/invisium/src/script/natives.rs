@@ -27,7 +27,16 @@ pub(crate) type Native = fn(&mut Runtime, &Cx, &[Value]) -> NRes;
 
 pub(crate) fn def(rt: &mut Runtime, obj: Value, cx: &Rc<Cx>, name: &str, arity: u32, f: Native) {
     let cx = cx.clone();
-    let func = rt.function(name, arity, Rc::new(move |rt: &mut Runtime, _this: Value, args: &[Value]| f(rt, &cx, args)));
+    // with profiling on, each native is timed under its name (the label is made once and kept)
+    let label: Option<&'static str> = crate::draw::prof::enabled().then(|| &*Box::leak(format!("native: {name}").into_boxed_str()));
+    let func = rt.function(
+        name,
+        arity,
+        Rc::new(move |rt: &mut Runtime, _this: Value, args: &[Value]| {
+            let _t = label.map(crate::draw::prof::span);
+            f(rt, &cx, args)
+        }),
+    );
     // installed from outside any native call: keep the function alive until it is stored
     let root = rt.root(func);
     let _ = rt.set(obj, name, func);

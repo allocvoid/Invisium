@@ -38,6 +38,7 @@ mod parser_func;
 mod parser_module;
 mod parser_primary;
 mod parser_stmt;
+mod profile;
 mod promise;
 mod props;
 mod proxy;
@@ -46,6 +47,7 @@ mod scope;
 mod value;
 mod vm;
 
+pub use profile::ProfileRow;
 pub use runtime::{ClassId, ErrorKind, HostClass, JsError, Limits, RootId, Runtime, Thrown};
 pub use value::{BigId, NativeFn, ObjId, StrId, SymId, Value};
 
@@ -129,6 +131,9 @@ impl Runtime {
                 // e.g. after an out-of-memory abort: reclaim before running anything new
                 self.collect_garbage();
             }
+        }
+        if self.entry_depth == 0 {
+            self.profile_enter();
         }
         self.entry_depth += 1;
     }
