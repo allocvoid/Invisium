@@ -1,0 +1,16 @@
+[package]
+name = "invisium-glsl"
+description = "Invisium shader translator: GLSL ES 1.00 / 3.00 to WGSL, with the reflection data WebGL needs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# ── DEPENDENCY ALLOWLIST ── do not add, remove or re-feature entries (see docs/agents/RULES.md).
+[dependencies]
+invisium-draw = { path = "../invisium-draw" }
+
+[dev-dependencies]
+naga = { version = "24", features = ["wgsl-in"] }   # tests only: is the WGSL we emit valid?
+wgpu = "24"                                          # tests only: run translated shaders on the GPU
+pollster = "0.4"
+bytemuck = "1"

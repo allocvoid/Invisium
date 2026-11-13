@@ -1,0 +1,10 @@
+[package]
+name = "invisium-canvas"
+description = "Invisium 2D canvas: CanvasRenderingContext2D state machine and software rasteriser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# ── DEPENDENCY ALLOWLIST ── do not add, remove or re-feature entries (see docs/agents/RULES.md).
+[dependencies]
+invisium-draw = { path = "../invisium-draw" }

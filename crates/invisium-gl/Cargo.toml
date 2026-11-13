@@ -1,0 +1,11 @@
+[package]
+name = "invisium-gl"
+description = "Invisium WebGL state machine: WebGL 1 / 2 semantics on the CPU, emitting GPU commands"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# ── DEPENDENCY ALLOWLIST ── do not add, remove or re-feature entries (see docs/agents/RULES.md).
+[dependencies]
+invisium-draw = { path = "../invisium-draw" }
+invisium-glsl = { path = "../invisium-glsl" }

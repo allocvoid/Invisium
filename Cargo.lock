@@ -2403,10 +2403,19 @@ name = "invisium"
 version = "0.1.0"
 dependencies = [
  "ab_glyph",
+ "invisium-canvas",
  "invisium-draw",
+ "invisium-gl",
  "invisium-js",
  "memmap2",
  "woff2-patched",
+]
+
+[[package]]
+name = "invisium-canvas"
+version = "0.1.0"
+dependencies = [
+ "invisium-draw",
 ]
 
 [[package]]
@@ -2422,6 +2431,25 @@ dependencies = [
  "bytemuck",
  "image",
  "invisium-draw",
+ "pollster",
+ "wgpu",
+]
+
+[[package]]
+name = "invisium-gl"
+version = "0.1.0"
+dependencies = [
+ "invisium-draw",
+ "invisium-glsl",
+]
+
+[[package]]
+name = "invisium-glsl"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "invisium-draw",
+ "naga",
  "pollster",
  "wgpu",
 ]

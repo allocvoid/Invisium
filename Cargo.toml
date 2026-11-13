@@ -7,6 +7,9 @@ members = [
     "crates/invisium-regex",  # regular-expression engine (used by the JavaScript engine)
     "crates/invisium-js",     # JavaScript engine
     "crates/invisium-gfx",    # GPU renderer, image decoding, SVG rasteriser
+    "crates/invisium-glsl",   # shader translator: GLSL ES to WGSL (WebGL)
+    "crates/invisium-gl",     # WebGL state machine (emits GPU commands)
+    "crates/invisium-canvas", # 2D canvas: state machine and software rasteriser
     "crates/invis-chrome",    # browser chrome UI kit + internal pages
     "crates/invisbrowser",    # the browser application
 ]

@@ -13,6 +13,9 @@
 //! [`Layer`] says where the list lands on the surface, in physical pixels:
 //! `physical = layer.viewport.origin + (list_pos - layer.scroll) * layer.scale`.
 
+/// The WebGL command contract between the GL state machine and the GPU side.
+pub mod gl;
+
 /// Axis-aligned rectangle: origin at the top-left, y grows downward.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct Rect {
