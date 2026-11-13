@@ -124,12 +124,40 @@ impl Runtime {
             self.pending_steps.set(0);
             self.abort_stack.clear();
             self.stack_base = vm::stack_addr();
-            if self.total_heap() > self.limits.max_heap_bytes || self.gc_requested {
+            let over = self.total_heap() > self.limits.max_heap_bytes;
+            if self.gc_due() || over {
                 // e.g. after an out-of-memory abort: reclaim before running anything new
                 self.collect_garbage();
             }
         }
         self.entry_depth += 1;
+    }
+
+    /// `host_enter` for an API call whose inputs are `vals`: they are rooted before the
+    /// collection `host_enter` may run and stay rooted for the whole call (an embedder's
+    /// arguments often exist only in its Rust locals). Returns the mark for `finish_with`.
+    pub(crate) fn host_enter_with(&mut self, vals: &[Value], more: &[Value]) -> usize {
+        let mark = self.scratch.len();
+        self.scratch.extend_from_slice(vals);
+        self.scratch.extend_from_slice(more);
+        self.host_enter();
+        mark
+    }
+
+    /// `finish` for an entry made with `host_enter_with`: also unroots the inputs.
+    pub(crate) fn finish_with<T>(&mut self, r: Result<T, Exc>, mark: usize) -> Result<T, JsError> {
+        let r = self.finish(r);
+        self.scratch.truncate(mark);
+        r
+    }
+
+    /// Inside a native, a value handed back to it from script stays rooted until the native
+    /// returns: natives keep such values in Rust locals while they call back into script.
+    #[inline]
+    pub(crate) fn keep_for_native(&mut self, v: Value) {
+        if self.native_active && matches!(v, Value::Object(_) | Value::String(_) | Value::BigInt(_)) {
+            self.scratch.push(v);
+        }
     }
 
     fn host_exit(&mut self) {
@@ -255,9 +283,13 @@ impl Runtime {
     }
 
     pub fn call(&mut self, func: Value, this: Value, args: &[Value]) -> Result<Value, JsError> {
-        self.host_enter();
+        let mark = self.host_enter_with(&[func, this], args);
         let r = self.call_value(func, this, args);
-        self.finish(r)
+        let r = self.finish_with(r, mark);
+        if let Ok(v) = r {
+            self.keep_for_native(v);
+        }
+        r
     }
 
     pub fn global(&self) -> Value {
@@ -281,37 +313,47 @@ impl Runtime {
     }
 
     pub fn get(&mut self, obj: Value, key: &str) -> Result<Value, JsError> {
-        self.host_enter();
+        let mark = self.host_enter_with(&[obj], &[]);
         let k = self.key_str(key);
         let r = self.get_prop(obj, k);
-        self.finish(r)
+        let r = self.finish_with(r, mark);
+        if let Ok(v) = r {
+            self.keep_for_native(v);
+        }
+        r
     }
 
     pub fn set(&mut self, obj: Value, key: &str, value: Value) -> Result<(), JsError> {
-        self.host_enter();
+        let mark = self.host_enter_with(&[obj, value], &[]);
         let k = self.key_str(key);
         let r = self.set_prop(obj, k, value, obj).map(|_| ());
-        self.finish(r)
+        self.finish_with(r, mark)
     }
 
     pub fn get_index(&mut self, obj: Value, index: u32) -> Result<Value, JsError> {
-        self.host_enter();
+        let mark = self.host_enter_with(&[obj], &[]);
         let r = props_get_index(self, obj, index);
-        self.finish(r)
+        let r = self.finish_with(r, mark);
+        if let Ok(v) = r {
+            self.keep_for_native(v);
+        }
+        r
     }
 
     /// ToString; "" if it throws.
     pub fn to_string_lossy(&mut self, v: Value) -> String {
-        self.host_enter();
+        let mark = self.host_enter_with(&[v], &[]);
         let r = self.to_str(v).map(|s| self.rust_string(s));
         self.host_exit();
+        self.scratch.truncate(mark);
         r.unwrap_or_default()
     }
 
     pub fn to_number(&mut self, v: Value) -> f64 {
-        self.host_enter();
+        let mark = self.host_enter_with(&[v], &[]);
         let r = ops_to_number(self, v);
         self.host_exit();
+        self.scratch.truncate(mark);
         r.unwrap_or(f64::NAN)
     }
 
@@ -353,6 +395,29 @@ impl Runtime {
         }
     }
 
+    /// Keeps `v` alive across collections until `unroot`.
+    ///
+    /// The embedder's rule. The runtime collects only inside calls that can run script:
+    /// `eval`, `run`, `call`, `construct`, `get`, `set`, `get_index`, `define_property`,
+    /// `define_accessor`, `to_string_lossy`, `to_number`, `run_jobs`, `run_module`,
+    /// `finish_import` and `gc`. Calls that only make or inspect values (`string`, `object`,
+    /// `array`, `function`, `new_promise`, `host_object`, `host_id`, `type_of`, `to_boolean`,
+    /// `is_callable`, `root`) never collect. So:
+    /// - A value made with `string` / `object` / `array` / `function` (or returned by any call)
+    ///   may sit unrooted in a Rust local until the next collecting call. Values passed *as
+    ///   arguments* to that call (the function, `this`, the arguments, the object and value of
+    ///   `set`, ...) are rooted by the call itself for its whole duration, so making a value
+    ///   and passing it straight in is safe.
+    /// - A value kept *across* a collecting call it is not an argument of (across another
+    ///   `call`, `set`, `run_jobs`, an `eval`, ...) must be rooted first; otherwise it may be
+    ///   freed and its handle may later name an unrelated object.
+    /// - Inside a native function (and a host-class hook called from one): `this`, the
+    ///   arguments, everything the native allocates, and every value it gets back from
+    ///   `call` / `construct` / `get` / `get_index` stay alive until the native returns. A
+    ///   value the native returns is rooted by the engine from then on.
+    /// - Values that must outlive the current entry (a timer callback, an event listener, a
+    ///   promise to settle later) must be rooted, and unrooted when no longer needed. Host
+    ///   objects made with `host_object` are always kept alive by the runtime.
     pub fn root(&mut self, v: Value) -> RootId {
         let id = self.next_root;
         self.next_root = self.next_root.wrapping_add(1);
@@ -366,6 +431,18 @@ impl Runtime {
 
     pub fn gc(&mut self) {
         self.collect_garbage();
+    }
+
+    /// Collect garbage at every `every`-th point at which the engine may collect at all
+    /// (0 = normal behaviour). For tests and for embedders hunting rooting mistakes.
+    pub fn set_gc_stress(&mut self, every: u32) {
+        self.gc_stress = every;
+        self.gc_stress_tick = 0;
+    }
+
+    /// Number of collections so far.
+    pub fn gc_count(&self) -> u64 {
+        self.gc_count
     }
 
     pub fn heap_bytes(&self) -> usize {

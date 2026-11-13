@@ -48,7 +48,7 @@ impl Runtime {
 
     /// Define or replace an accessor property (configurable). `None` = no getter / no setter.
     pub fn define_accessor(&mut self, obj: Value, key: &str, getter: Option<Value>, setter: Option<Value>, enumerable: bool) -> Result<(), JsError> {
-        self.host_enter();
+        let mark = self.host_enter_with(&[obj, getter.unwrap_or(Value::Undefined), setter.unwrap_or(Value::Undefined)], &[]);
         let mut r = Ok(());
         for f in [getter, setter].into_iter().flatten() {
             if f != Value::Undefined && !self.is_callable_val(f) {
@@ -58,22 +58,26 @@ impl Runtime {
         let flags = ACCESSOR | CONFIGURABLE | if enumerable { ENUMERABLE } else { 0 };
         let p = Prop { value: getter.unwrap_or(Value::Undefined), setter: setter.unwrap_or(Value::Undefined), flags };
         let r = r.and_then(|_| self.define_from_host(obj, key, p));
-        self.finish(r)
+        self.finish_with(r, mark)
     }
 
     /// Define or replace a data property with explicit attributes.
     pub fn define_property(&mut self, obj: Value, key: &str, value: Value, writable: bool, enumerable: bool, configurable: bool) -> Result<(), JsError> {
-        self.host_enter();
+        let mark = self.host_enter_with(&[obj, value], &[]);
         let flags = if writable { WRITABLE } else { 0 } | if enumerable { ENUMERABLE } else { 0 } | if configurable { CONFIGURABLE } else { 0 };
         let r = self.define_from_host(obj, key, Prop::data(value, flags));
-        self.finish(r)
+        self.finish_with(r, mark)
     }
 
     /// `new ctor(...args)`.
     pub fn construct(&mut self, ctor: Value, args: &[Value]) -> Result<Value, JsError> {
-        self.host_enter();
+        let mark = self.host_enter_with(&[ctor], args);
         let r = self.construct_value(ctor, args, ctor);
-        self.finish(r)
+        let r = self.finish_with(r, mark);
+        if let Ok(v) = r {
+            self.keep_for_native(v);
+        }
+        r
     }
 
     /// Drains the promise job queue. An unhandled rejection is not an error here; a step-budget

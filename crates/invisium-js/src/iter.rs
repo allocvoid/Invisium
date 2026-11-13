@@ -131,11 +131,18 @@ impl Runtime {
         self.iterate_to_vec_ex(v, false)
     }
 
+    /// Inside a native the items stay rooted until the native returns: they may be reachable
+    /// from nothing else (a generator's values, an array the next callback empties) while the
+    /// native goes on to call script.
     pub(crate) fn iterate_to_vec_ex(&mut self, v: Value, at_site: bool) -> JsResult<Vec<Value>> {
         if let Value::Object(o) = v {
             if self.array_iter_pristine(o) {
                 if let ObjKind::Array(items) = &self.obj(o).kind {
-                    return Ok(items.iter().map(|x| x.unwrap_or(Value::Undefined)).collect());
+                    let items: Vec<Value> = items.iter().map(|x| x.unwrap_or(Value::Undefined)).collect();
+                    if self.native_active {
+                        self.scratch.extend(items.iter().copied().filter(|x| matches!(x, Value::Object(_) | Value::String(_) | Value::BigInt(_))));
+                    }
+                    return Ok(items);
                 }
             }
         }
@@ -143,7 +150,9 @@ impl Runtime {
         let mark = self.scratch.len();
         self.scratch.push(it);
         let r = self.collect_iter(it);
-        self.scratch.truncate(mark);
+        if !self.native_active {
+            self.scratch.truncate(mark);
+        }
         r
     }
 

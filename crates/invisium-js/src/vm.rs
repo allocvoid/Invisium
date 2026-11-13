@@ -96,7 +96,7 @@ impl Runtime {
         if self.steps > self.limits.step_budget {
             return Err(Exc::Abort(ErrorKind::StepBudget));
         }
-        if self.gc_requested {
+        if self.gc_due() {
             self.collect_garbage();
             if self.total_heap() > self.limits.max_heap_bytes {
                 return Err(Exc::Abort(ErrorKind::OutOfMemory));
@@ -143,7 +143,13 @@ impl Runtime {
 
     /// Pushes a frame for a closure whose arguments are already at `stack[args_base..]`.
     pub(crate) fn push_frame(&mut self, f: ObjId, this: Value, new_target: Value, args_base: usize, ret_sp: usize, construct: bool) -> JsResult<()> {
-        self.safepoint()?;
+        // the callee, `this` (for `new`, an object allocated just now) and `new.target` are in
+        // no frame yet: keep them alive across the collection the safepoint may run
+        let mark = self.scratch.len();
+        self.scratch.extend_from_slice(&[Value::Object(f), this, new_target]);
+        let sp = self.safepoint();
+        self.scratch.truncate(mark);
+        sp?;
         if self.frames.len() as u32 >= self.limits.max_call_depth {
             return Err(self.stack_overflow());
         }
@@ -359,8 +365,26 @@ impl Runtime {
         r
     }
 
-    /// Calls any callable value from Rust (nested run for closures).
+    /// Runs `f` with `v` rooted: for a value held in a Rust local while `f` may run script.
+    pub(crate) fn holding<T>(&mut self, v: Value, f: impl FnOnce(&mut Runtime) -> T) -> T {
+        let mark = self.scratch.len();
+        self.scratch.push(v);
+        let r = f(self);
+        self.scratch.truncate(mark);
+        r
+    }
+
+    /// Calls any callable value from Rust (nested run for closures). Inside a native, the
+    /// result stays rooted until that native returns.
     pub(crate) fn call_value(&mut self, f: Value, this: Value, args: &[Value]) -> JsResult<Value> {
+        let r = self.call_value_raw(f, this, args);
+        if let Ok(v) = r {
+            self.keep_for_native(v);
+        }
+        r
+    }
+
+    fn call_value_raw(&mut self, f: Value, this: Value, args: &[Value]) -> JsResult<Value> {
         let Value::Object(fo) = f else {
             return Err(self.type_error("value is not a function"));
         };
@@ -445,8 +469,16 @@ impl Runtime {
         Ok(())
     }
 
-    /// [[Construct]] from Rust.
+    /// [[Construct]] from Rust. Inside a native, the result stays rooted until it returns.
     pub(crate) fn construct_value(&mut self, f: Value, args: &[Value], new_target: Value) -> JsResult<Value> {
+        let r = self.construct_value_raw(f, args, new_target);
+        if let Ok(v) = r {
+            self.keep_for_native(v);
+        }
+        r
+    }
+
+    fn construct_value_raw(&mut self, f: Value, args: &[Value], new_target: Value) -> JsResult<Value> {
         if !self.is_constructor(f) {
             return Err(self.type_error("value is not a constructor"));
         }

@@ -235,6 +235,27 @@ impl Runtime {
         }
     }
 
+    /// Asked at each point where the engine may collect: should it collect here? True when an
+    /// allocation requested a collection, or when GC stress says this point's turn has come.
+    #[inline]
+    pub(crate) fn gc_due(&mut self) -> bool {
+        let r = self.gc_requested;
+        self.gc_due_or(r)
+    }
+
+    /// Like `gc_due` for a point whose own condition is `cond` instead of `gc_requested`.
+    #[inline]
+    pub(crate) fn gc_due_or(&mut self, cond: bool) -> bool {
+        if self.gc_stress != 0 {
+            self.gc_stress_tick += 1;
+            if self.gc_stress_tick >= self.gc_stress {
+                self.gc_stress_tick = 0;
+                return true;
+            }
+        }
+        cond
+    }
+
     pub(crate) fn grow(&mut self, bytes: usize) {
         self.heap_bytes += bytes;
         self.note_alloc();
@@ -285,6 +306,7 @@ impl Runtime {
 
     // ---- garbage collection ----
     pub(crate) fn collect_garbage(&mut self) {
+        self.gc_count += 1;
         let mut mo = vec![false; self.objs.len()];
         let mut me = vec![false; self.envs.len()];
         let mut ms = vec![false; self.strs.len()];
@@ -310,10 +332,12 @@ impl Runtime {
             i.set_iter_proto, i.weakmap_proto, i.weakset_proto, i.regexp_ctor, i.regexp_exec, i.regexp_iter_proto,
             i.date_proto, i.array_buffer_proto, i.data_view_proto, i.error_ctor, i.eval_fn,
             i.species_getter, i.array_ctor, i.promise_ctor, i.from_async, i.weakref_proto, i.finreg_proto,
+            i.bigint_proto,
         ]
         .into_iter()
         .chain(i.typed_protos)
         .chain(i.typed_ctors)
+        .chain(i.intl_protos)
         .flatten()
         {
             roots.push(Value::Object(p));

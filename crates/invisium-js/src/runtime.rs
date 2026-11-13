@@ -204,6 +204,10 @@ pub struct Runtime {
     pub(crate) permanent_bytes: usize,
     pub(crate) gc_threshold: usize,
     pub(crate) gc_requested: bool,
+    /// GC stress: collect at every `gc_stress`-th collection point (0 = off).
+    pub(crate) gc_stress: u32,
+    pub(crate) gc_stress_tick: u32,
+    pub(crate) gc_count: u64,
 
     pub(crate) roots: HashMap<u32, Value>,
     pub(crate) next_root: u32,
@@ -306,6 +310,9 @@ impl Runtime {
             permanent_bytes: 0,
             gc_threshold: 4 << 20,
             gc_requested: false,
+            gc_stress: 0,
+            gc_stress_tick: 0,
+            gc_count: 0,
             roots: HashMap::new(),
             next_root: 1,
             scratch: Vec::new(),

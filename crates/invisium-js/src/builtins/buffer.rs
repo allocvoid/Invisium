@@ -59,7 +59,7 @@ impl Runtime {
         if n > self.limits.max_heap_bytes {
             return Err(self.range_error("Array buffer allocation failed"));
         }
-        if self.total_heap().saturating_add(n) > self.limits.max_heap_bytes {
+        if self.gc_due_or(self.total_heap().saturating_add(n) > self.limits.max_heap_bytes) {
             self.collect_garbage();
         }
         self.check_alloc(n).map_err(|t| self.thrown_to_exc(t))

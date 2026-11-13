@@ -189,14 +189,15 @@ impl Runtime {
     /// and resolves with its namespace; `Err(message)` rejects with a TypeError.
     pub fn finish_import(&mut self, id: u32, result: Result<(), String>) {
         let Some((p, url)) = self.modules.imports.remove(&id) else { return };
-        self.host_enter();
-        self.scratch.push(Value::Object(p));
+        // out of `imports`, the promise is reachable from nothing: root it before the
+        // collection `host_enter` may run
+        let mark = self.host_enter_with(&[Value::Object(p)], &[]);
         let r = self.finish_import_inner(p, &url, result);
         if r.is_err() {
             let e = self.make_error("Error", "import() aborted: the step budget or heap limit was exhausted");
             self.reject_promise(p, e);
         }
-        let _ = self.finish(r);
+        let _ = self.finish_with(r, mark);
     }
 
     fn finish_import_inner(&mut self, p: ObjId, url: &str, result: Result<(), String>) -> JsResult<()> {

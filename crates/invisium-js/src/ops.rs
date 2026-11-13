@@ -164,7 +164,7 @@ impl Runtime {
     /// conversions, then Number or BigInt arithmetic (never a mix of the two).
     pub(crate) fn numeric_binary(&mut self, op: Op, a: Value, b: Value) -> JsResult<Value> {
         let x = self.to_numeric(a)?;
-        let y = self.to_numeric(b)?;
+        let y = self.holding(x, |rt| rt.to_numeric(b))?;
         match (x, y) {
             (Value::Number(x), Value::Number(y)) => Ok(Value::Number(number_op(op, x, y))),
             (Value::BigInt(x), Value::BigInt(y)) => {
@@ -398,8 +398,10 @@ impl Runtime {
         if let (Value::String(x), Value::String(y)) = (a, b) {
             return self.concat(x, y);
         }
+        // the first operand's primitive (a fresh string, say) lives only here while the
+        // second conversion runs script
         let pa = self.to_primitive(a, Hint::Default)?;
-        let pb = self.to_primitive(b, Hint::Default)?;
+        let pb = self.holding(pa, |rt| rt.to_primitive(b, Hint::Default))?;
         if matches!(pa, Value::String(_)) || matches!(pb, Value::String(_)) {
             let sa = self.to_str(pa)?;
             let sb = self.to_str(pb)?;
@@ -412,10 +414,10 @@ impl Runtime {
     pub(crate) fn less_than(&mut self, a: Value, b: Value, left_first: bool) -> JsResult<Option<bool>> {
         let (pa, pb) = if left_first {
             let pa = self.to_primitive(a, Hint::Number)?;
-            (pa, self.to_primitive(b, Hint::Number)?)
+            (pa, self.holding(pa, |rt| rt.to_primitive(b, Hint::Number))?)
         } else {
             let pb = self.to_primitive(b, Hint::Number)?;
-            (self.to_primitive(a, Hint::Number)?, pb)
+            (self.holding(pb, |rt| rt.to_primitive(a, Hint::Number))?, pb)
         };
         if let (Value::String(x), Value::String(y)) = (pa, pb) {
             return Ok(Some(self.str_units(x) < self.str_units(y)));
