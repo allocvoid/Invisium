@@ -83,6 +83,8 @@ pub(crate) struct HostState {
     /// change it directly, and can bring its layout up to date.
     pub page: crate::page::Page,
     pub scripting: bool,
+    /// Script-side constructors and prototypes the canvas natives build results with.
+    pub canvas_refs: Vec<invisium_js::Value>,
     pub fragment_tag: Atom,
     // ── script-side state ──
     pub fx: Effects,
@@ -141,6 +143,7 @@ impl HostState {
     pub fn new(join: UrlJoin, scripting: bool) -> HostState {
         HostState {
             page: crate::page::Page::hollow(join),
+            canvas_refs: Vec::new(),
             scripting,
             fragment_tag: Atom::new("#document-fragment"),
             fx: Effects::default(),

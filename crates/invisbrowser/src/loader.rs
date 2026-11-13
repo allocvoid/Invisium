@@ -22,13 +22,17 @@ pub struct DecodedImage {
 
 pub enum NetEvent {
     Document { tab: u64, nav: u64, result: Result<Response, NetError> },
-    Sheet { tab: u64, nav: u64, req: u32, result: Result<Response, NetError> },
-    Script { tab: u64, nav: u64, req: u32, result: Result<Response, NetError> },
+    // `page` in the events below is `Page::id` of the document that asked: the tab's own
+    // or one framed in it.
+    Sheet { tab: u64, nav: u64, page: u32, req: u32, result: Result<Response, NetError> },
+    Script { tab: u64, nav: u64, page: u32, req: u32, result: Result<Response, NetError> },
     /// The answer to a request made by page script (`fetch`, `XMLHttpRequest`).
-    Fetch { tab: u64, nav: u64, id: u32, result: Result<Response, NetError> },
-    Image { tab: u64, nav: u64, url: String, result: Result<DecodedImage, NetError> },
+    Fetch { tab: u64, nav: u64, page: u32, id: u32, result: Result<Response, NetError> },
+    Image { tab: u64, nav: u64, page: u32, url: String, result: Result<DecodedImage, NetError> },
     /// A web font file (`@font-face`).
-    Font { tab: u64, nav: u64, req: u32, result: Result<Response, NetError> },
+    Font { tab: u64, nav: u64, page: u32, req: u32, result: Result<Response, NetError> },
+    /// The document of the `<iframe>` element `node` of page `page`.
+    Frame { tab: u64, nav: u64, page: u32, node: u32, result: Result<Response, NetError> },
 }
 
 /// Where network results are delivered (the UI thread's event queue, or a channel when headless).
@@ -145,6 +149,13 @@ fn decode_image(_resp: &Response) -> Result<DecodedImage, NetError> {
 #[cfg(feature = "images")]
 pub fn rasterize_inline_svgs(page: &mut Page, scale: f32, upload: &mut dyn FnMut(u32, u32, &[u8]) -> invisium::draw::ImageId) -> bool {
     let mut any = false;
+    page.for_each_page(&mut |p| any |= rasterize_svgs_of(p, scale, upload));
+    any
+}
+
+#[cfg(feature = "images")]
+fn rasterize_svgs_of(page: &mut Page, scale: f32, upload: &mut dyn FnMut(u32, u32, &[u8]) -> invisium::draw::ImageId) -> bool {
+    let mut any = false;
     for (node, w, h) in page.svg_elements() {
         let src = page.outer_html(node);
         let pw = ((w * scale).round() as u32).clamp(1, 2048);
@@ -167,9 +178,52 @@ pub fn rasterize_inline_svgs(_page: &mut Page, _scale: f32, _upload: &mut dyn Fn
 }
 
 /// Start every fetch the page has asked for since the last call.
-pub fn fetch_subresources(net: &NetService, sink: &Sink, tab: u64, nav: u64, page: &mut Page) -> Vec<RequestHandle> {
+/// Upload the 2D canvases whose bitmap changed and attach the new images. Returns true if any
+/// was attached (the page then needs another `update`).
+pub fn upload_canvases(page: &mut Page, upload: &mut dyn FnMut(u32, u32, &[u8]) -> invisium::draw::ImageId) -> bool {
+    let mut any = false;
+    page.for_each_page(&mut |p| {
+        for (node, w, h, px) in p.take_canvas_uploads() {
+            let id = upload(w, h, &px);
+            p.set_node_image(node, invisium::paint::PaintImage { id, width: w as f32, height: h as f32 });
+            any = true;
+        }
+    });
+    any
+}
+
+/// Start every fetch the page and the pages framed in it have asked for since the last call.
+/// `top_local`: the tab's own document was served from a local address (`Response::served_local`
+/// of its navigation), so it may reach local targets. Never set it from anything else.
+pub fn fetch_subresources(net: &NetService, sink: &Sink, tab: u64, nav: u64, page: &mut Page, top_local: bool) -> Vec<RequestHandle> {
     let mut handles = Vec::new();
-    let page_url = Url::parse(&page.url).ok();
+    let top = Url::parse(&page.url).ok().filter(|u| u.is_http());
+    page.for_each_page(&mut |p| fetch_for(net, sink, tab, nav, p, top.as_ref(), top_local, &mut handles));
+    handles
+}
+
+/// The fetches of one document: the tab's own, or one framed in it.
+#[allow(clippy::too_many_arguments)]
+fn fetch_for(net: &NetService, sink: &Sink, tab: u64, nav: u64, page: &mut Page, top: Option<&Url>, top_local: bool, handles: &mut Vec<RequestHandle>) {
+    let pid = page.id();
+    let doc = Url::parse(&page.url).ok().filter(|d| d.is_http());
+    let framed = page.is_frame();
+    let doc_local = page.served_local;
+    // Who asks: the tab's document decides partitioning and what counts as third party; a
+    // framed document is named as the initiator, so origin checks are made against it.
+    // Internal pages (invis://) are not a web origin: their requests carry none of this.
+    let stamp = |req: &mut Request| -> bool {
+        let Some(d) = doc.as_ref() else { return false };
+        req.referrer = Some(d.clone());
+        req.top_level = Some(top.cloned().unwrap_or_else(|| d.clone()));
+        req.top_local = top_local;
+        if framed {
+            req.initiator = Some(d.clone());
+            // only what the network stack said about this very document
+            req.initiator_local = doc_local;
+        }
+        true
+    };
     for r in page.take_requests() {
         let Ok(url) = Url::parse(&r.url) else {
             page.resource_failed(r.id);
@@ -182,41 +236,61 @@ pub fn fetch_subresources(net: &NetService, sink: &Sink, tab: u64, nav: u64, pag
             ResKind::Font => ResourceKind::Font,
         };
         let mut req = Request::get(url, kind);
-        // internal pages (invis://) are not a web origin: their requests carry no referrer
-        if let Some(p) = page_url.as_ref().filter(|p| p.is_http()) {
-            req.referrer = Some(p.clone());
-            req.top_level = Some(p.clone());
-        }
+        stamp(&mut req);
         let sink = sink.clone();
         let handle = match r.kind {
             ResKind::Stylesheet => {
                 let id = r.id;
-                net.fetch(req, move |result| sink(NetEvent::Sheet { tab, nav, req: id, result }))
+                net.fetch(req, move |result| sink(NetEvent::Sheet { tab, nav, page: pid, req: id, result }))
             }
             ResKind::Script => {
                 let id = r.id;
-                net.fetch(req, move |result| sink(NetEvent::Script { tab, nav, req: id, result }))
+                net.fetch(req, move |result| sink(NetEvent::Script { tab, nav, page: pid, req: id, result }))
             }
             ResKind::Font => {
                 let id = r.id;
-                net.fetch(req, move |result| sink(NetEvent::Font { tab, nav, req: id, result }))
+                net.fetch(req, move |result| sink(NetEvent::Font { tab, nav, page: pid, req: id, result }))
             }
             ResKind::Image => {
                 let u = r.url.clone();
                 // decoding happens here, on the network thread, never on the UI thread
-                net.fetch(req, move |result| sink(NetEvent::Image { tab, nav, url: u, result: result.and_then(|resp| decode_image(&resp)) }))
+                net.fetch(req, move |result| sink(NetEvent::Image { tab, nav, page: pid, url: u, result: result.and_then(|resp| decode_image(&resp)) }))
             }
         };
         handles.push(handle);
     }
+    // the documents of this page's frames
+    for fr in page.take_frame_requests() {
+        let Ok(url) = Url::parse(&fr.url) else {
+            page.frame_failed(fr.node);
+            continue;
+        };
+        let mut req = Request::get(url, ResourceKind::Frame);
+        if !stamp(&mut req) {
+            page.frame_failed(fr.node);
+            continue;
+        }
+        if let Some((body, content_type)) = fr.body {
+            req.method = Method::Post;
+            req.headers.push(("Content-Type".to_string(), content_type.unwrap_or_else(|| "application/x-www-form-urlencoded".to_string())));
+            req.body = Some(body);
+        }
+        let sink = sink.clone();
+        let node = fr.node;
+        handles.push(net.fetch(req, move |result| sink(NetEvent::Frame { tab, nav, page: pid, node, result })));
+    }
     // requests made by the page's scripts: always sent as script requests, so the network
     // stack applies the cross-origin rules; a script request never goes out as a plain fetch
     for f in page.take_fetches() {
-        let (Ok(url), Some(doc)) = (Url::parse(&f.url), page_url.clone()) else {
+        let Ok(url) = Url::parse(&f.url) else {
             page.fetch_done(f.id, None);
             continue;
         };
         let mut req = Request::get(url, ResourceKind::Xhr);
+        if !stamp(&mut req) {
+            page.fetch_done(f.id, None);
+            continue;
+        }
         req.method = match f.method.as_str() {
             "POST" => Method::Post,
             "HEAD" => Method::Head,
@@ -228,8 +302,6 @@ pub fn fetch_subresources(net: &NetService, sink: &Sink, tab: u64, nav: u64, pag
         };
         req.headers = f.headers;
         req.body = f.body;
-        req.referrer = Some(doc.clone());
-        req.top_level = Some(doc);
         req.mode = if f.same_origin { FetchMode::SameOrigin } else { FetchMode::Cors };
         req.credentials = match f.credentials {
             0 => Credentials::Omit,
@@ -238,9 +310,8 @@ pub fn fetch_subresources(net: &NetService, sink: &Sink, tab: u64, nav: u64, pag
         };
         let sink = sink.clone();
         let id = f.id;
-        handles.push(net.fetch(req, move |result| sink(NetEvent::Fetch { tab, nav, id, result })));
+        handles.push(net.fetch(req, move |result| sink(NetEvent::Fetch { tab, nav, page: pid, id, result })));
     }
-    handles
 }
 
 /// What script gets to see of a response: nothing at all if the request failed or was refused.

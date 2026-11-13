@@ -25,6 +25,11 @@ use std::rc::Rc;
 mod scripting;
 #[path = "page_anim.rs"]
 mod animating;
+#[path = "page_canvas.rs"]
+pub(crate) mod canvas;
+#[path = "page_frames.rs"]
+pub(crate) mod frames;
+pub use frames::FrameRequest;
 
 /// Resolves a reference against a base URL: `(base, reference) -> absolute`.
 pub type UrlJoin = Rc<dyn Fn(&str, &str) -> Option<String>>;
@@ -188,6 +193,10 @@ pub(crate) struct PendingScript {
     /// Request id of an external script.
     req: Option<u32>,
     failed: bool,
+    /// Position among the scripts the parser found (1, 2, ...); 0 for scripts inserted later.
+    seq: u32,
+    /// `defer`: runs once every script that blocks the parser has run.
+    deferred: bool,
 }
 
 pub struct Page {
@@ -254,6 +263,32 @@ pub struct Page {
     pub(crate) scripts: VecDeque<PendingScript>,
     /// Scripts that run whenever they arrive (`async`, or inserted by another script).
     pub(crate) loose_scripts: Vec<PendingScript>,
+    /// Counts the scripts the parser found, for their document order.
+    pub(crate) script_seq: u32,
+    /// `<canvas>` elements that have a drawing context.
+    pub(crate) canvases: HashMap<NodeId, canvas::CanvasSlot>,
+    /// The embedder's GPU device for WebGL contexts.
+    pub(crate) gl_device: Option<Rc<RefCell<dyn invisium_draw::gl::GlDevice>>>,
+    /// Identifies this page object among all pages (see `Page::id`).
+    pub(crate) id: u32,
+    /// The documents shown in this page's `<iframe>` elements.
+    pub(crate) frames: HashMap<NodeId, frames::Frame>,
+    pub(crate) frame_requests: Vec<frames::FrameRequest>,
+    /// What each `<iframe>` was last asked to show (to notice a new `src`).
+    pub(crate) frame_srcs: HashMap<NodeId, String>,
+    /// How many documents this one is framed in, and their addresses.
+    pub(crate) frame_depth: u8,
+    pub(crate) ancestors: Vec<String>,
+    /// Messages this document's scripts sent to other documents, not yet delivered.
+    pub(crate) outbox: Vec<frames::FrameMsg>,
+    /// The frame that has the keyboard, and the one under the pointer (`NO_NODE` = none).
+    pub(crate) focus_frame: NodeId,
+    pub(crate) hover_frame: NodeId,
+    /// This page's glyphs followed by its frames' (what the spliced display list indexes).
+    pub(crate) glyph_buf: Vec<Glyph>,
+    /// The document came over a direct connection to a local address: the embedder copies
+    /// `Response::served_local` here for frames and passes it back on the frame's requests.
+    pub served_local: bool,
     pub(crate) seen_scripts: HashSet<NodeId>,
     /// 0 = loading, 1 = `DOMContentLoaded` fired, 2 = `load` fired.
     pub(crate) lifecycle: u8,
@@ -407,6 +442,7 @@ fn collect_font_rules(rules: &[Rule], out: &mut Vec<WebFontRule>) {
 
 impl Drop for Page {
     fn drop(&mut self) {
+        self.drop_canvases();
         // the fonts this page loaded go with it
         if self.font_scope != 0 && !self.fonts_requested.is_empty() {
             if let Some(fonts) = &self.fonts {
@@ -504,6 +540,20 @@ impl Page {
             script: None,
             scripts: VecDeque::new(),
             loose_scripts: Vec::new(),
+            script_seq: 0,
+            canvases: HashMap::new(),
+            gl_device: None,
+            id: frames::next_page_id(),
+            frames: HashMap::new(),
+            frame_requests: Vec::new(),
+            frame_srcs: HashMap::new(),
+            frame_depth: 0,
+            ancestors: Vec::new(),
+            outbox: Vec::new(),
+            focus_frame: NO_NODE,
+            hover_frame: NO_NODE,
+            glyph_buf: Vec::new(),
+            served_local: false,
             seen_scripts: HashSet::new(),
             lifecycle: 0,
             console: Vec::new(),
@@ -731,6 +781,7 @@ impl Page {
         {
             match self.doc.tag(n) {
                 a::SCRIPT if self.cfg.scripting => self.discover_script(n, parser),
+                a::IFRAME => self.discover_frame(n),
                 a::IMG => {
                     let src = self
                         .doc
@@ -825,7 +876,11 @@ impl Page {
     /// Images that were replaced since the last call (an inline `<svg>` drawn again); the
     /// embedder releases them.
     pub fn take_stale_images(&mut self) -> Vec<crate::draw::ImageId> {
-        std::mem::take(&mut self.stale_images)
+        let mut out = std::mem::take(&mut self.stale_images);
+        for f in self.frames.values_mut() {
+            out.extend(f.page.take_stale_images());
+        }
+        out
     }
 
     /// Script changed something inside an inline `<svg>`: it has to be rasterised again.
@@ -848,7 +903,14 @@ impl Page {
 
     /// Every image handle this page holds (for releasing GPU memory when the page is dropped).
     pub fn image_ids(&self) -> Vec<crate::draw::ImageId> {
-        let mut ids: Vec<_> = self.images.values().map(|i| i.id).chain(self.bg_images.values().map(|i| i.id)).collect();
+        // a WebGL canvas's image belongs to the GPU device, not to the embedder
+        let gl = |n: &NodeId| matches!(self.canvases.get(n).map(|s| &s.ctx), Some(canvas::CanvasCtx::Gl(_)));
+        let mut ids: Vec<_> = self.images.iter().filter(|(n, _)| !gl(n)).map(|(_, i)| i.id).chain(self.bg_images.values().map(|i| i.id)).collect();
+        // a frame's placeholder is no image; the frames' own images count
+        ids.retain(|id| *id < frames::FRAME_IMAGE_BASE);
+        for f in self.frames.values() {
+            ids.extend(f.page.image_ids());
+        }
         ids.sort_unstable();
         ids.dedup();
         ids
@@ -871,7 +933,7 @@ impl Page {
         }
     }
 
-    pub fn set_caret(&mut self, on: bool) {
+    fn set_caret_own(&mut self, on: bool) {
         if self.caret_on != on && self.focus != NO_NODE {
             self.dirty_paint = true;
         }
@@ -879,7 +941,7 @@ impl Page {
     }
 
     pub fn needs_update(&self) -> bool {
-        self.dirty_style || self.dirty_layout || self.dirty_paint
+        self.dirty_style || self.dirty_layout || self.dirty_paint || self.frames_need_update()
     }
 
     /// Bring style, layout and the display list up to date. Returns true if the picture changed.
@@ -889,6 +951,13 @@ impl Page {
         }
         fonts.set_scope(self.font_scope);
         self.update_style_layout(fonts);
+        if !self.frames.is_empty() {
+            // a frame is laid out at the size this page's layout gives its element
+            if self.update_frames(fonts) {
+                self.dirty_paint = true;
+            }
+            fonts.set_scope(self.font_scope);
+        }
         if self.dirty_paint {
             let t0 = std::time::Instant::now();
             let out = paint(
@@ -909,6 +978,10 @@ impl Page {
             self.list = out.list;
             self.canvas = out.canvas;
             self.dirty_paint = false;
+            self.glyph_buf.clear();
+            if !self.frames.is_empty() {
+                self.splice_frames();
+            }
             self.pass_ms[2] = t0.elapsed().as_secs_f32() * 1000.0;
         }
         true
@@ -1114,7 +1187,12 @@ impl Page {
         &self.list
     }
     pub fn glyphs(&self) -> &[Glyph] {
-        &self.tree.glyphs
+        // with frames, the display list indexes this page's glyphs followed by theirs
+        if self.glyph_buf.is_empty() {
+            &self.tree.glyphs
+        } else {
+            &self.glyph_buf
+        }
     }
     pub fn canvas_color(&self) -> Rgba {
         self.canvas
@@ -1228,7 +1306,7 @@ impl Page {
     }
 
     /// Pointer moved to viewport coordinates `(x, y)`.
-    pub fn mouse_move(&mut self, x: f32, y: f32) -> Hover {
+    fn mouse_move_own(&mut self, x: f32, y: f32) -> Hover {
         let b = self.hit(x, y);
         let mut out = Hover::default();
         let mut chain: Vec<NodeId> = Vec::new();
@@ -1320,7 +1398,7 @@ impl Page {
         }
     }
 
-    pub fn has_text_focus(&self) -> bool {
+    fn has_text_focus_own(&self) -> bool {
         self.focus != NO_NODE && self.is_text_control(self.focus)
     }
 
@@ -1346,7 +1424,7 @@ impl Page {
     }
 
     /// A primary-button click at viewport coordinates. `new_tab` = ctrl/middle click.
-    pub fn click(&mut self, x: f32, y: f32, new_tab: bool) -> PageAction {
+    fn click_own(&mut self, x: f32, y: f32, new_tab: bool) -> PageAction {
         let b = self.hit(x, y);
         if b == NO_BOX {
             self.set_focus(NO_NODE);
@@ -1490,8 +1568,8 @@ impl Page {
     }
 
     /// Committed text typed while a text control has focus.
-    pub fn text_input(&mut self, text: &str) -> PageAction {
-        if !self.has_text_focus() {
+    fn text_input_own(&mut self, text: &str) -> PageAction {
+        if !self.has_text_focus_own() {
             return PageAction::None;
         }
         let node = self.focus;
@@ -1528,8 +1606,8 @@ impl Page {
         }
     }
 
-    pub fn backspace(&mut self) -> PageAction {
-        if !self.has_text_focus() {
+    fn backspace_own(&mut self) -> PageAction {
+        if !self.has_text_focus_own() {
             return PageAction::None;
         }
         let node = self.focus;
@@ -1549,8 +1627,8 @@ impl Page {
     }
 
     /// Enter pressed: submits the form of a focused single-line input, adds a line to a textarea.
-    pub fn enter(&mut self) -> PageAction {
-        if !self.has_text_focus() {
+    fn enter_own(&mut self) -> PageAction {
+        if !self.has_text_focus_own() {
             return PageAction::None;
         }
         if self.doc.tag(self.focus) == a::TEXTAREA {
@@ -1571,7 +1649,7 @@ impl Page {
         self.submit(focus, NO_NODE)
     }
 
-    pub fn blur(&mut self) {
+    fn blur_own(&mut self) {
         self.set_focus(NO_NODE);
     }
 

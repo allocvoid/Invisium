@@ -359,7 +359,7 @@ impl Page {
     /// True if the page needs frames without any input: an animation is running, or a script
     /// asked to be called before the next frame.
     pub fn wants_frame(&self) -> bool {
-        self.animations_need_frames() || self.script_frame_due()
+        self.animations_need_frames() || self.script_frame_due() || self.frames_want_frame()
     }
 
     /// True if a running animation needs frames: one on an element that is shown, or one that
@@ -392,7 +392,10 @@ impl Page {
             // animations those callbacks started or stopped show in this very frame
             self.refresh_overrides(now);
         }
-        ran || self.needs_update() || std::mem::take(&mut self.script_redraw)
+        // what scripts drew on canvases during this frame goes on screen with it
+        self.present_canvases();
+        let framed = self.frame_frames(now);
+        ran || framed || self.needs_update() || std::mem::take(&mut self.script_redraw)
     }
 
     // ───────────── script animations (`Element.animate`) ─────────────

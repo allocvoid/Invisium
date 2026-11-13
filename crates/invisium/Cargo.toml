@@ -8,6 +8,8 @@ license.workspace = true
 [dependencies]
 invisium-draw = { path = "../invisium-draw" }
 invisium-js = { path = "../invisium-js" }
+invisium-gl = { path = "../invisium-gl" }          # WebGL state machine (pure CPU)
+invisium-canvas = { path = "../invisium-canvas" }  # 2D canvas rasteriser (pure CPU)
 # --- platform plumbing only: no HTML/CSS/layout engine code comes from a crate ---
 ab_glyph = "0.2"                 # glyph outlines + rasteriser
 memmap2 = "0.9"                  # file-backed font data (not private RAM)

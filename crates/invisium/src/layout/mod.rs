@@ -248,6 +248,44 @@ impl LayoutTree {
     }
 
     /// First box generated for a DOM node.
+    /// The area an inline box (or a run of text) covers: the union of the line fragments of
+    /// the box and of everything inside it, in document coordinates. `None` if it produced no
+    /// fragment (an empty `<span>`).
+    pub fn inline_rect(&self, id: BoxId) -> Option<(f32, f32, f32, f32)> {
+        // the block container that lays this inline content out
+        let mut root = self.boxes.get(id as usize)?.parent;
+        while root != NO_BOX && self.boxes[root as usize].flags & F_IFC == 0 {
+            root = self.boxes[root as usize].parent;
+        }
+        if root == NO_BOX {
+            return None;
+        }
+        let rb = &self.boxes[root as usize];
+        let inside = |mut b: BoxId| {
+            while b != NO_BOX && b != root {
+                if b == id {
+                    return true;
+                }
+                b = self.boxes[b as usize].parent;
+            }
+            false
+        };
+        let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for f in self.fragments.get(rb.r0 as usize..rb.r1 as usize)? {
+            if inside(f.box_id) {
+                x0 = x0.min(f.x);
+                y0 = y0.min(f.y);
+                x1 = x1.max(f.x + f.w);
+                y1 = y1.max(f.y + f.h);
+            }
+        }
+        if x1 < x0 {
+            return None;
+        }
+        let (ox, oy) = self.abs_pos(root);
+        Some((ox + x0, oy + y0, x1 - x0, y1 - y0))
+    }
+
     pub fn box_for_node(&self, node: NodeId) -> BoxId {
         self.boxes
             .iter()
@@ -724,6 +762,11 @@ impl<'a> Layout<'a> {
                 } else {
                     (0.0, 0.0)
                 }
+            }
+            a::CANVAS => {
+                // the bitmap size from the attributes, as for the context scripts get
+                let dim = |v: Option<&str>, d: f32| v.and_then(|s| s.trim().parse::<u32>().ok()).map_or(d, |n| n.min(32_767) as f32);
+                (dim(self.doc.attr(node, a::WIDTH), 300.0), dim(self.doc.attr(node, a::HEIGHT), 150.0))
             }
             _ => (300.0, 150.0),
         }

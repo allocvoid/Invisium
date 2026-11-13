@@ -373,16 +373,29 @@ class URLSearchParams {
   }
 }
 
+// Without a base only an absolute address parses ("" and "/x" are errors, not "about:blank");
+// a base must itself be absolute.
+var ABS_URL = /^[\x00-\x20]*[A-Za-z][A-Za-z0-9+.\-]*:/;
+function parseUrl(url, base) {
+  url = String(url);
+  if (base === undefined) return ABS_URL.test(url) ? n.resolve(url, 'about:blank') : null;
+  base = String(base);
+  if (!ABS_URL.test(base)) return null;
+  var b = n.resolve(base, 'about:blank');
+  return b === null ? null : n.resolve(url, b);
+}
+
 class URL {
   constructor(url, base) {
-    var abs = n.resolve(String(url), base === undefined ? 'about:blank' : String(base));
+    var abs = parseUrl(url, base);
     if (abs === null) throw new TypeError("Failed to construct 'URL': Invalid URL");
     hide(this, '_u', splitUrl(abs));
     hide(this, '_sp', null);
   }
-  static canParse(url, base) { return n.resolve(String(url), base === undefined ? 'about:blank' : String(base)) !== null; }
+  static canParse(url, base) { return parseUrl(url, base) !== null; }
+  static parse(url, base) { try { return new URL(url, base); } catch (e) { return null; } }
   get href() { return joinUrl(this._u); }
-  set href(v) { var abs = n.resolve(String(v), 'about:blank'); if (abs === null) throw new TypeError('Invalid URL'); this._u = splitUrl(abs); this._sp = null; }
+  set href(v) { var abs = parseUrl(v, undefined); if (abs === null) throw new TypeError('Invalid URL'); this._u = splitUrl(abs); this._sp = null; }
   get origin() { return originOf(this._u); }
   get protocol() { return this._u.protocol; }
   set protocol(v) { v = String(v); this._u.protocol = v[v.length - 1] === ':' ? v : v + ':'; }

@@ -45,23 +45,66 @@ impl Page {
             Some(src) => {
                 let Some(abs) = self.resolve(&src).filter(|_| !src.trim().is_empty()) else { return };
                 let id = self.request(abs.clone(), ResKind::Script);
-                PendingScript { node: n, url: abs, source: None, req: Some(id), failed: false }
+                PendingScript { node: n, url: abs, source: None, req: Some(id), failed: false, seq: 0, deferred: false }
             }
             None => {
                 let text = self.doc.text_content(n);
                 if text.trim().is_empty() {
                     return; // may still get a `src` or text later
                 }
-                PendingScript { node: n, url: self.url.clone(), source: Some(text), req: None, failed: false }
+                PendingScript { node: n, url: self.url.clone(), source: Some(text), req: None, failed: false, seq: 0, deferred: false }
             }
         };
+        let mut pending = pending;
         self.seen_scripts.insert(n);
-        let is_async = pending.req.is_some() && self.doc.attr(n, Atom::new("async")).is_some();
+        let external = pending.req.is_some();
+        let is_async = external && self.doc.attr(n, Atom::new("async")).is_some();
+        if parser {
+            self.script_seq += 1;
+            pending.seq = self.script_seq;
+        }
         if parser && !is_async {
+            pending.deferred = external && self.doc.attr(n, Atom::new("defer")).is_some();
             self.scripts.push_back(pending);
         } else {
             self.loose_scripts.push(pending);
         }
+    }
+
+    /// Run the parser-found scripts that are due, in the order a browser would: scripts that
+    /// block the parser in document order, `defer` scripts after all of those, and an `async`
+    /// script any time after the blocking scripts that precede it in the document (its tag
+    /// would not have been seen before they ran; bundler runtimes rely on it).
+    fn run_due_scripts(&mut self) -> bool {
+        let mut ran = false;
+        for _ in 0..64 {
+            let at = match self.scripts.iter().position(|s| !s.deferred) {
+                Some(i) => i,
+                None if !self.scripts.is_empty() => 0,
+                None => break,
+            };
+            if !(self.scripts[at].source.is_some() || self.scripts[at].failed) {
+                break;
+            }
+            if let Some(s) = self.scripts.remove(at) {
+                self.run_pending(s);
+                ran = true;
+            }
+        }
+        let mut i = 0;
+        while i < self.loose_scripts.len() {
+            let s = &self.loose_scripts[i];
+            let arrived = s.source.is_some() || s.failed;
+            let held = s.seq != 0 && self.scripts.iter().any(|b| !b.deferred && b.seq < s.seq);
+            if arrived && !held {
+                let s = self.loose_scripts.remove(i);
+                self.run_pending(s);
+                ran = true;
+            } else {
+                i += 1;
+            }
+        }
+        ran
     }
 
     fn discover_module(&mut self, n: NodeId) {
@@ -283,6 +326,8 @@ impl Page {
                     self.discover_node(n, false);
                 }
                 (a::SCRIPT, a::SRC) => self.discover_node(n, false),
+                // a frame given another address (or inline document) loads it
+                (a::IFRAME, _) if name == a::SRC || name.as_str() == "srcdoc" => self.discover_node(n, false),
                 (a::BASE, _) => {
                     if let Some(abs) = self.doc.attr(n, a::HREF).and_then(|h| (self.join)(&self.url, h)) {
                         self.base_url = abs;
@@ -393,27 +438,9 @@ impl Page {
             return false;
         }
         let mut ran = std::mem::take(&mut self.script_redraw);
-        // document order: an external script that has not arrived holds back those after it
-        for _ in 0..64 {
-            if !matches!(self.scripts.front(), Some(s) if s.source.is_some() || s.failed) {
-                break;
-            }
-            if let Some(s) = self.scripts.pop_front() {
-                self.run_pending(s);
-                ran = true;
-            }
-        }
-        let mut i = 0;
-        while i < self.loose_scripts.len() {
-            if self.loose_scripts[i].source.is_some() || self.loose_scripts[i].failed {
-                let s = self.loose_scripts.remove(i);
-                self.run_pending(s);
-                ran = true;
-            } else {
-                i += 1;
-            }
-        }
+        ran |= self.run_due_scripts();
         ran |= self.process_modules();
+        ran |= self.pump_frames(now_ms);
         if self.script.is_none() {
             return ran;
         }
@@ -430,6 +457,9 @@ impl Page {
         let due = self.script.as_ref().and_then(|e| e.next_timer()).map_or(false, |d| d <= now_ms);
         if due {
             ran |= self.script(|e| e.run_timers(now_ms)).unwrap_or(0) > 0;
+        }
+        if ran {
+            ran |= self.present_canvases();
         }
         ran | std::mem::take(&mut self.script_redraw)
     }
@@ -472,12 +502,20 @@ impl Page {
 
     /// When the next timer is due, on the clock passed to `pump`.
     pub fn next_timer_ms(&self) -> Option<f64> {
-        self.script.as_ref().and_then(|e| e.next_timer())
+        let own = self.script.as_ref().and_then(|e| e.next_timer());
+        match (own, self.frames_next_timer()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     /// Console output since the last call.
     pub fn take_console(&mut self) -> Vec<ConsoleMessage> {
-        std::mem::take(&mut self.console)
+        let mut out = std::mem::take(&mut self.console);
+        for f in self.frames.values_mut() {
+            out.extend(f.page.take_console());
+        }
+        out
     }
 
     /// A navigation or form submission that a script asked for.

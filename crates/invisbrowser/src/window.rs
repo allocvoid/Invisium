@@ -42,7 +42,58 @@ const IDLE_FRAME_GAP: Duration = Duration::from_millis(16);
 /// How quickly a wheel or key scroll closes in on its target (time constant).
 const SCROLL_EASE_MS: f32 = 55.0;
 
+/// Counters printed once a second when `INVIS_LOOP_DEBUG` is set: what wakes the event loop
+/// and where its time goes.
+#[derive(Default)]
+struct LoopStats {
+    on: bool,
+    since: Option<Instant>,
+    wakes: u32,
+    timer_wakes: u32,
+    ticks: u32,
+    tick_us: u64,
+    frames: u32,
+    frame_us: u64,
+    user_events: u32,
+    window_events: u32,
+    /// about_to_wait outcomes: frames wanted, busy, page timer, idle
+    branch: [u32; 4],
+    timer_ms: u64,
+}
+
+impl LoopStats {
+    fn report(&mut self, extra: &str) {
+        if !self.on {
+            return;
+        }
+        let now = Instant::now();
+        let since = *self.since.get_or_insert(now);
+        if now.duration_since(since) < Duration::from_secs(1) {
+            return;
+        }
+        eprintln!(
+            "[loop] wakes {} (timer {}) ticks {} ({} ms) frames {} ({} ms) user-events {} window-events {} wait[frames {} busy {} timer {} idle {}] next-timer {} ms {}",
+            self.wakes,
+            self.timer_wakes,
+            self.ticks,
+            self.tick_us / 1000,
+            self.frames,
+            self.frame_us / 1000,
+            self.user_events,
+            self.window_events,
+            self.branch[0],
+            self.branch[1],
+            self.branch[2],
+            self.branch[3],
+            self.timer_ms,
+            extra
+        );
+        *self = LoopStats { on: true, since: Some(now), ..LoopStats::default() };
+    }
+}
+
 struct App {
+    stats: LoopStats,
     browser: Browser,
     chrome: Chrome,
     state: ChromeState,
@@ -331,6 +382,14 @@ impl App {
             return;
         }
         let z = self.zoom();
+        // a frame under the pointer scrolls first; the page moves once the frame cannot
+        if let Some((px, py)) = self.page_point(x, y) {
+            let in_frame = self.browser.active_page().map_or(false, |p| p.scroll_frame_at(px, py, 0.0, dy_px / z));
+            if in_frame {
+                self.redraw_soon();
+                return;
+            }
+        }
         self.scroll_smoothly(dy_px / z);
     }
 
@@ -476,6 +535,12 @@ impl App {
 
     fn tick(&mut self) {
         let now = Instant::now();
+        self.stats.ticks += 1;
+        self.tick_inner(now);
+        self.stats.tick_us += now.elapsed().as_micros() as u64;
+    }
+
+    fn tick_inner(&mut self, now: Instant) {
         let dt = now.duration_since(self.last_tick).as_millis().min(1000) as u32;
         self.last_tick = now;
         if self.chrome.tick(dt, &self.state) {
@@ -505,9 +570,18 @@ impl App {
         }
     }
 
+    /// Nothing of the window can be seen: it is minimised (which some systems only show as a
+    /// window of no size) or fully covered. Pages get no frames then and their timers run at
+    /// most once a second, as in other browsers.
+    fn out_of_sight(&self) -> bool {
+        let Some(w) = self.window.as_ref() else { return true };
+        let size = w.inner_size();
+        self.hidden || w.is_minimized() == Some(true) || size.width == 0 || size.height == 0
+    }
+
     /// True if the next frame should follow this one without waiting for input.
     fn wants_frames(&self) -> bool {
-        if self.hidden || self.window.as_ref().map_or(true, |w| w.is_minimized() == Some(true)) {
+        if self.out_of_sight() {
             return false;
         }
         self.scroll_goal.is_some() || self.browser.active_wants_frame()
@@ -584,6 +658,9 @@ impl App {
                 if let Some(r) = self.renderer.as_mut() {
                     let mut upload = |w: u32, h: u32, px: &[u8]| r.create_image(w, h, px);
                     if crate::loader::rasterize_inline_svgs(&mut lp.page, scale * zoom, &mut upload) {
+                        changed |= lp.page.update(&mut fonts.borrow_mut());
+                    }
+                    if crate::loader::upload_canvases(&mut lp.page, &mut upload) {
                         changed |= lp.page.update(&mut fonts.borrow_mut());
                     }
                     // an inline SVG that was drawn again leaves its old texture behind
@@ -668,6 +745,15 @@ impl ApplicationHandler<UserEvent> for App {
         match pollster::block_on(Renderer::new(window.clone(), size.width.max(1), size.height.max(1), opts)) {
             Ok(r) => {
                 self.browser.gpu_info = r.stats().adapter;
+                // pages that run scripts draw their WebGL canvases with the renderer's device
+                let dev = r.gl_device();
+                for tab in &mut self.browser.tabs {
+                    let pages = tab.incoming.iter_mut().map(|(lp, _)| lp).chain(tab.page.iter_mut());
+                    for lp in pages.filter(|lp| !lp.internal) {
+                        lp.page.for_each_page(&mut |p| p.set_gl_device(dev.clone()));
+                    }
+                }
+                self.browser.gl_device = Some(dev);
                 self.renderer = Some(r);
             }
             Err(e) => {
@@ -686,6 +772,7 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn user_event(&mut self, _el: &ActiveEventLoop, event: UserEvent) {
+        self.stats.user_events += 1;
         let UserEvent::Net(ev) = event;
         let App { browser, renderer, .. } = self;
         let mut upload = |w: u32, h: u32, rgba: &[u8]| match renderer.as_mut() {
@@ -699,6 +786,7 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        self.stats.window_events += 1;
         match event {
             WindowEvent::CloseRequested => el.exit(),
             WindowEvent::Resized(size) => {
@@ -708,7 +796,12 @@ impl ApplicationHandler<UserEvent> for App {
                 self.redraw_soon();
             }
             WindowEvent::ScaleFactorChanged { .. } => self.redraw_soon(),
-            WindowEvent::RedrawRequested => self.frame(),
+            WindowEvent::RedrawRequested => {
+                let t = Instant::now();
+                self.frame();
+                self.stats.frames += 1;
+                self.stats.frame_us += t.elapsed().as_micros() as u64;
+            }
             WindowEvent::Focused(f) => {
                 self.chrome_input(Input::WindowFocus(f));
                 self.redraw_soon();
@@ -773,7 +866,9 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn new_events(&mut self, _el: &ActiveEventLoop, cause: StartCause) {
+        self.stats.wakes += 1;
         if matches!(cause, StartCause::ResumeTimeReached { .. }) {
+            self.stats.timer_wakes += 1;
             self.tick();
             if self.wants_frames() {
                 self.next_animation_frame();
@@ -783,8 +878,25 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         // Sleep until input arrives unless something on screen is still changing.
-        // A page timer also wakes the loop, but never more often than every 4 ms.
-        let timer = self.browser.next_script_wake().map(|ms| ms.max(4));
+        // A page timer also wakes the loop, but never more often than every 4 ms (once a
+        // second while the window cannot be seen).
+        let floor = if self.out_of_sight() { 1000 } else { 4 };
+        let timer = self.browser.next_script_wake().map(|ms| ms.max(floor));
+        if self.stats.on {
+            self.stats.timer_ms = timer.unwrap_or(0);
+            let branch = if self.wants_frames() {
+                0
+            } else if self.animating() {
+                1
+            } else if timer.is_some() {
+                2
+            } else {
+                3
+            };
+            self.stats.branch[branch] += 1;
+            let extra = format!("out-of-sight {} page-wants-frame {}", self.out_of_sight(), self.browser.active_wants_frame());
+            self.stats.report(&extra);
+        }
         if self.wants_frames() {
             // something on the page is moving: the next frame follows as soon as the gap allows
             // (a frame that drew waited for the display; one that did not is paced here)
@@ -826,6 +938,7 @@ pub fn run(start_url: Option<String>) -> i32 {
     });
     let now = Instant::now();
     let mut app = App {
+        stats: LoopStats { on: std::env::var_os("INVIS_LOOP_DEBUG").is_some(), ..LoopStats::default() },
         browser: Browser::new(sink),
         chrome: Chrome::new(Theme::invis()),
         state: ChromeState::default(),

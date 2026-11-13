@@ -33,7 +33,7 @@ fn arg_value<T: std::str::FromStr>(args: &[String], name: &str, default: T) -> T
 /// Which navigation a network result belongs to.
 fn event_nav(e: &NetEvent) -> u64 {
     match e {
-        NetEvent::Document { nav, .. } | NetEvent::Sheet { nav, .. } | NetEvent::Script { nav, .. } | NetEvent::Fetch { nav, .. } | NetEvent::Image { nav, .. } | NetEvent::Font { nav, .. } => *nav,
+        NetEvent::Document { nav, .. } | NetEvent::Sheet { nav, .. } | NetEvent::Script { nav, .. } | NetEvent::Fetch { nav, .. } | NetEvent::Image { nav, .. } | NetEvent::Font { nav, .. } | NetEvent::Frame { nav, .. } => *nav,
     }
 }
 
@@ -50,13 +50,13 @@ fn load_document(
     nav: u64,
     deadline: Instant,
     dump: bool,
-) -> Result<String, i32> {
+) -> Result<(String, bool), i32> {
     let mut hops = 0;
     let mut body = body;
     loop {
         if url.starts_with("invis:") {
             match internal::handle(url, settings, &Info::default()) {
-                Internal::Html(h) => return Ok(h),
+                Internal::Html(h) => return Ok((h, false)),
                 Internal::Redirect { url: u, .. } => {
                     *url = u;
                     hops += 1;
@@ -85,11 +85,11 @@ fn load_document(
                         if dump {
                             eprintln!("document: {} {} ({} bytes, {:?})", resp.status, resp.mime, resp.body.len(), resp.via);
                         }
-                        return Ok(loader::document_html(&resp));
+                        return Ok((loader::document_html(&resp), resp.served_local));
                     }
                     Err(e) => {
                         eprintln!("navigation failed: {e:?}");
-                        return Ok(loader::error_html(&e, url));
+                        return Ok((loader::error_html(&e, url), false));
                     }
                 },
                 Ok(_) => continue, // a result for a page that has been left
@@ -128,6 +128,10 @@ pub fn run(args: &[String]) -> i32 {
 
     let mut settings = Settings::default();
     settings.letterbox = false;
+    // for test pages served from this machine (`python -m http.server`): allow plain HTTP
+    if args.iter().any(|a| a == "--http") {
+        settings.https_only = false;
+    }
     let net = Arc::new(NetService::new(settings.net_config()));
     let (tx, rx) = mpsc::channel::<NetEvent>();
     let sink: Sink = Arc::new(move |e| {
@@ -145,7 +149,7 @@ pub fn run(args: &[String]) -> i32 {
     // ── the document ──
     let mut url = loader::fix_url(url_arg, &settings.search);
     let mut nav: u64 = 1;
-    let html = match load_document(&net, &sink, &rx, &mut settings, &mut url, None, nav, deadline, dump) {
+    let (html, mut served_local) = match load_document(&net, &sink, &rx, &mut settings, &mut url, None, nav, deadline, dump) {
         Ok(h) => h,
         Err(code) => return code,
     };
@@ -167,6 +171,10 @@ pub fn run(args: &[String]) -> i32 {
             return 1;
         }
     };
+    if scripting {
+        // WebGL canvases draw with the renderer's device
+        page.set_gl_device(renderer.gl_device());
+    }
 
     // ── subresources and scripts ──
     let mut outstanding = 0usize;
@@ -205,28 +213,30 @@ pub fn run(args: &[String]) -> i32 {
                         eprintln!("script navigated to {target}");
                     }
                     url = target;
-                    let html = match load_document(&net, &sink, &rx, &mut settings, &mut url, body, nav, deadline, dump) {
+                    let (html, local) = match load_document(&net, &sink, &rx, &mut settings, &mut url, body, nav, deadline, dump) {
                         Ok(h) => h,
                         Err(code) => return code,
                     };
+                    served_local = local;
                     handles.clear();
                     outstanding = 0;
                     page = Page::new(&url, &html, loader::url_join(), viewport, cfg.clone());
                     page.set_cookie_access(loader::cookie_access(net.clone()));
                     page.set_fonts(fonts.clone());
                     page.set_script_stack(loader::SCRIPT_STACK);
+                    page.set_gl_device(renderer.gl_device());
                     continue;
                 }
             }
         }
-        let new = loader::fetch_subresources(&net, &sink, 1, nav, &mut page);
+        let new = loader::fetch_subresources(&net, &sink, 1, nav, &mut page, served_local);
         outstanding += new.len();
         handles.extend(new);
         let mut wait = deadline.saturating_duration_since(Instant::now());
         if outstanding == 0 {
             // layout may reveal more (background images); stop when it asks for nothing new
             page.update(&mut fonts.borrow_mut());
-            let more = loader::fetch_subresources(&net, &sink, 1, nav, &mut page);
+            let more = loader::fetch_subresources(&net, &sink, 1, nav, &mut page, served_local);
             if more.is_empty() {
                 // the network is quiet: give timers that are due soon a chance, then stop
                 // a page that animates gets a frame every 16 ms, as it would on screen
@@ -270,7 +280,8 @@ pub fn run(args: &[String]) -> i32 {
         };
         match rx.recv_timeout(wait) {
             Ok(ev) if event_nav(&ev) != nav => {} // belongs to a page that has been left
-            Ok(NetEvent::Sheet { req, result, .. }) => {
+            Ok(NetEvent::Sheet { page: pid, req, result, .. }) => {
+                let Some(page) = page.page_by_id(pid) else { continue };
                 outstanding = outstanding.saturating_sub(1);
                 match result {
                     Ok(resp) if resp.status < 400 => {
@@ -287,7 +298,8 @@ pub fn run(args: &[String]) -> i32 {
                     }
                 }
             }
-            Ok(NetEvent::Script { req, result, .. }) => {
+            Ok(NetEvent::Script { page: pid, req, result, .. }) => {
+                let Some(page) = page.page_by_id(pid) else { continue };
                 outstanding = outstanding.saturating_sub(1);
                 match result {
                     Ok(resp) if resp.status < 400 => {
@@ -311,7 +323,8 @@ pub fn run(args: &[String]) -> i32 {
                     }
                 }
             }
-            Ok(NetEvent::Fetch { id, result, .. }) => {
+            Ok(NetEvent::Fetch { page: pid, id, result, .. }) => {
+                let Some(page) = page.page_by_id(pid) else { continue };
                 outstanding = outstanding.saturating_sub(1);
                 if let Err(e) = &result {
                     count_failure(e);
@@ -320,7 +333,8 @@ pub fn run(args: &[String]) -> i32 {
                 }
                 page.fetch_done(id, loader::fetch_result(result));
             }
-            Ok(NetEvent::Image { url, result, .. }) => {
+            Ok(NetEvent::Image { page: pid, url, result, .. }) => {
+                let Some(page) = page.page_by_id(pid) else { continue };
                 outstanding = outstanding.saturating_sub(1);
                 match result {
                     Ok(img) => {
@@ -331,7 +345,8 @@ pub fn run(args: &[String]) -> i32 {
                     Err(e) => count_failure(&e),
                 }
             }
-            Ok(NetEvent::Font { req, result, .. }) => {
+            Ok(NetEvent::Font { page: pid, req, result, .. }) => {
+                let Some(page) = page.page_by_id(pid) else { continue };
                 outstanding = outstanding.saturating_sub(1);
                 match result {
                     Ok(resp) if resp.status < 400 => {
@@ -346,6 +361,20 @@ pub fn run(args: &[String]) -> i32 {
                     Err(e) => {
                         count_failure(&e);
                         page.resource_failed(req);
+                    }
+                }
+            }
+            Ok(NetEvent::Frame { page: pid, node, result, .. }) => {
+                outstanding = outstanding.saturating_sub(1);
+                let Some(owner) = page.page_by_id(pid) else { continue };
+                match result {
+                    Ok(resp) => {
+                        let html = loader::document_html(&resp);
+                        owner.frame_loaded(node, resp.url.as_str(), &html, resp.served_local);
+                    }
+                    Err(e) => {
+                        count_failure(&e);
+                        owner.frame_failed(node);
                     }
                 }
             }
@@ -398,6 +427,9 @@ pub fn run(args: &[String]) -> i32 {
         if loader::rasterize_inline_svgs(&mut page, scale, &mut upload) {
             page.update(&mut fonts.borrow_mut());
         }
+        if loader::upload_canvases(&mut page, &mut upload) {
+            page.update(&mut fonts.borrow_mut());
+        }
     }
     let empty = DrawList::new();
     let _ = &empty;
@@ -444,6 +476,25 @@ pub fn run(args: &[String]) -> i32 {
         );
         eprintln!("network: {} requests, {} blocked, {} KB received", n.requests, n.blocked, n.bytes_received / 1024);
         eprintln!("web fonts: {web_fonts} loaded, {} KB", fonts.borrow().web_font_bytes() / 1024);
+        // canvases with a context, in every document of the page, and what WebGL holds on the GPU
+        let (mut canvases, mut canvas_bytes) = (0usize, 0usize);
+        page.for_each_page(&mut |p| {
+            let (n, b) = p.canvas_stats();
+            canvases += n;
+            canvas_bytes += b;
+        });
+        if canvases > 0 {
+            let gl = renderer.gl_device().borrow().stats();
+            eprintln!(
+                "canvas: {canvases} with a context, {} KB on the CPU | WebGL: {} contexts, buffers {} KB, textures {} KB, {} programs, {} pipelines",
+                canvas_bytes / 1024,
+                gl.contexts,
+                gl.buffer_bytes / 1024,
+                gl.texture_bytes / 1024,
+                gl.programs,
+                gl.pipelines
+            );
+        }
         // what one fully invalidated frame costs
         let mut best = [f32::MAX; 3];
         for _ in 0..5 {

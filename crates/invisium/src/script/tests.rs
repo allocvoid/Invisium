@@ -201,6 +201,65 @@ fn external_scripts_run_in_document_order() {
 }
 
 #[test]
+fn async_and_defer_scripts_keep_the_order_a_parser_gives_them() {
+    let cfg = PageConfig { scripting: true, ..PageConfig::default() };
+    // The layout a bundler emits: early async chunks, a deferred script, an inline bootstrap,
+    // and an async chunk after it that the bootstrap waits for.
+    let html = "<head><script async src='/early.js'></script></head><body>\
+        <script defer src='/defer.js'></script>\
+        <script>console.log('inline, late chunk ran: ' + (typeof late !== 'undefined'));</script>\
+        <script async src='/late.js'></script>\
+        <script src='/block.js'></script>\
+        <script async src='/last.js'></script>\
+        <script>document.addEventListener('DOMContentLoaded', function () { console.log('dcl'); });</script>";
+    let mut p = Page::new("https://example.test/", html, join(), (800.0, 600.0), cfg);
+    let reqs: Vec<_> = p.take_requests().into_iter().filter(|r| r.kind == ResKind::Script).collect();
+    let id = |name: &str| reqs.iter().find(|r| r.url.ends_with(name)).unwrap().id;
+    let mut log: Vec<String> = Vec::new();
+    // The later chunks arrive before anything else. `late.js` may run only after the inline
+    // script before it; `last.js` has a blocking script before it that is still loading.
+    p.script_loaded(id("late.js"), "var late = 1; console.log('late');");
+    p.script_loaded(id("last.js"), "console.log('last');");
+    p.pump(0.0);
+    log.extend(p.take_console().into_iter().map(|m| m.text));
+    assert_eq!(log, vec!["inline, late chunk ran: false", "late"]);
+    // an early async script runs whenever it arrives; the deferred one does not hold anything
+    p.script_loaded(id("early.js"), "console.log('early');");
+    p.pump(1.0);
+    p.script_loaded(id("block.js"), "console.log('block');");
+    p.pump(2.0);
+    log.extend(p.take_console().into_iter().map(|m| m.text));
+    assert_eq!(log[2..], ["early", "block", "last"]);
+    // deferred scripts run last, and DOMContentLoaded waits for them
+    p.script_loaded(id("defer.js"), "console.log('defer');");
+    p.pump(3.0);
+    log.extend(p.take_console().into_iter().map(|m| m.text));
+    assert_eq!(log[5..], ["defer", "dcl"]);
+    assert_eq!(p.pending_scripts(), 0);
+}
+
+#[test]
+fn url_needs_a_base_unless_it_is_absolute() {
+    let t = T::new(
+        "<body><script>
+        function tryUrl(a, b) { try { return (b === undefined ? new URL(a) : new URL(a, b)).href; } catch (e) { return e.name; } }
+        console.log(tryUrl(''), tryUrl('/x'), tryUrl('x y'), tryUrl('https://a.test/p?q#h'));
+        console.log(tryUrl('/x', 'https://a.test/dir/'), tryUrl('', 'https://a.test/dir/'), tryUrl('/x', 'nope'));
+        console.log(URL.canParse(''), URL.canParse('https://b.test/'), URL.parse('') === null, URL.parse('https://a.test/').host);
+        </script>",
+    );
+    assert!(t.errors().is_empty(), "{:?}", t.errors());
+    assert_eq!(
+        t.logs(),
+        vec![
+            "TypeError TypeError TypeError https://a.test/p?q#h",
+            "https://a.test/x https://a.test/dir/ TypeError",
+            "false true true a.test",
+        ]
+    );
+}
+
+#[test]
 fn a_failing_script_does_not_stop_the_next_one() {
     let t = T::new(
         "<body><script>var ok = 1; nope.missing();</script><script>console.log('still here ' + ok);</script>
@@ -1046,4 +1105,340 @@ fn observers_follow_layout_and_scrolling() {
     t.step(96.0);
     assert_eq!(t.logs(), ["true", "size:300 top:true:100 far:false:0", "top:false:0 far:true:100", "size:120"]);
     assert!(t.errors().is_empty(), "{:?}", t.log);
+}
+
+/// A GPU device that only records what it is asked to do.
+#[derive(Default)]
+struct RecordingGl {
+    next: u32,
+    cmds: Vec<invisium_draw::gl::Cmd>,
+    destroyed: Vec<u32>,
+}
+
+impl invisium_draw::gl::GlDevice for RecordingGl {
+    fn create(&mut self) -> Option<u32> {
+        self.next += 1;
+        Some(self.next)
+    }
+    fn destroy(&mut self, ctx: u32) {
+        self.destroyed.push(ctx);
+    }
+    fn image(&self, ctx: u32) -> invisium_draw::ImageId {
+        9000 + ctx
+    }
+    fn run(&mut self, _ctx: u32, cmds: &mut Vec<invisium_draw::gl::Cmd>) {
+        self.cmds.append(cmds);
+    }
+    fn read_pixels(&mut self, _ctx: u32, _target: &invisium_draw::gl::Target, _color: u32, rect: invisium_draw::gl::Rect4) -> Option<(invisium_draw::gl::TexFormat, Vec<u8>)> {
+        let n = (rect[2].max(0) * rect[3].max(0)) as usize;
+        Some((invisium_draw::gl::TexFormat::Rgba8, [10u8, 20, 30, 255].repeat(n)))
+    }
+    fn read_buffer(&mut self, _ctx: u32, _buffer: u32, _offset: u32, len: u32) -> Option<Vec<u8>> {
+        Some(vec![7; len as usize])
+    }
+    fn stats(&self) -> invisium_draw::gl::GlStats {
+        invisium_draw::gl::GlStats::default()
+    }
+}
+
+#[test]
+fn a_canvas_gets_a_webgl_context_that_reaches_the_device() {
+    use invisium_draw::gl::Cmd;
+    let cfg = PageConfig { scripting: true, ..PageConfig::default() };
+    let html = "<body><canvas id=c width=64 height=32></canvas><canvas id=plain></canvas><script>
+        var c = document.getElementById('c');
+        var gl = c.getContext('webgl2', { alpha: false });
+        console.log(String(gl), gl === c.getContext('webgl2'), c.getContext('2d'), gl.canvas === c);
+        console.log(gl.getParameter(gl.VERSION), gl.drawingBufferWidth, gl.drawingBufferHeight, gl.DEPTH_TEST, WebGL2RenderingContext.TEXTURE_2D, gl.TIMEOUT_IGNORED);
+        gl.clearColor(1, 0, 0, 1);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        var px = new Uint8Array(8);
+        gl.readPixels(0, 0, 2, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+        console.log(Array.prototype.join.call(px, ' '));
+        var b = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, b);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([1, 2, 3]), gl.STATIC_DRAW);
+        console.log(String(b), b instanceof WebGLBuffer, gl.getParameter(gl.ARRAY_BUFFER_BINDING) === b, gl.getBufferParameter(gl.ARRAY_BUFFER, gl.BUFFER_SIZE), gl.getError());
+        var ext = gl.getExtension('webgl_lose_context');
+        console.log(typeof ext.loseContext, ext === gl.getExtension('WEBGL_lose_context'), gl.getExtension('WEBGL_debug_renderer_info'));
+        console.log(document.getElementById('plain').getContext('nonsense'));
+        </script>";
+    let mut p = Page::new("https://example.test/", html, join(), (800.0, 600.0), cfg);
+    let dev = Rc::new(RefCell::new(RecordingGl::default()));
+    p.set_gl_device(dev.clone());
+    let fonts = Rc::new(RefCell::new(FontSystem::new()));
+    p.set_fonts(fonts.clone());
+    p.update(&mut fonts.borrow_mut());
+    p.pump(0.0);
+    p.update(&mut fonts.borrow_mut());
+    let log: Vec<String> = p.take_console().into_iter().map(|m| m.text).collect();
+    assert_eq!(
+        log,
+        vec![
+            "[object WebGL2RenderingContext] true null true",
+            "WebGL 2.0 64 32 2929 3553 -1",
+            "10 20 30 255 10 20 30 255",
+            "[object WebGLBuffer] true true 12 0",
+            "function true null",
+            "null",
+        ]
+    );
+    // the script's drawing reached the device and was presented at the end of the turn
+    let cmds = std::mem::take(&mut dev.borrow_mut().cmds);
+    assert!(matches!(cmds.first(), Some(Cmd::Configure { width: 64, height: 32, alpha: false, .. })), "{:?}", cmds.first());
+    assert!(cmds.iter().any(|c| matches!(c, Cmd::Clear { .. })));
+    assert!(cmds.iter().any(|c| matches!(c, Cmd::BufferCreate { bytes, .. } if bytes.len() == 12)));
+    assert_eq!(cmds.iter().filter(|c| matches!(c, Cmd::Present)).count(), 1);
+    // the element is painted with the device's image, which the embedder must not release
+    assert_eq!(p.gl_image_ids(), vec![9001]);
+    assert!(p.image_ids().is_empty());
+    assert_eq!(p.canvas_stats().0, 1);
+    // the context goes with the page
+    drop(p);
+    assert_eq!(dev.borrow().destroyed, vec![1]);
+}
+
+#[test]
+fn a_canvas_draws_in_2d_and_hands_its_bitmap_to_the_embedder() {
+    let mut t = T::new(
+        "<body><canvas id=c width=40 height=20 style='color: rgb(0, 170, 102)'></canvas><script>
+        var c = document.getElementById('c'), x = c.getContext('2d');
+        console.log(String(x), x === c.getContext('2d'), c.getContext('webgl'), x.canvas === c);
+        x.fillStyle = '#1e66d0';
+        x.fillRect(0, 0, 20, 20);
+        x.fillStyle = 'not a colour';
+        console.log(x.fillStyle, x.font, x.globalAlpha, x.lineWidth);
+        x.fillStyle = 'currentColor';
+        x.fillRect(20, 0, 20, 20);
+        var d = x.getImageData(5, 5, 1, 1), e = x.getImageData(30, 5, 1, 1).data;
+        console.log(d instanceof ImageData, d.width, Object.prototype.toString.call(d.data), d.data.join(','), e.join(','));
+        var g = x.createLinearGradient(0, 0, 40, 0);
+        g.addColorStop(0, 'red');
+        console.log(g instanceof CanvasGradient, String(g));
+        x.font = 'italic 700 12px sans-serif';
+        var m = x.measureText('abc');
+        console.log(x.font, m.width > 5, m.fontBoundingBoxAscent > 5, typeof m.actualBoundingBoxLeft);
+        try { x.arc(0, 0, -1, 0, 1); console.log('no error'); } catch (err) { console.log(err instanceof DOMException, err.name); }
+        x.save(); x.setTransform({ a: 2, b: 0, c: 0, d: 2, e: 1, f: 1 }); console.log(x.getTransform().a, x.getTransform().e); x.restore();
+        </script>",
+    );
+    assert!(t.errors().is_empty(), "{:?}", t.errors());
+    assert_eq!(
+        t.logs(),
+        vec![
+            "[object CanvasRenderingContext2D] true null true",
+            "#1e66d0 10px sans-serif 1 1",
+            "true 1 [object Uint8ClampedArray] 30,102,208,255 0,170,102,255",
+            "true [object CanvasGradient]",
+            "italic 700 12px sans-serif true true number",
+            "true IndexSizeError",
+            "2 1",
+        ]
+    );
+    // the bitmap goes to the embedder once per change, as straight RGBA from the top row
+    let up = t.p.take_canvas_uploads();
+    assert_eq!(up.len(), 1);
+    let (node, w, h, px) = &up[0];
+    assert_eq!((*node, *w, *h, px.len()), (t.id("c"), 40, 20, 40 * 20 * 4));
+    assert_eq!(&px[0..4], &[30, 102, 208, 255]);
+    assert_eq!(&px[(39 * 4)..(40 * 4)], &[0, 170, 102, 255]);
+    assert!(t.p.take_canvas_uploads().is_empty());
+    // resizing clears it and asks for another upload
+    t.p.eval("document.getElementById('c').width = 10; console.log(document.getElementById('c').getContext('2d').getImageData(1, 1, 1, 1).data.join(','))");
+    t.step(1.0);
+    assert_eq!(t.logs().last(), Some(&"0,0,0,0"));
+    let up = t.p.take_canvas_uploads();
+    assert_eq!((up.len(), up[0].1, up[0].2), (1, 10, 20));
+}
+
+#[test]
+fn frames_load_paint_inside_their_element_and_take_input() {
+    use invisium_draw::Item;
+    let cfg = PageConfig { scripting: true, ..PageConfig::default() };
+    let html = "<body style='margin:0'><p style='margin:0;height:40px'>top</p>\
+        <iframe id=f src='/inner.html' style='border:0;width:300px;height:100px;display:block'></iframe>\
+        <iframe id=self src='/'></iframe>\
+        <iframe id=doc srcdoc='<p>inline</p><script>console.log(\"srcdoc ran\")</script>' sandbox></iframe>\
+        <script>document.getElementById('f').addEventListener('load', function () { console.log('frame load event'); });</script>";
+    let mut p = Page::new("https://example.test/", html, join(), (800.0, 600.0), cfg);
+    let fonts = Rc::new(RefCell::new(FontSystem::new()));
+    p.set_fonts(fonts.clone());
+    p.update(&mut fonts.borrow_mut());
+    // only the real frame is asked for: a document may not frame itself, srcdoc needs no fetch
+    let reqs = p.take_frame_requests();
+    assert_eq!(reqs.len(), 1);
+    assert_eq!((reqs[0].node, reqs[0].url.as_str()), (p.document().element_by_id("f"), "https://example.test/inner.html"));
+    assert_eq!(p.frames_loading(), 0);
+    let before = p.display_list().items.len();
+    p.frame_loaded(
+        reqs[0].node,
+        "https://example.test/inner.html",
+        "<body style='margin:0;background:#00f'><a id=l href='/next.html' style='display:block;height:50px'>inner link</a>\
+         <script>console.log('inner ran at ' + location.href + ' framed ' + (window.top !== window));</script>",
+        false,
+    );
+    for t in 0..4 {
+        p.pump(t as f64);
+        p.update(&mut fonts.borrow_mut());
+    }
+    let log: Vec<String> = p.take_console().into_iter().map(|m| m.text).collect();
+    // the sandboxed inline frame runs no script; the real one does, and its element hears `load`
+    assert!(log.iter().any(|l| l.starts_with("inner ran at https://example.test/inner.html")), "{log:?}");
+    assert!(log.iter().any(|l| l == "frame load event"), "{log:?}");
+    assert!(!log.iter().any(|l| l.contains("srcdoc ran")), "{log:?}");
+    // the frame's picture sits inside this page's list: clipped, moved to the element, blue
+    let list = p.display_list();
+    assert!(list.items.len() > before);
+    let at = list.items.iter().position(|i| matches!(i, Item::Rect { color, .. } if (color.r, color.g, color.b) == (0, 0, 255))).expect("frame background");
+    assert!(matches!(&list.items[at - 1], Item::PushClip { rect, .. } if (rect.x, rect.y, rect.w, rect.h) == (0.0, 40.0, 300.0, 100.0)), "{:?}", list.items[at - 1]);
+    assert!(matches!(&list.items[at + 1], Item::PushTransform { m } if (m[4], m[5]) == (0.0, 40.0)));
+    // glyph spans of the frame's text point into the combined glyph buffer
+    let glyphs = p.glyphs().len() as u32;
+    for it in &list.items {
+        if let Item::Glyphs { glyphs: span, .. } = it {
+            assert!(span.0 <= span.1 && span.1 <= glyphs);
+        }
+    }
+    assert!(list.items.iter().all(|i| !matches!(i, Item::Image { image, .. } if *image >= 0xF000_0000)));
+    assert!(p.image_ids().is_empty());
+    // hovering and clicking the link inside the frame: the frame navigates, not the page
+    let hover = p.mouse_move(20.0, 60.0);
+    assert_eq!(hover.link.as_deref(), Some("https://example.test/next.html"));
+    assert_eq!(p.click(20.0, 60.0, false), PageAction::Redraw);
+    let reqs = p.take_frame_requests();
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].url, "https://example.test/next.html");
+    // a click outside the frame is the page's own
+    assert_eq!(p.click(20.0, 10.0, false), PageAction::None);
+    // every page can be reached by id for routing
+    let mut ids = Vec::new();
+    p.for_each_page(&mut |pg| ids.push((pg.id(), pg.is_frame())));
+    assert_eq!(ids.len(), 3);
+    assert!(!ids[0].1 && ids[1].1 && ids[2].1);
+    let inner = ids.iter().find(|i| i.1).unwrap().0;
+    assert!(p.page_by_id(inner).is_some());
+}
+
+#[test]
+fn documents_in_frames_talk_by_messages_only() {
+    let cfg = PageConfig { scripting: true, ..PageConfig::default() };
+    let html = "<body><iframe id=f src='https://widget.test/w.html'></iframe><script>
+        var f = document.getElementById('f');
+        console.log('top: top is self ' + (window.top === window) + ', parent is self ' + (window.parent === window) + ', document of frame ' + f.contentDocument + ', same window ' + (f.contentWindow === f.contentWindow));
+        window.addEventListener('message', function (e) {
+            console.log('top got ' + JSON.stringify(e.data) + ' from ' + e.origin + ' source is frame ' + (e.source === f.contentWindow));
+            if (e.data.hello) e.source.postMessage({ reply: e.data.hello + 1 }, 'https://widget.test');
+            if (e.data.hello) e.source.postMessage({ reply: 'wrong origin' }, 'https://other.test');
+        });
+        </script>";
+    let mut p = Page::new("https://example.test/page", html, join(), (800.0, 600.0), cfg);
+    let fonts = Rc::new(RefCell::new(FontSystem::new()));
+    p.set_fonts(fonts.clone());
+    p.update(&mut fonts.borrow_mut());
+    let reqs = p.take_frame_requests();
+    assert_eq!(reqs.len(), 1);
+    p.frame_loaded(
+        reqs[0].node,
+        "https://widget.test/w.html",
+        "<body><script>
+        console.log('frame: top is self ' + (window.top === window) + ', parent is top ' + (window.parent === window.top) + ', frameElement ' + window.frameElement);
+        window.addEventListener('message', function (e) {
+            console.log('frame got ' + JSON.stringify(e.data) + ' from ' + e.origin + ' source is parent ' + (e.source === window.parent));
+        });
+        window.parent.postMessage({ hello: 41, list: [1, 'two', null] }, '*');
+        try { window.parent.postMessage(function () {}, '*'); } catch (e) { console.log('frame cannot send a function: ' + e.name); }
+        </script>",
+        false,
+    );
+    for t in 0..8 {
+        p.pump(t as f64);
+        p.update(&mut fonts.borrow_mut());
+    }
+    let log: Vec<String> = p.take_console().into_iter().map(|m| m.text).collect();
+    assert_eq!(
+        log,
+        vec![
+            // (a page's own console lines come before those of the documents framed in it)
+            "top: top is self true, parent is self true, document of frame null, same window true",
+            "top got {\"hello\":41,\"list\":[1,\"two\",null]} from https://widget.test source is frame true",
+            "frame: top is self false, parent is top true, frameElement null",
+            "frame cannot send a function: DataCloneError",
+            "frame got {\"reply\":42} from https://example.test source is parent true",
+        ]
+    );
+}
+
+#[test]
+fn inline_elements_report_where_their_text_is() {
+    let t = T::new(
+        "<body style='margin:0'><p style='margin:0;font:20px/30px sans-serif'><span id=a>one</span> <span id=b>two <i id=c>three</i></span></p><span id=e></span><script>
+        function r(id) { var q = document.getElementById(id).getBoundingClientRect(); return [Math.round(q.left), Math.round(q.top), Math.round(q.width), Math.round(q.height)]; }
+        var a = r('a'), b = r('b'), c = r('c');
+        console.log(a[0] === 0, a[2] > 10, b[0] > a[0] + a[2] - 1, c[0] > b[0], Math.abs(c[0] + c[2] - (b[0] + b[2])) <= 1, a[3] > 10, a[1] >= 0 && a[1] < 30);
+        console.log(r('e').join(','));
+        </script>",
+    );
+    assert!(t.errors().is_empty(), "{:?}", t.errors());
+    // each word starts after the one before it; an inner element ends where its parent ends
+    assert_eq!(t.logs()[0], "true true true true true true true");
+}
+
+#[test]
+fn computed_style_reports_the_text_properties_pages_copy() {
+    let t = T::new(
+        "<body><p id=p style='font-size:20px;letter-spacing:-0.05em;text-transform:uppercase;line-height:1.5;word-spacing:2px'>x</p><p id=q>y</p><script>
+        var a = getComputedStyle(document.getElementById('p')), b = getComputedStyle(document.getElementById('q'));
+        console.log(a.letterSpacing, a.textTransform, a.lineHeight, a.wordSpacing, '|', b.letterSpacing, b.textTransform, b.lineHeight);
+        </script>",
+    );
+    assert_eq!(t.logs(), vec!["-1px uppercase 30px 2px | normal none normal"]);
+}
+
+#[test]
+fn a_script_can_point_a_frame_somewhere_else() {
+    let mut t = T::new(
+        "<body><iframe id=f></iframe><script>
+        var f = document.getElementById('f');
+        f.src = '/first.html';
+        var g = document.createElement('iframe');
+        g.src = 'https://other.test/second.html';
+        document.body.appendChild(g);
+        </script>",
+    );
+    let mut urls: Vec<String> = t.p.take_frame_requests().into_iter().map(|r| r.url).collect();
+    urls.sort();
+    assert_eq!(urls, vec!["https://example.test/first.html", "https://other.test/second.html"]);
+    // the same address again asks for nothing; a new one does
+    t.p.eval("document.getElementById('f').src = '/first.html'");
+    t.step(1.0);
+    assert!(t.p.take_frame_requests().is_empty());
+    t.p.eval("document.getElementById('f').src = '/third.html'");
+    t.step(2.0);
+    assert_eq!(t.p.take_frame_requests().len(), 1);
+}
+
+#[test]
+fn throwaway_webgl_canvases_do_not_use_up_the_contexts() {
+    let cfg = PageConfig { scripting: true, ..PageConfig::default() };
+    // pages probe for WebGL with canvases they never attach; the shown canvas must keep working
+    let html = "<body><canvas id=shown></canvas><script>
+        var shown = document.getElementById('shown').getContext('webgl2'), made = 0;
+        for (var i = 0; i < 40; i++) { if (document.createElement('canvas').getContext('webgl2')) made++; }
+        shown.clearColor(0, 1, 0, 1); shown.clear(shown.COLOR_BUFFER_BIT);
+        console.log(made, shown.getError());
+        </script>";
+    let mut p = Page::new("https://example.test/", html, join(), (800.0, 600.0), cfg);
+    let dev = Rc::new(RefCell::new(RecordingGl::default()));
+    p.set_gl_device(dev.clone());
+    let fonts = Rc::new(RefCell::new(FontSystem::new()));
+    p.set_fonts(fonts.clone());
+    p.update(&mut fonts.borrow_mut());
+    p.pump(0.0);
+    let log: Vec<String> = p.take_console().into_iter().map(|m| m.text).collect();
+    assert_eq!(log, vec!["40 0"]);
+    // never more than the limit alive, and the canvas in the document was not the one dropped
+    assert_eq!(p.canvas_stats().0, 16);
+    assert_eq!(dev.borrow().destroyed.len(), 25);
+    assert!(!dev.borrow().destroyed.contains(&1));
+    assert!(dev.borrow().cmds.iter().any(|c| matches!(c, invisium_draw::gl::Cmd::Clear { .. })));
 }

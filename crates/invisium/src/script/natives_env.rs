@@ -8,7 +8,7 @@ use crate::css::parser::{parse_media_query_list, MediaEnv};
 use crate::css::tokenizer::tokenize_value;
 use crate::css::values::Color;
 use crate::dom::{NodeId, DOCUMENT_NODE, NO_NODE};
-use crate::layout::{F_POSITIONED, NO_BOX};
+use crate::layout::{BoxKind, F_POSITIONED, NO_BOX};
 use invisium_js::{Runtime, Value};
 use std::rc::Rc;
 
@@ -35,8 +35,14 @@ fn doc_rect(st: &mut HostState, n: NodeId) -> Option<(f32, f32, f32, f32)> {
     if b == NO_BOX {
         return None;
     }
-    let (x, y) = st.page.tree.abs_pos(b);
     let bx = &st.page.tree.boxes[b as usize];
+    // an inline box has no geometry of its own: it is where its line fragments are
+    if matches!(bx.kind, BoxKind::Inline | BoxKind::Text | BoxKind::Break) {
+        if let Some(r) = st.page.tree.inline_rect(b) {
+            return Some(r);
+        }
+    }
+    let (x, y) = st.page.tree.abs_pos(b);
     Some((x, y, bx.w, bx.h))
 }
 
@@ -185,6 +191,16 @@ fn n_computed(rt: &mut Runtime, cx: &Cx, args: &[Value]) -> NRes {
                 "font-weight" => s.font_weight.to_string(),
                 "font-style" => if s.italic { "italic".into() } else { "normal".into() },
                 "font-family" => s.font_family.iter().map(|f| f.as_str()).collect::<Vec<_>>().join(", "),
+                // pages copy these into a canvas to redraw their own text
+                "letter-spacing" => if s.letter_spacing == 0.0 { "normal".into() } else { px(s.letter_spacing) },
+                "word-spacing" => px(s.word_spacing),
+                "text-transform" => kebab(&format!("{:?}", s.text_transform)),
+                "line-height" => match s.line_height {
+                    crate::style::LineHeight::Normal => "normal".into(),
+                    crate::style::LineHeight::Number(n) => px(n * s.font_size),
+                    crate::style::LineHeight::Px(v) => px(v),
+                },
+                "cursor" => kebab(&format!("{:?}", s.cursor)),
                 "width" => bx.as_ref().map_or("auto".into(), |b| px((b.w - b.pad[1] - b.pad[3] - s.border_width[1] - s.border_width[3]).max(0.0))),
                 "height" => bx.as_ref().map_or("auto".into(), |b| px((b.h - b.pad[0] - b.pad[2] - s.border_width[0] - s.border_width[2]).max(0.0))),
                 "margin-top" => px(bx.as_ref().map_or(0.0, |b| b.margin[0])),

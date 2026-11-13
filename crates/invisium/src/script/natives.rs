@@ -16,6 +16,10 @@ use std::rc::Rc;
 pub(crate) struct Cx {
     pub st: Shared,
     pub class: ClassId,
+    /// Host classes of the objects canvas contexts hand out (WebGL objects; gradients,
+    /// patterns and paths of 2D contexts).
+    pub gl_class: ClassId,
+    pub c2d_class: ClassId,
 }
 
 pub(crate) type NRes = Result<Value, Thrown>;

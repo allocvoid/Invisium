@@ -292,6 +292,14 @@ function atob(s) {
     CSSStyleDeclaration: CSSStyleDeclaration, CSSStyleSheet: CSSStyleSheet, Storage: Storage, URL: URL,
     URLSearchParams: URLSearchParams, Range: Range, TreeWalker: TreeWalker, NodeFilter: NodeFilter,
     MutationObserver: MutationObserver, IntersectionObserver: IntersectionObserver, ResizeObserver: ResizeObserver,
+    CanvasRenderingContext2D: CanvasRenderingContext2D, WebGLRenderingContext: WebGLRenderingContext,
+    WebGL2RenderingContext: WebGL2RenderingContext, ImageData: ImageData, CanvasGradient: CanvasGradient,
+    CanvasPattern: CanvasPattern, WebGLActiveInfo: WebGLActiveInfo, WebGLShaderPrecisionFormat: WebGLShaderPrecisionFormat,
+    WebGLBuffer: glObjects.WebGLBuffer, WebGLTexture: glObjects.WebGLTexture, WebGLRenderbuffer: glObjects.WebGLRenderbuffer,
+    WebGLFramebuffer: glObjects.WebGLFramebuffer, WebGLShader: glObjects.WebGLShader, WebGLProgram: glObjects.WebGLProgram,
+    WebGLUniformLocation: glObjects.WebGLUniformLocation, WebGLVertexArrayObject: glObjects.WebGLVertexArrayObject,
+    WebGLSampler: glObjects.WebGLSampler, WebGLQuery: glObjects.WebGLQuery, WebGLSync: glObjects.WebGLSync,
+    WebGLTransformFeedback: glObjects.WebGLTransformFeedback,
     IntersectionObserverEntry: IntersectionObserverEntry, ResizeObserverEntry: ResizeObserverEntry,
     Animation: Animation, AnimationEffect: AnimationEffect, KeyframeEffect: KeyframeEffect,
     PerformanceObserver: PerformanceObserver, AbortController: AbortController, AbortSignal: AbortSignal,
@@ -329,6 +337,12 @@ function atob(s) {
   hide(g, 'HTMLCollection', Array);
 })();
 
+// Inside a frame, the windows above are other documents.
+if (n.frameDepth() > 0) {
+  Object.defineProperty(g, 'parent', { get: function () { return otherWindow(0, null); }, configurable: true });
+  Object.defineProperty(g, 'top', { get: function () { return otherWindow(n.frameDepth() > 1 ? 1 : 0, null); }, configurable: true });
+}
+
 // ───────────────────────────── entry points for the engine ─────────────────────────────
 
 return {
@@ -341,6 +355,8 @@ return {
   anim: cssAnimationEvent,
   // script animations that reached their end: [id, ...]
   animDone: animationsDone,
+  // a message from another document: (JSON text, origin, frame element or null)
+  message: frameMessage,
   // a script request finished: (id, ok, status, url, [name, value, ...], text)
   fetched: fetchDone,
   focus: function (prev, next) {

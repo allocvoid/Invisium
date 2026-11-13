@@ -7,6 +7,8 @@
 mod host;
 mod natives;
 mod natives_anim;
+mod natives_canvas;
+mod natives_frames;
 mod natives_env;
 mod serialize;
 #[cfg(test)]
@@ -37,6 +39,8 @@ const BOOTSTRAP: &str = concat!(
     include_str!("js/46_streams.js"),
     include_str!("js/47_misc.js"),
     include_str!("js/48_animation.js"),
+    include_str!("js/49_canvas.js"),
+    include_str!("js/49_frames.js"),
     include_str!("js/50_window.js"),
 );
 
@@ -71,6 +75,7 @@ struct Exports {
     frame: Value,
     anim: Value,
     anim_done: Value,
+    message: Value,
 }
 
 pub(crate) struct ScriptEngine {
@@ -94,6 +99,11 @@ impl ScriptEngine {
         if native_stack > 0 {
             rt.set_native_stack_budget(native_stack);
         }
+        // Debugging aid: collect garbage at every n-th point where the engine may collect, so
+        // a value this glue forgot to root fails at once instead of once in a thousand loads.
+        if let Some(n) = std::env::var("INVIS_GC_STRESS").ok().and_then(|v| v.parse::<u32>().ok()) {
+            rt.set_gc_stress(n);
+        }
         // all behaviour lives on prototypes, so the wrapper class needs no property hooks
         let class = rt.register_plain_host_class("Node");
         let st: Shared = Rc::new(RefCell::new(HostState::new(join, true)));
@@ -113,12 +123,15 @@ impl ScriptEngine {
                 (st.page.join)(referrer, spec)
             }
         }));
-        let cx = Rc::new(Cx { st, class });
+        let (gl_class, c2d_class) = natives_canvas::classes(&mut rt);
+        let cx = Rc::new(Cx { st, class, gl_class, c2d_class });
         let n = rt.object();
         rt.root(n);
         natives::install(&mut rt, n, &cx);
         natives_env::install(&mut rt, n, &cx);
         natives_anim::install(&mut rt, n, &cx);
+        natives_canvas::install(&mut rt, n, &cx);
+        natives_frames::install(&mut rt, n, &cx);
         ScriptEngine { rt, cx, natives: n, exports: None, broken: false, tmp: Vec::new() }
     }
 
@@ -191,6 +204,7 @@ impl ScriptEngine {
                     frame: grab("frame"),
                     anim: grab("anim"),
                     anim_done: grab("animDone"),
+                    message: grab("message"),
                 });
             }
             Err(e) => {
@@ -400,6 +414,20 @@ impl ScriptEngine {
         let n = self.rt.string(name);
         self.keep(n);
         self.call_export(ex.anim, &[t, k, n, Value::Number(elapsed)], "animation event");
+        self.release();
+    }
+
+    /// A message from another document arrived: its data as JSON text, the sender's origin
+    /// and the frame element it came through (`NO_NODE` = from the document this one is
+    /// framed in).
+    pub fn frame_message(&mut self, json: &str, origin: &str, through: NodeId) {
+        let Some(ex) = self.exports else { return };
+        let j = self.rt.string(json);
+        self.keep(j);
+        let o = self.rt.string(origin);
+        self.keep(o);
+        let n = wrap(&mut self.rt, &self.cx, through);
+        self.call_export(ex.message, &[j, o, n], "message listener");
         self.release();
     }
 
