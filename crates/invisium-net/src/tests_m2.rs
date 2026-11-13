@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-type Log = Arc<Mutex<Vec<String>>>;
+pub(crate) type Log = Arc<Mutex<Vec<String>>>;
 
 fn relay(client: TcpStream, port: u16) {
     let Ok(upstream) = TcpStream::connect(("127.0.0.1", port)) else { return };
@@ -26,7 +26,7 @@ fn relay(client: TcpStream, port: u16) {
 }
 
 /// Fake HTTP CONNECT proxy: logs the CONNECT head, "resolves" every name to 127.0.0.1.
-fn fake_connect_proxy(basic: Option<&'static str>) -> (u16, Log) {
+pub(crate) fn fake_connect_proxy(basic: Option<&'static str>) -> (u16, Log) {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
     let log: Log = Arc::default();
@@ -63,7 +63,7 @@ enum SocksAuth {
 }
 
 /// Fake SOCKS5 proxy (RFC 1928/1929): logs the requested address.
-fn fake_socks5(auth: Option<(&'static str, &'static str)>) -> (u16, Log) {
+pub(crate) fn fake_socks5(auth: Option<(&'static str, &'static str)>) -> (u16, Log) {
     fake_socks5_with(auth.map_or(SocksAuth::None, |(u, p)| SocksAuth::Exact(u, p)))
 }
 

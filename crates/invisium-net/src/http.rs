@@ -269,6 +269,186 @@ pub(crate) async fn read_response<R: AsyncRead + Unpin>(
     Err(proto("too many interim responses"))
 }
 
+/// How a response body is delimited.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Framing {
+    Empty,
+    Length(u64),
+    Chunked,
+    Close,
+}
+
+/// A response head read on its own, the body still on the connection.
+pub(crate) struct Head {
+    pub status: u16,
+    pub http11: bool,
+    pub headers: Headers,
+}
+
+/// Reads one response head, skipping 1xx interim responses. A `101` is returned only when
+/// `upgrade` is set (the WebSocket handshake); otherwise it is an error as in `read_response`.
+pub(crate) async fn read_final_head<R: AsyncRead + Unpin>(
+    r: &mut Reader<R>,
+    upgrade: bool,
+) -> Result<Head, NetError> {
+    for _ in 0..MAX_INTERIM {
+        let (status, http11, headers) = read_head(r).await?;
+        if status == 101 {
+            if upgrade {
+                return Ok(Head { status, http11, headers });
+            }
+            return Err(proto("unexpected protocol switch"));
+        }
+        if (100..200).contains(&status) {
+            continue;
+        }
+        return Ok(Head { status, http11, headers });
+    }
+    Err(proto("too many interim responses"))
+}
+
+/// The body framing of a final response, as `read_response` decides it.
+pub(crate) fn framing(head: &Head, head_request: bool) -> Result<Framing, NetError> {
+    if head_request || head.status == 204 || head.status == 304 {
+        return Ok(Framing::Empty);
+    }
+    let te: Vec<String> = head
+        .headers
+        .get_all("transfer-encoding")
+        .flat_map(|v| v.split(','))
+        .map(|t| t.trim().to_ascii_lowercase())
+        .filter(|t| !t.is_empty() && t != "identity")
+        .collect();
+    if !te.is_empty() {
+        if te.iter().any(|t| t != "chunked") {
+            return Err(proto("unsupported Transfer-Encoding"));
+        }
+        return Ok(Framing::Chunked);
+    }
+    Ok(match content_length(&head.headers)? {
+        Some(n) => Framing::Length(n),
+        None => Framing::Close,
+    })
+}
+
+/// Whether the connection may carry another request once the body was read completely.
+pub(crate) fn keep_alive(head: &Head, framing: Framing) -> bool {
+    let close = head
+        .headers
+        .get_all("connection")
+        .flat_map(|v| v.split(','))
+        .any(|t| t.trim().eq_ignore_ascii_case("close"));
+    head.http11 && framing != Framing::Close && !close
+}
+
+/// Hands out a response body piece by piece without collecting it. Each piece is at most the
+/// reader's buffer (a few tens of KiB).
+pub(crate) struct BodyStream {
+    framing: Framing,
+    /// Bytes left in the current chunk (or in the whole body with `Length`).
+    left: u64,
+    /// Chunked: a chunk's data was consumed and its CR LF is still to be read.
+    chunk_open: bool,
+    done: bool,
+}
+
+impl BodyStream {
+    pub fn new(framing: Framing) -> BodyStream {
+        let (left, done) = match framing {
+            Framing::Empty => (0, true),
+            Framing::Length(n) => (n, n == 0),
+            _ => (0, false),
+        };
+        BodyStream { framing, left, chunk_open: false, done }
+    }
+
+    /// The next piece of the body, `None` at its end.
+    pub async fn next<'a, R: AsyncRead + Unpin>(
+        &mut self,
+        r: &'a mut Reader<R>,
+    ) -> Result<Option<&'a [u8]>, NetError> {
+        if self.done {
+            return Ok(None);
+        }
+        match self.framing {
+            Framing::Empty => Ok(None),
+            Framing::Length(_) => {
+                if r.drained() && r.fill().await? == 0 {
+                    return Err(proto("connection closed before end of body"));
+                }
+                let piece = r.take(self.left);
+                self.left -= piece.len() as u64;
+                self.done = self.left == 0;
+                Ok(Some(piece))
+            }
+            Framing::Close => {
+                if r.drained() && r.fill().await? == 0 {
+                    self.done = true;
+                    return Ok(None);
+                }
+                Ok(Some(r.take(u64::MAX)))
+            }
+            Framing::Chunked => {
+                if self.left == 0 {
+                    if self.chunk_open {
+                        let end = r.read_line().await?.ok_or_else(|| proto("connection closed after chunk"))?;
+                        if !end.is_empty() {
+                            return Err(proto("missing CRLF after chunk"));
+                        }
+                        self.chunk_open = false;
+                    }
+                    let size = chunk_size(r).await?;
+                    if size == 0 {
+                        for _ in 0..=MAX_HEADERS {
+                            let t = r.read_line().await?.ok_or_else(|| proto("connection closed in trailers"))?;
+                            if t.is_empty() {
+                                self.done = true;
+                                return Ok(None);
+                            }
+                        }
+                        return Err(proto("too many trailers"));
+                    }
+                    self.left = size;
+                    self.chunk_open = true;
+                }
+                if r.drained() && r.fill().await? == 0 {
+                    return Err(proto("connection closed before end of body"));
+                }
+                let piece = r.take(self.left);
+                self.left -= piece.len() as u64;
+                Ok(Some(piece))
+            }
+        }
+    }
+}
+
+async fn chunk_size<R: AsyncRead + Unpin>(r: &mut Reader<R>) -> Result<u64, NetError> {
+    let line = r.read_line().await?.ok_or_else(|| proto("connection closed in chunked body"))?;
+    let size_part = line.split(|&b| b == b';').next().unwrap_or(&[]);
+    let s = std::str::from_utf8(size_part).map_err(|_| proto("invalid chunk size"))?.trim();
+    if s.is_empty() || s.len() > 16 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(proto("invalid chunk size"));
+    }
+    u64::from_str_radix(s, 16).map_err(|_| proto("invalid chunk size"))
+}
+
+impl<R> Reader<R> {
+    /// Up to `max` buffered bytes, consumed.
+    fn take(&mut self, max: u64) -> &[u8] {
+        let avail = self.buf.len() - self.pos;
+        let n = (max.min(avail as u64)) as usize;
+        let start = self.pos;
+        self.pos += n;
+        &self.buf[start..start + n]
+    }
+
+    /// The stream and the bytes already read from it but not consumed.
+    pub fn into_parts(self) -> (R, Vec<u8>) {
+        let rest = self.buf[self.pos..].to_vec();
+        (self.io, rest)
+    }
+}
+
 /// Lower-case MIME essence and charset parameter of a Content-Type value.
 pub(crate) fn parse_content_type(v: &str) -> (String, Option<String>) {
     let mut parts = v.split(';');

@@ -55,13 +55,23 @@ pub(crate) struct Conn {
     _guard: ConnGuard,
 }
 
-/// Test-only stand-in for name resolution: the address the "resolver" reports for a host and
-/// the address the socket is really opened to (a local listener playing a public server).
+impl Conn {
+    /// The stream (with bytes already read but not consumed) for a protocol that takes the
+    /// connection over (WebSocket). The guard keeps the connection counted as open.
+    pub(crate) fn into_stream(self) -> (Box<dyn Io>, Vec<u8>, ConnGuard) {
+        let (io, rest) = self.reader.into_parts();
+        (io, rest, self._guard)
+    }
+}
+
+/// Test-only stand-in for name resolution: the addresses the "resolver" reports for a host, in
+/// order, each with the address the socket is really opened to in its place (a local listener
+/// playing a public server), or `None` when that address is unreachable. The connected peer is
+/// reported as the address the resolver gave.
 #[cfg(test)]
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct TestRoute {
-    pub resolved: std::net::IpAddr,
-    pub dial: std::net::IpAddr,
+    pub addrs: Vec<(std::net::IpAddr, Option<std::net::IpAddr>)>,
 }
 
 /// Stable identifier of the route and its credentials, used in pool keys.
@@ -106,18 +116,51 @@ pub(crate) struct Dialer<'a> {
     pub host_map: Option<TestRoute>,
 }
 
-async fn connect_any(addrs: &[SocketAddr]) -> Result<TcpStream, NetError> {
+/// Connects to the first reachable address; returns the stream and the address connected to.
+async fn connect_any(addrs: &[SocketAddr]) -> Result<(TcpStream, SocketAddr), NetError> {
     let mut last = String::from("no addresses");
     for a in addrs {
         match TcpStream::connect(a).await {
             Ok(s) => {
                 let _ = s.set_nodelay(true);
-                return Ok(s);
+                let peer = s.peer_addr().unwrap_or(*a);
+                return Ok((s, peer));
             }
             Err(e) => last = format!("{a}: {e}"),
         }
     }
     Err(NetError::Connect(last))
+}
+
+/// `connect_any` through the test resolver seam: each reported address is dialled as its
+/// stand-in, and the peer is reported as the address the resolver gave.
+#[cfg(test)]
+async fn connect_mapped(route: &TestRoute, port: u16) -> Result<(TcpStream, SocketAddr), NetError> {
+    let mut last = String::from("no addresses");
+    for (reported, dial) in &route.addrs {
+        let Some(dial) = dial else {
+            last = format!("{reported}: unreachable");
+            continue;
+        };
+        match TcpStream::connect(SocketAddr::new(*dial, port)).await {
+            Ok(s) => return Ok((s, SocketAddr::new(*reported, port))),
+            Err(e) => last = format!("{reported}: {e}"),
+        }
+    }
+    Err(NetError::Connect(last))
+}
+
+/// A host name DNS cannot encode (a label over 63 bytes, a name over 253) fails at once,
+/// before any resolver or proxy is asked. IP literals are not names.
+pub(crate) fn check_dns_name(host: &str) -> Result<(), NetError> {
+    if host.starts_with('[') || host.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(());
+    }
+    let name = host.strip_suffix('.').unwrap_or(host);
+    if name.len() > 253 || name.split('.').any(|l| l.len() > 63) {
+        return Err(NetError::Dns(format!("{host}: name too long for DNS")));
+    }
+    Ok(())
 }
 
 /// Connects to the proxy itself; any failure is a proxy error.
@@ -127,10 +170,11 @@ async fn connect_proxy(host: &str, port: u16) -> Result<TcpStream, NetError> {
         .await
         .map_err(|e| NetError::Proxy(format!("cannot resolve proxy {host}: {e}")))?
         .collect();
-    connect_any(&addrs).await.map_err(|e| match e {
-        NetError::Connect(m) => NetError::Proxy(format!("cannot reach proxy: {m}")),
-        other => other,
-    })
+    match connect_any(&addrs).await {
+        Ok((s, _)) => Ok(s),
+        Err(NetError::Connect(m)) => Err(NetError::Proxy(format!("cannot reach proxy: {m}"))),
+        Err(other) => Err(other),
+    }
 }
 
 impl Dialer<'_> {
@@ -141,8 +185,8 @@ impl Dialer<'_> {
     /// The addresses `host` resolves to on this machine.
     async fn lookup(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, NetError> {
         #[cfg(test)]
-        if let Some(r) = self.host_map {
-            return Ok(vec![SocketAddr::new(r.resolved, port)]);
+        if let Some(r) = &self.host_map {
+            return Ok(r.addrs.iter().map(|(ip, _)| SocketAddr::new(*ip, port)).collect());
         }
         let bare = host.trim_start_matches('[').trim_end_matches(']');
         self.resolver.resolve(self.tls, self.cfg.dns, bare, port, self.timeout()).await
@@ -150,17 +194,18 @@ impl Dialer<'_> {
 
     /// Resolves and connects directly. The private-network test runs on the resolved addresses
     /// before any socket is opened, and the socket is opened to exactly those addresses.
-    /// Returns the stream and whether the peer is a local address.
+    /// Returns the stream and whether the address actually connected to is local (not whether
+    /// any of the resolved addresses is).
     async fn direct(&self, host: &str, port: u16) -> Result<(TcpStream, bool), NetError> {
         let addrs = self.lookup(host, port).await?;
         privnet::check_resolved(self.guard_local, &addrs)?;
-        let local = addrs.iter().any(|a| privnet::ip_is_local(a.ip()));
         #[cfg(test)]
-        let addrs = match self.host_map {
-            Some(r) => vec![SocketAddr::new(r.dial, port)],
-            None => addrs,
-        };
-        Ok((connect_any(&addrs).await?, local))
+        if let Some(r) = &self.host_map {
+            let (s, peer) = connect_mapped(r, port).await?;
+            return Ok((s, privnet::ip_is_local(peer.ip())));
+        }
+        let (s, peer) = connect_any(&addrs).await?;
+        Ok((s, privnet::ip_is_local(peer.ip())))
     }
 
     async fn transport(&self, host: &str, port: u16) -> Result<(Box<dyn Io>, Route, bool), NetError> {
@@ -190,6 +235,7 @@ impl Dialer<'_> {
     pub async fn connect(&self, url: &Url) -> Result<Conn, NetError> {
         let host = url.host().to_string();
         let port = url.port_or_default();
+        check_dns_name(&host)?;
         let fut = async {
             let (stream, route, local_peer) = self.transport(&host, port).await?;
             let io: Box<dyn Io> = if url.is_secure() {

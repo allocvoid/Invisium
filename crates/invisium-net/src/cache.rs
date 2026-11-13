@@ -10,6 +10,8 @@ pub(crate) struct Cached {
     pub status: u16,
     pub headers: Headers,
     pub body: Vec<u8>,
+    /// `Response::served_local` of the response this entry was stored from.
+    pub served_local: bool,
 }
 
 struct Entry {
@@ -117,7 +119,7 @@ mod tests {
             h.push("Cache-Control", cc);
         }
         let ttl = freshness(200, &h);
-        (Cached { status: 200, headers: h, body: vec![b'x'; body] }, ttl)
+        (Cached { status: 200, headers: h, body: vec![b'x'; body], served_local: false }, ttl)
     }
 
     #[test]

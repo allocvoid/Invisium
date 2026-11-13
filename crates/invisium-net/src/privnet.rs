@@ -146,6 +146,20 @@ pub(crate) fn guards(top_level: Option<&Url>) -> bool {
     top_level.is_some_and(|page| classify(page.host()) != Some(true))
 }
 
+/// `guards` for a request made by a document (`initiator`, a frame) inside a tab (`top_level`):
+/// a local target is reachable only if both are local. A document is local if its host is a
+/// local address literal or its flag says it was itself served from a local address
+/// (`Request::top_local` / `initiator_local`). Nothing about pages is remembered here.
+pub(crate) fn guards_for(
+    top_level: Option<&Url>,
+    top_local: bool,
+    initiator: Option<&Url>,
+    initiator_local: bool,
+) -> bool {
+    let guarded = |page: &Url, local: bool| !local && guards(Some(page));
+    top_level.is_some_and(|top| guarded(top, top_local) || initiator.is_some_and(|i| guarded(i, initiator_local)))
+}
+
 fn refused() -> NetError {
     NetError::Blocked(BlockReason::PrivateNetwork)
 }

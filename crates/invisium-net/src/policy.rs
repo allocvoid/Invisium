@@ -6,8 +6,16 @@ use crate::url::Url;
 
 pub(crate) const GENERIC_UA: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0";
-const ACCEPT_LANGUAGE: &str = "en-US,en;q=0.5";
-const ACCEPT_ENCODING: &str = "gzip, deflate, br";
+pub(crate) const ACCEPT_LANGUAGE: &str = "en-US,en;q=0.5";
+pub(crate) const ACCEPT_ENCODING: &str = "gzip, deflate, br";
+
+/// The `User-Agent` value for this configuration.
+pub(crate) fn user_agent(cfg: &NetConfig) -> &str {
+    match &cfg.user_agent {
+        UaProfile::Custom(s) if valid_value(s) && !s.is_empty() => s.as_str(),
+        _ => GENERIC_UA,
+    }
+}
 
 const TRACKING_PARAMS: &[&str] = &[
     "__s", "_hsenc", "_hsmi", "_openstat", "dclid", "epik", "fbclid", "gbraid", "gclid", "gclsrc",
@@ -167,11 +175,7 @@ pub(crate) fn build_request(cfg: &NetConfig, o: &Outgoing<'_>) -> Vec<u8> {
         h.push_str("\r\n");
     };
     push("Host", &o.url.host_port());
-    let ua = match &cfg.user_agent {
-        UaProfile::Custom(s) if valid_value(s) && !s.is_empty() => s.as_str(),
-        _ => GENERIC_UA,
-    };
-    push("User-Agent", ua);
+    push("User-Agent", user_agent(cfg));
     let accept = o
         .extra
         .iter()

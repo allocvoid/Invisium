@@ -148,6 +148,13 @@ fn combine(host: &str, a: Reply, aaaa: Reply) -> Result<(Vec<IpAddr>, u32), DohE
     })
 }
 
+/// Single-label names and the special-use local suffixes.
+pub(crate) fn local_by_nature(host: &str) -> bool {
+    let h = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+    !h.contains('.')
+        || [".local", ".lan", ".home.arpa", ".internal"].iter().any(|s| h.ends_with(s))
+}
+
 async fn system_lookup(host: &str, port: u16) -> Result<Vec<SocketAddr>, NetError> {
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
         .await
@@ -240,6 +247,13 @@ impl Resolver {
             return Ok(vec![SocketAddr::new(IpAddr::from([127, 0, 0, 1]), port)]);
         }
         if let DnsMode::Doh { provider, strict } = mode {
+            // Names that only mean something on the local network never go to a DoH provider.
+            if local_by_nature(host) {
+                if strict {
+                    return Err(NetError::Dns(format!("{host}: local name, not sent to the DoH resolver")));
+                }
+                return system().await;
+            }
             match self.doh(host, |qtype| query(provider, qtype)).await {
                 Ok(ips) => return Ok(ips.into_iter().map(|ip| SocketAddr::new(ip, port)).collect()),
                 // The resolver answered: the name has no addresses. Never ask anyone else.
@@ -399,6 +413,39 @@ mod tests {
             let o = resolve(false, &v4, &other);
             assert_eq!(o.result, Ok(vec![SocketAddr::new(DOH_V4, 443)]));
             assert!(!o.asked_system);
+        }
+    }
+
+    /// E9 leftover 4: local names never reach the DoH provider.
+    #[test]
+    fn local_names_are_never_sent_to_doh() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        for host in ["printer", "nas.local", "router.lan", "box.home.arpa", "svc.internal", "NAS.LOCAL."] {
+            for strict in [false, true] {
+                let (queries, asked_system) = (Cell::new(0), Cell::new(false));
+                let result = rt.block_on(Resolver::default().resolve_with(
+                    DnsMode::Doh { provider: DohProvider::Cloudflare, strict },
+                    host,
+                    443,
+                    |_, _| {
+                        queries.set(queries.get() + 1);
+                        ready(reply(0, &[DOH_V4]))
+                    },
+                    || {
+                        asked_system.set(true);
+                        ready(Ok(vec![system_addr()]))
+                    },
+                ));
+                assert_eq!(queries.get(), 0, "{host}");
+                if strict {
+                    assert!(matches!(result, Err(NetError::Dns(_))) && !asked_system.get(), "{host}");
+                } else {
+                    assert_eq!(result, Ok(vec![system_addr()]), "{host}");
+                }
+            }
+        }
+        for host in ["example.com", "local.example.com", "lan.example"] {
+            assert!(!local_by_nature(host), "{host}");
         }
     }
 }

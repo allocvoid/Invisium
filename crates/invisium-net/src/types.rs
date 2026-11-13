@@ -47,12 +47,35 @@ impl Default for NetConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum ProxyConfig {
     Direct,
     Http { host: String, port: u16, auth: Option<(String, String)> },
     Socks5 { host: String, port: u16, auth: Option<(String, String)> },
     Tor,
+}
+
+/// Never prints proxy credentials.
+impl fmt::Debug for ProxyConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let masked = |a: &Option<(String, String)>| a.as_ref().map(|_| "***");
+        match self {
+            ProxyConfig::Direct => f.write_str("Direct"),
+            ProxyConfig::Http { host, port, auth } => f
+                .debug_struct("Http")
+                .field("host", host)
+                .field("port", port)
+                .field("auth", &masked(auth))
+                .finish(),
+            ProxyConfig::Socks5 { host, port, auth } => f
+                .debug_struct("Socks5")
+                .field("host", host)
+                .field("port", port)
+                .field("auth", &masked(auth))
+                .finish(),
+            ProxyConfig::Tor => f.write_str("Tor"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,6 +187,14 @@ pub struct Request {
     pub mode: FetchMode,
     /// Only read when `mode != Subresource`.
     pub credentials: Credentials,
+    /// The document that makes the request when it is not the tab's top-level document (a
+    /// frame's URL). `None` = the top-level document.
+    pub initiator: Option<Url>,
+    /// The top-level document was itself served from a local address (the engine passes
+    /// `Response::served_local` of that document's navigation back here).
+    pub top_local: bool,
+    /// The same for the initiator document.
+    pub initiator_local: bool,
 }
 
 impl Request {
@@ -178,8 +209,64 @@ impl Request {
             top_level: None,
             mode: FetchMode::Subresource,
             credentials: Credentials::Include,
+            initiator: None,
+            top_local: false,
+            initiator_local: false,
         }
     }
+}
+
+/// The start of a response, before its body.
+#[derive(Clone, Debug)]
+pub struct ResponseHead {
+    pub url: Url,
+    pub status: u16,
+    /// Filtered exactly as `Response.headers` would be.
+    pub headers: Headers,
+    pub mime: String,
+    pub charset: Option<String>,
+    /// Content-Length of the encoded body, if sent.
+    pub length: Option<u64>,
+    /// `Content-Disposition: attachment`.
+    pub attachment: bool,
+    /// Safe suggested file name, never empty.
+    pub filename: String,
+}
+
+/// Where the body of a `fetch_with` response goes.
+pub enum BodyTarget {
+    /// Deliver the body in `Response.body` as `fetch` does.
+    Memory,
+    /// Write the decoded body to a new file at `path`; `progress(received_bytes)` reports the
+    /// decoded bytes written so far, at most about ten times a second and once at the end.
+    File { path: std::path::PathBuf, progress: Box<dyn FnMut(u64) + Send> },
+    /// Drop the body and finish with `NetError::Cancelled`.
+    Discard,
+}
+
+#[derive(Clone, Debug)]
+pub struct WsRequest {
+    /// `ws:` or `wss:`.
+    pub url: Url,
+    /// `Sec-WebSocket-Protocol` offers, in order.
+    pub protocols: Vec<String>,
+    /// The tab's document.
+    pub top_level: Url,
+    /// As in `Request`.
+    pub initiator: Option<Url>,
+    /// As in `Request`.
+    pub top_local: bool,
+    pub initiator_local: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WsEvent {
+    /// The subprotocol the server chose, "" if none.
+    Open { protocol: String },
+    Text(String),
+    Binary(Vec<u8>),
+    /// Always the last event. `clean` = the closing handshake completed.
+    Closed { code: u16, reason: String, clean: bool },
 }
 
 /// Case-insensitive, ordered multimap of header fields.
@@ -229,6 +316,10 @@ pub struct Response {
     pub from_cache: bool,
     pub redirects: u8,
     pub via: Route,
+    /// The final response came over a direct connection whose peer address (the address
+    /// actually connected to) is local. False for proxy and Tor routes; a cached response
+    /// keeps the value it was stored with.
+    pub served_local: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -286,6 +377,7 @@ pub enum BlockReason {
     MixedContent,
     Cors,
     PrivateNetwork,
+    Framing,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
